@@ -1,0 +1,124 @@
+{
+	"name": "bitmap-explorer",
+	"displayName": "Bitmap Explorer",
+	"description": "Custom editor for examining images.",
+	"keywords": [
+		"explorer"
+	],
+	"version": "0.1.0",
+	"license": "MIT",
+	"icon": "assets/icon.png",
+	"publisher": "isopodlabs",
+	"repository": "https://github.com/adrianstephens/vscode-bitmaps",
+	"homepage": "https://github.com/adrianstephens/vscode-bitmaps#readme",
+	"bugs": {
+		"url": "https://github.com/adrianstephens/vscode-bitmaps/issues"
+	},
+	"files": [
+		"node_modules/@isopodlabs/binary/dist/*.js",
+		"node_modules/@isopodlabs/binary_bitmaps/dist/*.js",
+		"node_modules/@isopodlabs/utilities/dist/*.js",
+		"node_modules/@isopodlabs/vscode_utils/dist/**/*.js",
+		"node_modules/@isopodlabs/vscode_utils/assets",
+		"out/**/*.js",
+		"assets",
+		"LICENSE.txt",
+		"!**/.DS_Store"
+	],
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"categories": [
+		"Other",
+		"Visualization"
+	],
+	"extensionKind": [
+		"workspace"
+	],
+	"main": "./out/src/extension.js",
+	"contributes": {
+		"customEditors": [
+			{
+				"viewType": "bitmap.viewer",
+				"displayName": "Bitmap Viewer",
+				"priority": "default",
+				"selector": [
+					{
+						"filenamePattern": "*.bmp"
+					},
+					{
+						"filenamePattern": "*.gif"
+					},
+					{
+						"filenamePattern": "*.png"
+					},
+					{
+						"filenamePattern": "*.jpg"
+					},
+					{
+						"filenamePattern": "*.jpeg"
+					},
+					{
+						"filenamePattern": "*.dds"
+					},
+					{
+						"filenamePattern": "*.psd"
+					},
+					{
+						"filenamePattern": "*.tga"
+					},
+					{
+						"filenamePattern": "*.tif"
+					},
+					{
+						"filenamePattern": "*.tiff"
+					}
+				]
+			}
+		],
+		"commands": [
+			{
+				"command": "bitmap.fit",
+				"title": "Fit to Window",
+				"icon": "$(screen-normal)"
+			},
+			{
+				"command": "bitmap.reset",
+				"title": "Reset Zoom",
+				"icon": "$(refresh)"
+			}
+		],
+		"menus": {
+			"editor/title": [
+				{
+					"command": "bitmap.fit",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "navigation"
+				},
+				{
+					"command": "bitmap.reset",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "navigation"
+				}
+			]
+		}
+	},
+	"scripts": {
+		"build": "tsc -b",
+		"watch": "tsc -b -watch",
+		"watch-link": "tsc -b -watch ./tsconfig.link.json",
+		"link": "npm link @isopodlabs/binary @isopodlabs/binary_bitmaps @isopodlabs/utilities @isopodlabs/vscode_utils",
+		"update": "npm install @isopodlabs/binary@latest @isopodlabs/binary_bitmaps@latest @isopodlabs/utilities @isopodlabs/vscode_utils@latest"
+	},
+	"devDependencies": {
+		"@types/node": "^18",
+		"@types/vscode": "^1.75.0",
+		"typescript": "^5.8.0"
+	},
+	"dependencies": {
+		"@isopodlabs/binary": "^1.11.0",
+		"@isopodlabs/binary_bitmaps": "^1.9.1",
+		"@isopodlabs/utilities": "^1.10.0",
+		"@isopodlabs/vscode_utils": "^0.7.0"
+	}
+}

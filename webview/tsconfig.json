@@ -1,0 +1,20 @@
+{
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"composite": true,
+		"sourceMap": false,
+		"inlineSourceMap": true,
+		"inlineSources": true,
+		"module": "es2022",
+		"moduleResolution": "bundler",
+		"target": "es2022",
+		"lib": ["ES2022", "DOM"],
+		"rewriteRelativeImportExtensions": true,
+		"paths": {
+			"@isopodlabs/vscode_utils/webview/*": [
+				"../node_modules/@isopodlabs/vscode_utils/dist/webview/*"
+			]
+		}
+	},
+	"include": ["*.ts"]
+}

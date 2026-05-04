@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+	"compilerOptions": {
+		"composite": true,
+	},
+	"include": ["src/*"],
+	"exclude": ["node_modules", "hidden"],
+	"references": [
+		{ "path": "./webview" },
+		{ "path": "node_modules/@isopodlabs/binary" },
+		{ "path": "node_modules/@isopodlabs/binary_bitmaps" },
+		{ "path": "node_modules/@isopodlabs/utilities" },
+		{ "path": "../../packages/vscode-utils" }
+	]
+}

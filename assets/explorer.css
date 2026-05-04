@@ -1,0 +1,251 @@
+html {
+	user-select: none;
+	height: 100%;
+}
+
+body {
+	margin: 0;
+	height: 100%;
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+}
+
+.tree {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+	position: relative;
+	scrollbar-width: none;
+	-ms-overflow-style: none;
+	line-height: 22px;
+	white-space: nowrap;
+	z-index: 1;
+	--depth: 0;
+	--depth2: 0;
+	--row-height: 23px;
+	--indent-step: 20px;
+	--shadow-top: var(--row-height);
+	background-color: var(--vscode-editor-background);
+	&::-webkit-scrollbar {
+		display: none;
+	}
+}
+
+.children {
+	--depth2: var(--depth);
+	content-visibility: auto;
+	contain-intrinsic-size: auto var(--row-height);
+}
+
+.caret {
+	position: relative;
+	--depth: calc(var(--depth2) + 1);
+	padding-left: var(--indent-step);
+
+	&.caret-down > span {
+		position: sticky;
+		z-index: calc(var(--depth));
+		background-color: var(--vscode-editor-background);
+		padding-top: 1px;
+		top: calc((var(--depth) - 1) * var(--row-height));
+		&.stuck {
+			transform: translateZ(calc(var(--depth) * 10px));
+			/*box-shadow: var(--vscode-sideBarStickyScroll-shadow) 0 6px 6px -6px;*/
+			box-shadow: rgba(0,0,0,0.25) 0 6px 6px -6px;
+		}
+	}
+
+	&.caret-down::before {
+		position: sticky;
+		padding-top: 4px;
+		top: calc((var(--depth) - 1) * var(--row-height));
+	}
+
+	&.expanding::before {
+		content: '\eb19';
+		display: inline-block;
+		transform-origin: 50% 50%;
+		will-change: transform;
+		animation: codicon-spin 1.2s linear infinite;
+	}
+}
+
+
+.header {
+	position: sticky;
+	top: 0;
+	z-index: 25;
+	padding-bottom: 2px;
+	background: var(--vscode-editor-background);
+	border-bottom: 1px solid var(--vscode-editorGroup-border);
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	user-select: none;
+	display: grid;
+	grid-template-columns: minmax(0, calc(var(--name-fr) * 100%)) var(--stat-columns);
+	column-gap: 12px;
+	width: 100%;
+}
+
+.folder {
+	position: relative;
+	display: inline-block;
+	width: calc(100% - 19px);
+}
+
+.leaf {
+	display: grid;
+	grid-template-columns: minmax(0, calc(var(--name-fr) * 100% - var(--depth) * (1 - var(--name-fr)) * var(--indent-step))) var(--stat-columns);
+	column-gap: 12px;
+	width: 100%;
+	overflow: hidden;
+	flex: 1 1 auto;
+	min-width: 0;
+	& > span {
+		display: block;
+		min-width: 0;
+		max-width: 100%;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		pointer-events: none;
+	}
+}
+
+.select {
+    cursor: pointer;
+    &:hover:not(.selected) {
+	    background-color: var(--vscode-editorHoverWidget-background) !important;
+        text-decoration: inherit;
+    }
+	&:focus {
+		outline: none;
+	}
+	&.cursor:not(.editing)/*,
+	&:focus-visible */ {
+		outline: 1px solid var(--vscode-focusBorder);
+		outline-offset: -1px;
+	}
+}
+
+
+.file {
+	position: relative;
+	align-items: center;
+	padding-left: 18px;
+}
+
+.col-number,
+.col-time {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
+.col-string
+.col-path {
+	text-align: left;
+}
+
+.col-boolean {
+	text-align: center;
+}
+
+.editing {
+	pointer-events: auto;
+	overflow: visible;
+	align-items: center;
+	width: 100%;
+	min-width: 0;
+	& > input {
+		display: inline;
+		width: calc(100% - var(--edit-input-offset, 0px));
+		margin: 0;
+		border: 0;
+		padding: 0;
+		box-sizing: border-box;
+		background: var(--vscode-editor-background);
+		color: inherit;
+		font: inherit;
+		outline: 1px solid var(--vscode-focusBorder);
+		outline-offset: -1px;
+		line-height: inherit;
+	}
+
+}
+
+.file.editing {
+	overflow: visible;
+}
+
+.folder.editing > input {
+	width: calc(var(--name-fr) * 100% - var(--depth) * (1 - var(--name-fr)) * var(--indent-step) - var(--edit-input-offset, 0px) - 19px);
+
+}
+
+
+/* ── symlink badge ────────────────────────────────────────────────────── */
+
+.file[data-link]::after,
+.folder[data-link]::after {
+	color: var(--vscode-badge-foreground);
+	content: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23007acc'/%3E%3Cpath d='M5 11L11 5M7 5h4v4' fill='none' stroke='%23fff' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  	position: absolute;
+	/*content: url("./symlink.svg");*/
+	pointer-events: none;
+}
+
+.folder[data-link]::after {
+	top: 4px;
+	left: 8px;
+}
+
+.file[data-link]::after {
+	top: 4px;
+	left: 28px;
+}
+
+/* ── drag and drop ────────────────────────────────────────────────────── */
+
+.caret:has(> span.drop-target) {
+	background-color: var(--vscode-list-activeSelectionBackground) !important;
+	& .caret {
+		background-color: inherit !important;
+	}
+}
+
+.drag-image {
+	position: fixed;
+	top: -1000px;
+	left: -1000px;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	pointer-events: none;
+	font-family: var(--vscode-font-family);
+	color: var(--vscode-badge-foreground);
+}
+
+.drag-lozenge {
+	background-color: var(--vscode-badge-background);
+	border-radius: 10px;
+	padding: 2px 8px;
+	font-size: var(--vscode-font-size);
+	white-space: nowrap;
+	max-width: 300px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.drag-badge {
+	background-color: var(--vscode-badge-background);
+	border-radius: 50%;
+	width: 20px;
+	height: 20px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 11px;
+	flex-shrink: 0;
+}

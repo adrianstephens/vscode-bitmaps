@@ -1,0 +1,85 @@
+// A launch configuration that compiles the extension and then opens it inside a new window
+// Use IntelliSense to learn about possible attributes.
+// Hover to view descriptions of existing attributes.
+// For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Run Development Extension",
+			"type": "extensionHost",
+			"request": "launch",
+			"runtimeExecutable": "${execPath}",
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/binary/dist/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/binary_bitmaps/dist/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/utilities/dist/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/vscode_utils/dist/*.js",
+				//"D:/dev/packages/**.js",
+				//"E:/Github/vscode/out/**/*.js",
+			],
+			"sourceMaps": true,
+			"preLaunchTask": "npm: watch-link",
+			"windows": {
+				"args": [
+					"--extensionDevelopmentPath=${workspaceFolder}",
+					"--new-window",
+					"D:\\dev\\packages\\debug.code-workspace"
+					//"D:\\dev\\shared\\"
+					//"D:\\dev\\vscode_ext\\registry"
+					//"D:\\dev\\vscode_ext\\vstools"
+				],
+			},
+			"osx": {
+				"args": [
+					"--extensionDevelopmentPath=${workspaceFolder}",
+					//"--remote=ssh-remote+ubuntu-adrian",
+					//"/mnt/e/Github/xdg-desktop-portal/xdg-desktop-portal-gnome"
+					//"/Volumes/DevSSD/dev/SkyNetLights/firmware"
+					"/Volumes/DevSSD/dev/shared"
+				],
+			},
+			"linux": {
+				"args": [
+					"--extensionDevelopmentPath=${workspaceFolder}",
+					"--remote=ssh-remote+ubuntu-adrian",
+					"/mnt/e/Github/xdg-desktop-portal/xdg-desktop-portal-gnome"
+					//"/mnt/d/dev/shared"
+				],
+			},
+			"env": {
+				"NODE_PRESERVE_SYMLINKS": "1"
+			},
+			//"resolveSourceMapLocations": [],
+			//	"${workspaceFolder}/**",
+			//	"${workspaceFolder}/node_modules/@isopodlabs/**",
+			//	//"!**/node_modules/**"
+			//]
+		},
+				{
+			"name": "Run Extension",
+			"type": "extensionHost",
+			"request": "launch",
+			"runtimeExecutable": "${execPath}",
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js",
+			],
+			"sourceMaps": true,
+			"preLaunchTask": "npm: watch",
+			"windows": {
+				"args": [
+					"--extensionDevelopmentPath=${workspaceFolder}",
+					"D:\\dev\\packages\\debug.code-workspace"
+				],
+			},
+			"osx": {
+				"args": [
+					"--extensionDevelopmentPath=${workspaceFolder}",
+					"/Volumes/DevSSD/dev/shared"
+				],
+			}
+		}
+
+	]
+}

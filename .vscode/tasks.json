@@ -1,0 +1,75 @@
+// See https://go.microsoft.com/fwlink/?LinkId=733558
+// for the documentation about the tasks.json format
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "npm: build",
+			"type": "npm",
+			"script": "build",
+			"group": "build",
+			"problemMatcher": "$tsc",
+			"options": {"cwd": "${workspaceFolder}"},
+
+		},
+		{
+			"type": "npm",
+			"group": "build",
+			"label": "npm: watch",
+			"script": "watch",
+			"problemMatcher": "$tsc-watch",
+			"isBackground": true
+		},
+		{
+			"type": "npm",
+			"script": "watch-link",
+			"group": "build",
+			"problemMatcher": "$tsc-watch",
+			"isBackground": true,
+			"label": "npm: watch-link",
+			"detail": "tsc -b -watch ./tsconfig.link.json"
+		},
+		{
+			"type": "shell",
+			"label": "prepublish",
+			"command": "git add . && if [ \"${input:version}\" != \"none\" ]; then npm version ${input:version} --force; fi",
+			"windows": {
+				"command": "git add . & if not ${input:version}==none npm version ${input:version} --force",
+			},
+			"problemMatcher": [],
+			"dependsOn": "npm: build"
+		},
+		{
+			"type": "shell",
+			"label": "PUBLISH",
+			"command": "vsce publish",
+			"problemMatcher": [],
+			"dependsOn": "prepublish"
+		},
+		{
+			"type": "shell",
+			"label": "PACKAGE",
+			"command": "vsce package",
+			"problemMatcher": []
+		},
+		{
+			"label": "install",
+			"type": "shell",
+			"command": "code --install-extension $(node -p \"require('./package.json').name + '-' + require('./package.json').version + '.vsix'\")",
+			"windows": {
+				"command": "for /f \"usebackq delims=\" %G in (`node -p \"require('./package.json').name + '-' + require('./package.json').version + '.vsix'\"`) do code.cmd --install-extension \"%G\""
+			},
+			"problemMatcher": [],
+			"dependsOn": "PACKAGE"
+		}
+	],
+	"inputs": [
+		{
+			"id": "version",
+			"description": "Version bump:",
+			"type": "pickString",
+			"options": ["none", "patch", "minor", "major"],
+			"default": "none"
+		},
+	]
+}
