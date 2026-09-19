@@ -35,11 +35,11 @@ const FaceRot faceAxis[] = FaceRot[](
 );
 
 vec3 rotateAroundAxis(vec3 p, vec3 axis, float angle) {
-    vec3 n = normalize(axis);
-    float c = cos(angle);
-    float s = sin(angle);
-    float d = dot(n, p);
-    return p * c + cross(n, p) * s + n * d * (1.0 - c);
+	vec3 n = normalize(axis);
+	float c = cos(angle);
+	float s = sin(angle);
+	float d = dot(n, p);
+	return p * c + cross(n, p) * s + n * d * (1.0 - c);
 }
 
 void main() {
@@ -52,8 +52,8 @@ void main() {
 		vec3 axis = faceAxis[face].axis;
 		worldPos = rotateAroundAxis(worldPos - pivot, axis, angle) + pivot;
 	} else if (face == 5) {
-        vec3 pivot = vec3(2.0, 0.0, 0.0);
-        worldPos = rotateAroundAxis(worldPos - pivot, vec3(0.0, -1.0, 0.0), angle * 2.0) + pivot;
+		vec3 pivot = vec3(2.0, 0.0, 0.0);
+		worldPos = rotateAroundAxis(worldPos - pivot, vec3(0.0, -1.0, 0.0), angle * 2.0) + pivot;
 	}
 
 

@@ -360,6 +360,58 @@ function orthonormalizeCubeBasis() {
 	view.y = normalize(cross(view.z, view.x));
 }
 
+interface quat {
+	x: number;
+	y: number;
+	z: number;
+	w: number;
+}
+
+// rotation matrix with columns x, y, z
+function basisToQuat(x: float3, y: float3, z: float3): quat {
+	const trace = x.x + y.y + z.z;
+	if (trace > 0) {
+		const s = 0.5 / Math.sqrt(trace + 1);
+		return {x: (y.z - z.y) * s, y: (z.x - x.z) * s, z: (x.y - y.x) * s, w: 0.25 / s};
+	}
+	if (x.x > y.y && x.x > z.z) {
+		const s = 2 * Math.sqrt(1 + x.x - y.y - z.z);
+		return {x: 0.25 * s, y: (y.x + x.y) / s, z: (z.x + x.z) / s, w: (y.z - z.y) / s};
+	}
+	if (y.y > z.z) {
+		const s = 2 * Math.sqrt(1 + y.y - x.x - z.z);
+		return {x: (y.x + x.y) / s, y: 0.25 * s, z: (z.y + y.z) / s, w: (z.x - x.z) / s};
+	}
+	const s = 2 * Math.sqrt(1 + z.z - x.x - y.y);
+	return {x: (z.x + x.z) / s, y: (z.y + y.z) / s, z: 0.25 * s, w: (x.y - y.x) / s};
+}
+
+function quatToBasis({x, y, z, w}: quat) {
+	return {
+		x: {x: 1 - 2 * (y * y + z * z),	y: 2 * (x * y + w * z),			z: 2 * (x * z - w * y)},
+		y: {x: 2 * (x * y - w * z),		y: 1 - 2 * (x * x + z * z),		z: 2 * (y * z + w * x)},
+		z: {x: 2 * (x * z + w * y),		y: 2 * (y * z - w * x),			z: 1 - 2 * (x * x + y * y)},
+	};
+}
+
+function slerp(a: quat, b: quat, t: number): quat {
+	let d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+	if (d < 0) {	// take the short way round
+		d = -d;
+		b = {x: -b.x, y: -b.y, z: -b.z, w: -b.w};
+	}
+	let ta = 1 - t, tb = t;
+	if (d < 0.9995) {
+		const angle = Math.acos(d);
+		const s		= Math.sin(angle);
+		ta = Math.sin((1 - t) * angle) / s;
+		tb = Math.sin(t * angle) / s;
+	}
+	const q = {x: a.x * ta + b.x * tb, y: a.y * ta + b.y * tb, z: a.z * ta + b.z * tb, w: a.w * ta + b.w * tb};
+	const len = Math.hypot(q.x, q.y, q.z, q.w);
+	return {x: q.x / len, y: q.y / len, z: q.z / len, w: q.w / len};
+}
+
 function mat4OrthoNormalInverse(m: Float32Array) {
 	const inv = new Float32Array([
 		m[0], m[4], m[8], 0,
@@ -567,10 +619,9 @@ function render() {
 				u_texture: 	0,
 				u_mvp:		mvp,
 				u_origin:	iview.slice(12, 15),
-				u_steps:	128.0,
 				u_opacity:	1.0,
 				u_size:    	image.width,
-				u_light:	iview.slice(8, 11).map(x => -x), // directional light coming from the camera forward
+				u_light:	iview.slice(8, 11), // direction towards the light: a headlight, from the camera
 				u_flatten: 	flatten,
 			});
 
@@ -644,11 +695,21 @@ layerSlider.addEventListener('input', () => {
 	render();
 });
 
+// Orientation in which the unfolded layout is seen face on, matching the 2D view.
+// A volume unfolds with slice 0 at the top and image rows running down the screen, so it faces the camera
+// with a half turn about x (slice 0 in front, image upright); the cube unfolds around its +Z face.
+function homeRotation() {
+	return mode === '3d'
+		? {x: {x: 1, y: 0, z: 0}, y: {x: 0, y: -1, z: 0}, z: {x: 0, y: 0, z: -1}}
+		: {x: {x: 1, y: 0, z: 0}, y: {x: 0, y: 1, z: 0}, z: {x: 0, y: 0, z: 1}};
+}
+
 function fitView() {
 	if ((mode === 'cube' || mode === '3d') && flatten === 0) {
-		view.x = {x: 1, y: 0, z: 0};
-		view.y = {x: 0, y: 1, z: 0};
-		view.z = {x: 0, y: 0, z: 1};
+		const home = homeRotation();
+		view.x = home.x;
+		view.y = home.y;
+		view.z = home.z;
 		view.w = {x: 0, y: 0, z: -3};
 
 	} else if (image) {
@@ -731,6 +792,12 @@ canvas.addEventListener('pointerleave', () => {
 function clampScale(scale: number) {
 	const minScale = Math.min(canvas.width / atlasWidth, canvas.height / atlasHeight);
 	return Math.min(256, Math.max(minScale, scale));
+}
+
+// 1:1, centred - but never below the minimum (fit to window) that zooming allows, or the first wheel tick would jump
+function resetScale() {
+	scale	= clampScale(1);
+	offset	= {x: (canvas.width - atlasWidth * scale) / 2, y: (canvas.height - atlasHeight * scale) / 2};
 }
 
 function clampOffset(x: number, y: number) {
@@ -870,19 +937,61 @@ function setTexture(newTexture: WebGLTexture) {
 	texture = newTexture;
 }
 
-function cubePosition(fovy: number) {
+// Camera position (with the home rotation) at which the unfolded layout lands exactly where the 2D view draws it
+// (at the current scale and offset), so the switch between them is seamless.
+// The unfolded layout is the plane z=planeZ, 2 world units across `width` atlas texels, with atlas point `centre` on the axis
+function flatPosition(fovy: number, centre: {x: number, y: number}, width: number, planeZ: number) {
 	const f = canvas.height / 2 * fovy;
 
-	const facePx		= image!.width * scale;
-	const depth			= 2 * f / facePx;
-	const pixelDeltaX	= offset.x + 1.5 * facePx - canvas.width / 2;
-	const pixelDeltaY	= canvas.height / 2 - (offset.y + 1.5 * facePx);
+	const widthPx		= width * scale;
+	const depth			= 2 * f / widthPx;
+	const pixelDeltaX	= offset.x + centre.x * scale - canvas.width / 2;
+	const pixelDeltaY	= canvas.height / 2 - (offset.y + centre.y * scale);
 
 	return {
 		x: pixelDeltaX * depth / f,
 		y: pixelDeltaY * depth / f,
-		z: -1 - depth,
+		z: -depth - homeRotation().z.z * planeZ,
 	};
+}
+
+function unfoldedPosition() {
+	return mode === '3d'
+		? flatPosition(fovy, {x: atlasWidth / 2, y: atlasHeight / 2}, image!.width, 0)
+		: flatPosition(fovy, {x: image!.width * 1.5, y: image!.width * 1.5}, image!.width, 1);
+}
+
+let animation = 0;
+
+// Animate between the 3D view (target 0) and the unfolded 2D layout (target 1).
+// The unfolding itself is done by the shaders (u_flatten); this moves the camera so the layout ends up matching the 2D view.
+function animateFlatten(target: number, cameraTarget: float3) {
+	const id		= ++animation;
+	const flatten0	= flatten;
+	const start		= basisToQuat(view.x, view.y, view.z);
+	const home		= homeRotation();
+	const end		= basisToQuat(home.x, home.y, home.z);
+	const w0		= view.w;
+	const startTime	= performance.now();
+
+	function step(now: number) {
+		if (id !== animation)
+			return;	// superseded
+
+		const t		= Math.min(1, (now - startTime) / 300);
+		const s		= t * t * (3 - 2 * t);
+		flatten		= t === 1 ? target : flatten0 + (target - flatten0) * s;
+
+		const basis	= quatToBasis(slerp(start, end, s));
+		view.x		= basis.x;
+		view.y		= basis.y;
+		view.z		= basis.z;
+		view.w		= lerp(w0, cameraTarget, s);
+		render();
+		if (t < 1)
+			requestAnimationFrame(step);
+	}
+	requestAnimationFrame(step);
 }
 
 window.addEventListener('message', async event => {
@@ -981,41 +1090,20 @@ window.addEventListener('message', async event => {
 			break;
 
 		case 'resetZoom':
-			scale = 1;
-			offset = {x: (canvas.width - atlasWidth * scale) / 2, y: (canvas.height - atlasHeight * scale) / 2};
-
 			if (mode === 'cube' || mode === '3d') {
-				const down		= flatten > 0;
-				const view0		= view;
+				if (flatten > 0) {
+					// back to 3D: start from the 2D view as it is now
+					if (flatten === 1)
+						view.w = unfoldedPosition();
+					animateFlatten(0, {x: 0, y: 0, z: -3});
 
-				if (down)
-					view.w = cubePosition(fovy);
-				
-				const targetView = {
-					x: {x: 1, y: 0, z: 0},
-					y: {x: 0, y: 1, z: 0},
-					z: {x: 0, y: 0, z: 1},
-					w: down
-						? {x: 0, y: 0, z: -3}
-						: cubePosition(fovy)
+				} else {
+					resetScale();
+					animateFlatten(1, unfoldedPosition());
 				}
-				const startTime = performance.now();
-
-				function step(now: number) {
-					const t = Math.min(1, (now - startTime) / 300);
-					flatten = down ? 1 - t : t;
-					view.x = lerp(view0.x, targetView.x, t);
-					view.y = lerp(view0.y, targetView.y, t);
-					view.z = lerp(view0.z, targetView.z, t);
-					view.w = lerp(view0.w, targetView.w, t);
-					orthonormalizeCubeBasis();
-					render();
-					if (t < 1)
-						requestAnimationFrame(step);
-				}
-				requestAnimationFrame(step);
 
 			} else {
+				resetScale();
 				render();
 			}
 			break;

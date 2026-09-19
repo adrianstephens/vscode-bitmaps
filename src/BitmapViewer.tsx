@@ -29,36 +29,31 @@ interface ShaderSource {
 	frag: string;
 }
 const shaders: Record<shaderType, ShaderSource> = {
-	'bg':  		{ vert: 'bitmap.vert',  frag: 'background.frag'},
-	'2d':  		{ vert: 'bitmap.vert',  frag: 'bitmap.frag'    },
-	'array2d':	{ vert: 'bitmap.vert',  frag: 'array2d.frag'   },
-	'cube':		{ vert: 'cube.vert',	frag: 'cube.frag'   	},
-	'cube2d':	{ vert: 'bitmap.vert',	frag: 'cube2d.frag'   },
-	'3d':  		{ vert: 'volume.vert',  frag: 'volume.frag'    },
-	'3d2d':  	{ vert: 'bitmap.vert',  frag: 'volume2d.frag'    },
+	'bg':		{ vert: 'bitmap.vert',	frag: 'background.frag'	},
+	'2d':		{ vert: 'bitmap.vert',	frag: 'bitmap.frag'		},
+	'array2d':	{ vert: 'bitmap.vert',	frag: 'array2d.frag'	},
+	'cube':		{ vert: 'cube.vert',	frag: 'cube.frag'		},
+	'cube2d':	{ vert: 'bitmap.vert',	frag: 'cube2d.frag'		},
+	'3d':		{ vert: 'volume.vert',	frag: 'volume.frag'		},
+	'3d2d':		{ vert: 'bitmap.vert',	frag: 'volume2d.frag'	},
 };
 
 class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
-	webviewUri: (name: string) => vscode.Uri;
 	assetPath: vscode.Uri;
 
 	constructor(
 		public webviewPanel: vscode.WebviewPanel,
-		extensionUri: vscode.Uri,
+		assets: webview.Assets,
 		public document: BitmapDocument
 	) {
-		super(webviewPanel);
-		this.assetPath = vscode.Uri.joinPath(extensionUri, 'assets');
+		super(webviewPanel, assets);
+		this.assetPath = assets.uri('assets');
 
 		const webview = webviewPanel.webview;
 		webview.options = {
 			enableScripts: true,
-			localResourceRoots: [extensionUri],
+			localResourceRoots: assets.localRoots(),
 		};
-
-		this.webviewUri = (name: string) => {
-			return webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, name));
-		}
 
 		const nonce = Nonce();
 
@@ -68,12 +63,12 @@ class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
 					<meta charset="UTF-8" />
 					<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 					<CSP
-						csp={[CSPdefault(extensionUri), CSP.self, CSP.unsafe_inline]}
+						csp={[CSPdefault(assets.root), CSP.self, CSP.unsafe_inline]}
 						script={nonce}
-						img={[CSPdefault(extensionUri), CSP.self, vscode.Uri.parse('data:')]}
+						img={[CSPdefault(assets.root), CSP.self, vscode.Uri.parse('data:')]}
 					/>
 					<ImportMap nonce={nonce} webview={webview} map={{
-						"@isopodlabs/vscode_utils/webview/": vscode.Uri.joinPath(extensionUri, 'node_modules/@isopodlabs/vscode_utils/dist/webview/'),
+						"@isopodlabs/vscode_utils/webview/": assets.uri('node_modules/@isopodlabs/vscode_utils/dist/webview/'),
 					}} />
 					<link rel="stylesheet" type="text/css" href={this.webviewUri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
 					<link rel="stylesheet" type="text/css" href={this.webviewUri('assets/bitmap.css')}/>
@@ -215,6 +210,7 @@ class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
 export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	private readonly editors = new Set<BitmapViewer>();
 	private active: BitmapViewer | undefined;
+	private readonly assets: webview.Assets;
 	private _onDidChangeCustomDocument = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<BitmapDocument>>();
 
 	get onDidChangeCustomDocument() {
@@ -222,6 +218,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	}
 
 	constructor(private readonly context: vscode.ExtensionContext) {
+		this.assets = new webview.Assets(context.extensionUri);
 		context.subscriptions.push(
 			vscode.window.registerCustomEditorProvider('bitmap.viewer', this, { webviewOptions: { retainContextWhenHidden: true } }),
 			vscode.commands.registerCommand('bitmap.fit', () => this.active?.postMessage({command: 'fitToWindow'})),
@@ -302,7 +299,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	}
 
 	async resolveCustomEditor(document: BitmapDocument, webviewPanel: vscode.WebviewPanel): Promise<void> {
-		const editor = new BitmapViewer(webviewPanel, this.context.extensionUri, document);
+		const editor = new BitmapViewer(webviewPanel, this.assets, document);
 		this.editors.add(editor);
 		this.setActive(editor);
 

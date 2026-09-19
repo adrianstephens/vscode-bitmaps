@@ -116,7 +116,7 @@
 		"typescript": "^5.8.0"
 	},
 	"dependencies": {
-		"@isopodlabs/binary": "^1.11.0",
+		"@isopodlabs/binary": "^2.0.0",
 		"@isopodlabs/binary_bitmaps": "^1.9.1",
 		"@isopodlabs/utilities": "^1.10.0",
 		"@isopodlabs/vscode_utils": "^0.7.0"

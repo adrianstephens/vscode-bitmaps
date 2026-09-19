@@ -29,16 +29,16 @@ float disc(float dist, float radius, float edge) {
 	return smoothstep(radius + edge, radius - edge, dist);
 }
 vec4 sampleTex(vec2 uv) {
-    float z  = uv.y / u_size.y;
-    vec3 pixelUV  = (floor(vec3(uv.x, fract(z) * u_size.y, z)) + 0.5) / u_size;
-    return texture(u_texture, pixelUV);
+	float z  = uv.y / u_size.y;
+	vec3 pixelUV  = (floor(vec3(uv.x, fract(z) * u_size.y, z)) + 0.5) / u_size;
+	return texture(u_texture, pixelUV);
 }
 
 void main() {
 	vec2 frag	= vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
 	fragColor	= background(frag);
 
-	vec2 texel = (frag - u_offset) / u_scale;    // texel coordinates in top-left space
+	vec2 texel = (frag - u_offset) / u_scale;	// texel coordinates in top-left space
 
 	if (texel.x >= 0.0 && texel.y >= 0.0 && texel.x < u_size.x && texel.y < u_size.y * u_size.z) {
 		vec4 color = sampleTex(texel);
