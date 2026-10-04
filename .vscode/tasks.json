@@ -9,25 +9,36 @@
 			"script": "build",
 			"group": "build",
 			"problemMatcher": "$tsc",
-			"options": {"cwd": "${workspaceFolder}"},
-
 		},
 		{
+			"label": "npm: watch",
 			"type": "npm",
 			"group": "build",
-			"label": "npm: watch",
 			"script": "watch",
 			"problemMatcher": "$tsc-watch",
-			"isBackground": true
+			"isBackground": true,
 		},
 		{
+			"label": "npm: build-link",
+			"type": "npm",
+			"group": "build",
+			"script": "build-link",
+			"problemMatcher": "$tsc"
+		},
+		{
+			"label": "npm: watch-link",
 			"type": "npm",
 			"script": "watch-link",
 			"group": "build",
 			"problemMatcher": "$tsc-watch",
 			"isBackground": true,
-			"label": "npm: watch-link",
-			"detail": "tsc -b -watch ./tsconfig.link.json"
+		},
+		{
+			"label": "Open Extension Dev Window",
+			"type": "shell",
+			"command": "NODE_PRESERVE_SYMLINKS=1 code --extensionDevelopmentPath=${workspaceFolder} --inspect-brk-extensions=9230 /Volumes/DevSSD/dev/github/openscad",
+			"problemMatcher": [],
+			"dependsOn": "npm: watch-link"
 		},
 		{
 			"type": "shell",

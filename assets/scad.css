@@ -1,0 +1,45 @@
+/* the .scad viewer: a line about the model over the render, and a shader that will not compile in its place */
+
+/* the coordinates painted along the floor grid, over the render but under everything else */
+
+/* what is under the cursor: position, distance, normal and material, following the pointer */
+#scad-tooltip {
+  position: absolute;
+  padding: 4px 7px;
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  line-height: 1.5;
+  white-space: pre;
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border);
+  pointer-events: none;
+}
+
+#scad-info {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#scad-error {
+  position: absolute;
+  inset: 8px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border);
+}

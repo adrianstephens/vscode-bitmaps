@@ -31,7 +31,8 @@ float disc(float dist, float radius, float edge) {
 vec4 sampleTex(vec2 uv) {
 	float z  = uv.y / u_size.y;
 	vec3 pixelUV  = (floor(vec3(uv.x, fract(z) * u_size.y, z)) + 0.5) / u_size;
-	return texture(u_texture, pixelUV);
+	vec4 c = texture(u_texture, pixelUV);
+	return vec4(c.rgb * c.a, c.a);	// the texture is straight alpha, blend() wants it premultiplied
 }
 
 void main() {

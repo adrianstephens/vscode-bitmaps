@@ -5,6 +5,8 @@ import * as webview from "@isopodlabs/vscode_utils/webview";
 import { JSX, CSP, CSPdefault, ImportMap, Nonce } from '@isopodlabs/vscode_utils/jsx-runtime';
 import type { MessageIn, MessageOut, MessageRpc, shaderType } from "../webview/bitmap"
 
+import { setActiveViewer, readShader } from './extension';
+
 class BitmapDocument implements vscode.CustomDocument {
 	public fileWatcher: vscode.FileSystemWatcher | undefined;
 	constructor(public readonly uri: vscode.Uri, public data: Uint8Array) {}
@@ -38,63 +40,65 @@ const shaders: Record<shaderType, ShaderSource> = {
 	'3d2d':		{ vert: 'bitmap.vert',	frag: 'volume2d.frag'	},
 };
 
-class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
-	assetPath: vscode.Uri;
+// the page of a webview: the shared styles, an import map for the utilities, the body and the script which runs it
+export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, uri: (name: string) => vscode.Uri, script: string, title: string, body: JSX.Element[], bodyClass?: string, stylesheets: string[] = []) {
+	const nonce = Nonce();
+	return '<!DOCTYPE html>' + JSX.render(
+		<html lang="en">
+			<head>
+				<meta charset="UTF-8" />
+				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+				<CSP
+					csp={[CSPdefault(assets.root), CSP.self, CSP.unsafe_inline]}
+					script={nonce}
+					img={[CSPdefault(assets.root), CSP.self, vscode.Uri.parse('data:')]}
+				/>
+				<ImportMap nonce={nonce} webview={webviewPanel.webview} map={{
+					"@isopodlabs/vscode_utils/webview/": assets.uri('node_modules/@isopodlabs/vscode_utils/dist/webview/'),
+					"@isopodlabs/maths/vector": assets.uri('node_modules/@isopodlabs/maths/esm/vector.js'),
+					"@isopodlabs/maths/quaternion": assets.uri('node_modules/@isopodlabs/maths/esm/quaternion.js'),
+				}} />
+				<link rel="stylesheet" type="text/css" href={uri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
+				{stylesheets.map(name => <link rel="stylesheet" type="text/css" href={uri(name)}/>)}
+				<link rel="stylesheet" type="text/css" href={uri('assets/bitmap.css')}/>
 
-	constructor(
-		public webviewPanel: vscode.WebviewPanel,
-		assets: webview.Assets,
-		public document: BitmapDocument
-	) {
+				<title>{title}</title>
+			</head>
+			<body class={bodyClass}>
+				{body}
+				<script type="module" nonce={nonce} src={uri(script)} />
+			</body>
+		</html>
+	);
+}
+
+// the webview which displays an image; subclasses decide what to show in it
+export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
+
+	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets) {
 		super(webviewPanel, assets);
-		this.assetPath = assets.uri('assets');
 
-		const webview = webviewPanel.webview;
-		webview.options = {
+		webviewPanel.webview.options = {
 			enableScripts: true,
 			localResourceRoots: assets.localRoots(),
 		};
 
-		const nonce = Nonce();
-
-		webviewPanel.webview.html = '<!DOCTYPE html>' + JSX.render(
-			<html lang="en">
-				<head>
-					<meta charset="UTF-8" />
-					<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-					<CSP
-						csp={[CSPdefault(assets.root), CSP.self, CSP.unsafe_inline]}
-						script={nonce}
-						img={[CSPdefault(assets.root), CSP.self, vscode.Uri.parse('data:')]}
-					/>
-					<ImportMap nonce={nonce} webview={webview} map={{
-						"@isopodlabs/vscode_utils/webview/": assets.uri('node_modules/@isopodlabs/vscode_utils/dist/webview/'),
-					}} />
-					<link rel="stylesheet" type="text/css" href={this.webviewUri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
-					<link rel="stylesheet" type="text/css" href={this.webviewUri('assets/bitmap.css')}/>
-
-					<title>Bitmap Viewer</title>
-				</head>
-				<body>
-					<canvas id="viewport" />
-					<div id="layer-control" class="hidden">
-						<input id="layer-slider" type="range" min="0" max="0" value="0" />
-						<span id="layer-label">0 / 0</span>
-					</div>
-					<script type="module" nonce={nonce} src={this.webviewUri('out/webview/bitmap.js')} />
-				</body>
-			</html>
-		);
+		webviewPanel.webview.html = webviewPage(webviewPanel, assets, name => this.webviewUri(name), 'out/webview/bitmap.js', 'Bitmap Viewer', [
+			<canvas id="viewport" />,
+			<div id="layer-control" class="hidden">
+				<input id="layer-slider" type="range" min="0" max="0" value="0" />
+				<span id="layer-label">0 / 0</span>
+			</div>,
+		]);
 	}
 
 	async command(message: MessageOut) {
 		switch (message.command) {
 			case 'getShaders': {
-				const loadAsset = async (name: string) => vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.assetPath, name)).then(data => new TextDecoder('utf-8').decode(data));
 				return {
-					vert: await loadAsset(shaders[message.type].vert),
-					frag: await loadAsset(shaders[message.type].frag),
-				}
+					vert: await readShader(this.localUri('assets/' + shaders[message.type].vert)),
+					frag: await readShader(this.localUri('assets/' + shaders[message.type].frag)),
+				};
 			}
 
 			case 'ready':
@@ -106,6 +110,18 @@ class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
 				break;
 		}
 	}
+	abstract loadImage(): Promise<void>;
+}
+
+class BitmapViewer extends ViewerPanel {
+	constructor(
+		webviewPanel: vscode.WebviewPanel,
+		assets: webview.Assets,
+		public document: BitmapDocument
+	) {
+		super(webviewPanel, assets);
+	}
+
 	async loadImage() {
 		try {
 			const data		= this.document.data;
@@ -209,7 +225,6 @@ class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
 
 export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	private readonly editors = new Set<BitmapViewer>();
-	private active: BitmapViewer | undefined;
 	private readonly assets: webview.Assets;
 	private _onDidChangeCustomDocument = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<BitmapDocument>>();
 
@@ -221,14 +236,9 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 		this.assets = new webview.Assets(context.extensionUri);
 		context.subscriptions.push(
 			vscode.window.registerCustomEditorProvider('bitmap.viewer', this, { webviewOptions: { retainContextWhenHidden: true } }),
-			vscode.commands.registerCommand('bitmap.fit', () => this.active?.postMessage({command: 'fitToWindow'})),
-			vscode.commands.registerCommand('bitmap.reset', () => this.active?.postMessage({command: 'resetZoom'})),
 		);
 	}
 
-	private setActive(editor: BitmapViewer) {
-		this.active = editor;
-	}
 	private getEditor(document: BitmapDocument) {
 		for (const editor of this.editors) {
 			if (editor.document === document)
@@ -301,7 +311,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	async resolveCustomEditor(document: BitmapDocument, webviewPanel: vscode.WebviewPanel): Promise<void> {
 		const editor = new BitmapViewer(webviewPanel, this.assets, document);
 		this.editors.add(editor);
-		this.setActive(editor);
+		setActiveViewer(editor);
 
 		webviewPanel.onDidDispose(() => {
 			this.editors.delete(editor);
@@ -309,7 +319,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 
 		webviewPanel.onDidChangeViewState(event => {
 			if (event.webviewPanel.active)
-				this.setActive(editor);
+				setActiveViewer(editor);
 		});
 
 		if (!document.fileWatcher) {

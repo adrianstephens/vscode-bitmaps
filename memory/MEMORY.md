@@ -1,0 +1,1 @@
+- [maths migration](maths-migration.md) — vectors come from @isopodlabs/maths; matrix.ts is only the OpenSCAD layer; postMessage/test gotchas

@@ -17,9 +17,18 @@
 	"files": [
 		"node_modules/@isopodlabs/binary/dist/*.js",
 		"node_modules/@isopodlabs/binary_bitmaps/dist/*.js",
+		"node_modules/@isopodlabs/binary_fonts/dist/*.js",
+		"node_modules/@isopodlabs/binary_ml/dist/*.js",
+		"node_modules/@isopodlabs/binary_meshes/dist/*.js",
+		"node_modules/@isopodlabs/binary_archives/dist/*.js",
+		"node_modules/@isopodlabs/xml/dist/*.js",
+		"node_modules/@isopodlabs/dwg/dist/**/*.js",
+		"node_modules/@isopodlabs/maths/dist/*.js",
+		"node_modules/@isopodlabs/maths/esm/*.js",
 		"node_modules/@isopodlabs/utilities/dist/*.js",
 		"node_modules/@isopodlabs/vscode_utils/dist/**/*.js",
 		"node_modules/@isopodlabs/vscode_utils/assets",
+		"node_modules/@isopodlabs/tison/dist/**/*.js",
 		"out/**/*.js",
 		"assets",
 		"LICENSE.txt",
@@ -74,6 +83,79 @@
 						"filenamePattern": "*.tiff"
 					}
 				]
+			},
+			{
+				"viewType": "gguf.viewer",
+				"displayName": "GGUF Tensor Viewer",
+				"priority": "default",
+				"selector": [
+					{
+						"filenamePattern": "*.gguf"
+					}
+				]
+			},
+			{
+				"viewType": "mesh.viewer",
+				"displayName": "Mesh Viewer",
+				"priority": "default",
+				"selector": [
+					{
+						"filenamePattern": "*.stl"
+					},
+					{
+						"filenamePattern": "*.off"
+					},
+					{
+						"filenamePattern": "*.obj"
+					},
+					{
+						"filenamePattern": "*.ply"
+					},
+					{
+						"filenamePattern": "*.amf"
+					},
+					{
+						"filenamePattern": "*.3mf"
+					},
+					{
+						"filenamePattern": "*.dxf"
+					},
+					{
+						"filenamePattern": "*.dwg"
+					}
+				]
+			},
+			{
+				"viewType": "font.viewer",
+				"displayName": "Font Viewer",
+				"priority": "default",
+				"selector": [
+					{
+						"filenamePattern": "*.ttf"
+					},
+					{
+						"filenamePattern": "*.otf"
+					},
+					{
+						"filenamePattern": "*.ttc"
+					},
+					{
+						"filenamePattern": "*.woff"
+					},
+					{
+						"filenamePattern": "*.woff2"
+					}
+				]
+			},
+			{
+				"viewType": "scad.viewer",
+				"displayName": "OpenSCAD SDF Viewer",
+				"priority": "option",
+				"selector": [
+					{
+						"filenamePattern": "*.scad"
+					}
+				]
 			}
 		],
 		"commands": [
@@ -86,38 +168,99 @@
 				"command": "bitmap.reset",
 				"title": "Reset Zoom",
 				"icon": "$(refresh)"
+			},
+			{
+				"command": "gguf.previousSlice",
+				"title": "GGUF: Previous Slice",
+				"icon": "$(chevron-left)"
+			},
+			{
+				"command": "gguf.nextSlice",
+				"title": "GGUF: Next Slice",
+				"icon": "$(chevron-right)"
+			},
+			{
+				"command": "scad.openPreview",
+				"title": "Open SDF Preview to the Side",
+				"icon": "$(preview)"
+			},
+			{
+				"command": "scad.exportStl",
+				"title": "Export STL…",
+				"icon": "$(package)"
 			}
 		],
 		"menus": {
 			"editor/title": [
 				{
+					"command": "scad.openPreview",
+					"when": "resourceExtname == .scad",
+					"group": "navigation@1"
+				},
+				{
+					"command": "scad.exportStl",
+					"when": "resourceExtname == .scad",
+					"group": "navigation@2"
+				},
+				{
 					"command": "bitmap.fit",
-					"when": "activeCustomEditorId == bitmap.viewer",
+					"when": "activeCustomEditorId == bitmap.viewer || activeCustomEditorId == gguf.viewer || activeCustomEditorId == scad.viewer || activeCustomEditorId == mesh.viewer",
 					"group": "navigation"
 				},
 				{
 					"command": "bitmap.reset",
-					"when": "activeCustomEditorId == bitmap.viewer",
+					"when": "activeCustomEditorId == bitmap.viewer || activeCustomEditorId == gguf.viewer || activeCustomEditorId == scad.viewer || activeCustomEditorId == mesh.viewer",
 					"group": "navigation"
+				},
+				{
+					"command": "gguf.previousSlice",
+					"when": "activeCustomEditorId == gguf.viewer",
+					"group": "navigation@2"
+				},
+				{
+					"command": "gguf.nextSlice",
+					"when": "activeCustomEditorId == gguf.viewer",
+					"group": "navigation@3"
 				}
 			]
+		},
+		"configuration": {
+			"title": "OpenSCAD SDF Viewer",
+			"properties": {
+				"scad.libraryPath": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"description": "Extra directories searched for use <...>/include <...> when the path is not found relative to the including file, the way OpenSCAD's own OPENSCADPATH does. Each use <MCAD/fonts.scad> then checks every listed directory for a MCAD/fonts.scad inside it."
+				}
+			}
 		}
 	},
 	"scripts": {
 		"build": "tsc -b",
 		"watch": "tsc -b -watch",
+		"build-link": "tsc -b ./tsconfig.link.json",
 		"watch-link": "tsc -b -watch ./tsconfig.link.json",
-		"link": "npm link @isopodlabs/binary @isopodlabs/binary_bitmaps @isopodlabs/utilities @isopodlabs/vscode_utils",
-		"update": "npm install @isopodlabs/binary@latest @isopodlabs/binary_bitmaps@latest @isopodlabs/utilities @isopodlabs/vscode_utils@latest"
+		"link": "npm link @isopodlabs/binary @isopodlabs/binary_archives @isopodlabs/binary_bitmaps @isopodlabs/binary_fonts @isopodlabs/binary_meshes @isopodlabs/binary_ml @isopodlabs/dwg @isopodlabs/maths @isopodlabs/tison @isopodlabs/utilities @isopodlabs/vscode_utils",
+		"update": "npm install @isopodlabs/binary@latest @isopodlabs/binary_bitmaps@latest @isopodlabs/binary_ml@latest @isopodlabs/binary_fonts@latest @isopodlabs/binary_meshes@latest @isopodlabs/maths@latest @isopodlabs/utilities @isopodlabs/vscode_utils@latest"
 	},
 	"devDependencies": {
 		"@types/node": "^18",
 		"@types/vscode": "^1.75.0",
+		"puppeteer-core": "^25.12.0",
 		"typescript": "^5.8.0"
 	},
 	"dependencies": {
 		"@isopodlabs/binary": "^2.0.0",
 		"@isopodlabs/binary_bitmaps": "^1.9.1",
+		"@isopodlabs/binary_fonts": "^0.7.0",
+		"@isopodlabs/binary_meshes": "^0.1.0",
+		"@isopodlabs/binary_ml": "^0.1.0",
+		"@isopodlabs/dwg": "file:../../packages/dwg",
+		"@isopodlabs/maths": "^1.0.0",
+		"@isopodlabs/tison": "^0.1.0",
 		"@isopodlabs/utilities": "^1.10.0",
 		"@isopodlabs/vscode_utils": "^0.7.0"
 	}

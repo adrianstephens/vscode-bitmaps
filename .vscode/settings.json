@@ -1,3 +1,10 @@
 {
-    "taskviewer.showLaunches": true
+    "taskviewer.showLaunches": true,
+    "taskviewer.showAll": false,
+    "js/ts.tsserver.watchOptions": {
+        "watchFile": "useFsEvents",
+        "watchDirectory": "useFsEvents",
+        "fallbackPolling": "dynamicPriorityPolling",
+        "synchronousWatchDirectory": true
+    }
 }

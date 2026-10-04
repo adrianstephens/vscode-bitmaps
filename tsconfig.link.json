@@ -3,13 +3,18 @@
 	"compilerOptions": {
 		"composite": true,
 	},
-	"include": ["src/*"],
+	"include": ["src/**/*"],
 	"exclude": ["node_modules", "hidden"],
 	"references": [
-		{ "path": "./webview" },
-		{ "path": "node_modules/@isopodlabs/binary" },
-		{ "path": "node_modules/@isopodlabs/binary_bitmaps" },
-		{ "path": "node_modules/@isopodlabs/utilities" },
+		{ "path": "./webview/tsconfig.link.json" },
+		{ "path": "../../packages/binary" },
+		{ "path": "../../packages/binary-bitmaps" },
+		{ "path": "../../packages/binary-fonts" },
+		{ "path": "../../packages/binary-meshes" },
+		{ "path": "../../packages/binary-ml" },
+		{ "path": "../../packages/dwg" },
+		{ "path": "../../packages/maths" },
+		{ "path": "../../packages/utilities" },
 		{ "path": "../../packages/vscode-utils" }
 	]
 }

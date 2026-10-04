@@ -11,13 +11,8 @@
 			"request": "launch",
 			"runtimeExecutable": "${execPath}",
 			"outFiles": [
-				"${workspaceFolder}/out/**/*.js",
-				"${workspaceFolder}/node_modules/@isopodlabs/binary/dist/*.js",
-				"${workspaceFolder}/node_modules/@isopodlabs/binary_bitmaps/dist/*.js",
-				"${workspaceFolder}/node_modules/@isopodlabs/utilities/dist/*.js",
-				"${workspaceFolder}/node_modules/@isopodlabs/vscode_utils/dist/*.js",
-				//"D:/dev/packages/**.js",
-				//"E:/Github/vscode/out/**/*.js",
+				"${workspaceFolder}/out/src/**/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/*/dist/**/*.js"
 			],
 			"sourceMaps": true,
 			"preLaunchTask": "npm: watch-link",
@@ -37,7 +32,7 @@
 					//"--remote=ssh-remote+ubuntu-adrian",
 					//"/mnt/e/Github/xdg-desktop-portal/xdg-desktop-portal-gnome"
 					//"/Volumes/DevSSD/dev/SkyNetLights/firmware"
-					"/Volumes/DevSSD/dev/shared"
+					//"/Volumes/DevSSD/dev/shared"
 				],
 			},
 			"linux": {
@@ -57,13 +52,16 @@
 			//	//"!**/node_modules/**"
 			//]
 		},
-				{
+		{
 			"name": "Run Extension",
 			"type": "extensionHost",
 			"request": "launch",
 			"runtimeExecutable": "${execPath}",
+			// only the extension host's own output: the webview bundles under out/webview are emitted with inline source
+			// maps and inline sources, and vscode-js-debug parses every map in outFiles before it lets the host start,
+			// which leaves it paused past the readiness timeout (see vscode-js-debug#2265)
 			"outFiles": [
-				"${workspaceFolder}/out/**/*.js",
+				"${workspaceFolder}/out/src/**/*.js",
 			],
 			"sourceMaps": true,
 			"preLaunchTask": "npm: watch",
@@ -75,11 +73,59 @@
 			},
 			"osx": {
 				"args": [
+					"--inspect=127.0.0.1:9229",
 					"--extensionDevelopmentPath=${workspaceFolder}",
 					"/Volumes/DevSSD/dev/shared"
 				],
-			}
+				"autoAttachChildProcesses": false
+			},
+			"timeout": 30000
+		},
+		{
+			// workaround for js-debug connecting to ::1 while the extension host inspector listens on 127.0.0.1 only:
+			// the task opens the dev window paused (--inspect-brk-extensions), and we attach to it by IPv4 address
+			"name": "Run Extension (attach)",
+			"type": "node",
+			"request": "attach",
+			"address": "127.0.0.1",
+			"port": 9230,
+			"timeout": 30000,
+			"continueOnAttach": true,
+			"sourceMaps": true,
+			"preLaunchTask": "Open Extension Dev Window",
+			"skipFiles": [
+				"<node_internals>/**",
+				"**/bootstrap-fork.js"
+			],
+			"outFiles": [
+				"${workspaceFolder}/out/src/**/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/*/dist/**/*.js"
+			],
+			"resolveSourceMapLocations": [
+				"${workspaceFolder}/**",
+				"${workspaceFolder}/node_modules/@isopodlabs/**",
+				"/Volumes/DevSSD/dev/packages/**"
+			],
+		},
+		{
+			"name": "Attach to Extension Host",
+			"type": "node",
+			"request": "attach",
+			"address": "127.0.0.1",
+			"processId": "${command:PickProcess}",
+			"skipFiles": [
+				"<node_internals>/**",
+				"**/bootstrap-fork.js"
+			],
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js",
+				"${workspaceFolder}/node_modules/@isopodlabs/*/dist/**/*.js"
+			],
+			"resolveSourceMapLocations": [
+				"${workspaceFolder}/**",
+				"${workspaceFolder}/node_modules/@isopodlabs/**",
+				"/Volumes/DevSSD/dev/packages/**"
+			],
 		}
-
 	]
 }
