@@ -15,14 +15,14 @@ const STRING	= /"(?:[^"\\]|\\.)*"/;
 // OpenSCAD's lexer.l accepts a leading-digit form (5, 5., 5.5) and a leading-dot form (.5) as separate rules; this
 // is both in one, since the two never overlap (the second alternative needs a digit right after the dot, so it
 // never eats a bare '.', which is the member-access operator).
-const NUMBER = /(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?[fFlL]?/;
+const NUMBER	= /(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?[fFlL]?/;
 
 // The text between the angle brackets of a `use`/`include`, and the directory part of a path.
-const pathOf = (match: string) => match.slice(match.indexOf('<') + 1, -1);
-const dirOf  = (file: string) => file.replace(/[\\/][^\\/]*$/, '');
+const pathOf	= (match: string) => match.slice(match.indexOf('<') + 1, -1);
+const dirOf	= (file: string) => file.replace(/[\\/][^\\/]*$/, '');
 
 // OpenSCAD's escapes are C-like, not JSON (it also has \xNN and \u{...}), so the rule action decodes them itself.
-const unescape = (s: string) => s.slice(1, -1).replace(/\\(.)/g, (_, c: string) => c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c);
+const unescape	= (s: string) => s.slice(1, -1).replace(/\\(.)/g, (_, c: string) => c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c);
 
 // `use`/`include` are keywords only in front of a `<path>`: OpenSCAD's lexer has a state for each
 // (lexer.l's cond_use/cond_include), so with none the word falls through to its ID rule.
@@ -67,7 +67,7 @@ export class UserFunction {
 
 export class LocalScope {
 	assignments:			Assignment[] = [];
-  	moduleInstantiations:	ModuleInstantiation[] = [];
+	moduleInstantiations:	ModuleInstantiation[] = [];
 	functions	= new Map<string, UserFunction>;
 	modules		= new Map<string, UserModule>;
 
@@ -75,32 +75,26 @@ export class LocalScope {
 	addModule(mod: UserModule)				{ this.modules.set(mod.name, mod); }
 	addFunction(func: UserFunction)			{ this.functions.set(func.name, func); }
 	addAssignment(ass: Assignment)			{ this.assignments.push(ass); }
-	hasChildren() 							{ return this.moduleInstantiations.length > 0; }
+	hasChildren()							{ return this.moduleInstantiations.length > 0; }
 };
 
 export class ModuleInstantiation {
 	scope				= new LocalScope;
 	tag_root?:			boolean;
-	tag_highlight?: 	boolean;
+	tag_highlight?:		boolean;
 	tag_background?:	boolean;
-
-	constructor(public modname?: string, public args?: Assignment[]) {
-	}
+	constructor(public modname?: string, public args?: Assignment[]) {}
 }
 
 export class IfElseModuleInstantiation extends ModuleInstantiation {
 	else_scope = new LocalScope;
-
-	constructor(public expr: Expr) {
-		super();
-	}
+	constructor(public expr: Expr) { super(); }
 }
 
 export class SourceFile {
 	scope		= new LocalScope;
 	includes	= new Map<string, string>;
-	usedlibs:	string[]	= [];
-//	indicatorData:	IndicatorData[];
+	usedlibs	= [] as string[];
 
 	constructor(public path: string) {}
 	registerUse(path: string, loc: Location) {
@@ -117,99 +111,23 @@ export class SourceFile {
 	}
 };
 
-export type unaryOps	= '+'|'-'|'~'|'!';
-export type binaryOps	= ','|'+'|'-'|'*'|'/'|'%'|'^'|'<<'|'>>'
-						| '&&'|'||'|'&'|'|'
-						|'<'|'>'|'<='|'>='|'=='|'!='
+export type unaryOps	= '+' | '-' | '~' | '!';
+export type binaryOps	= ',' | '+' | '-' | '*' | '/' | '%' | '^' | '<<' | '>>' | '&&' | '||' | '&' | '|' | '<' | '>' | '<=' | '>=' | '==' | '!='
 
-
-export interface FunctionDefinition {
-	type: 'funcdef';
-	expr: Expr;
-	args: Assignment[];
-}
-
-export interface ArrayLookup {
-	type: 'arraylookup';
-	array: Expr;
-	index: Expr;
-}
-
-export interface Range {
-	type:'range';
-	begin: Expr;
-	step?: Expr;
-	end: Expr;
-}
-
-export interface MemberLookup {
-	type: 'memberlookup';
-	expr: Expr;
-	member: string;
-}
-
-export interface FunctionCall {
-	type: 'functioncall';
-	name: string;
-	expr: Expr;
-	arguments: Assignment[];
-}
-
-export interface Assert {
-	type: 'assert';
-	expr?: Expr;
-	arguments: Assignment[];
-}
-
-export interface Echo {
-	type: 'echo';
-	expr?: Expr;
-	arguments: Assignment[];
-}
-
-export interface Let {
-	type: 'let';
-	expr: Expr;
-	arguments: Assignment[];
-}
-
-export interface LcIf {
-	type: 'lcif';
-	cond: Expr;
-	ifexpr: Expr;
-	elseexpr?: Expr;
-}
-
-export interface LcFor {
-	type: 'lcfor';
-	args: Assignment[];
-//	cond: Expr;
-	expr: Expr;
-}
-
-export interface LcForC {
-	type: 'lcforc';
-	args: Assignment[];
-	incrargs: Assignment[];
-	cond: Expr;
-	expr: Expr;
-}
-
-export interface LcEach {
-	type: 'lceach';
-	expr: Expr;
-}
-
-export interface LcLet {
-	type: 'lcletp';
-	args: Assignment[];
-	expr: Expr;
-}
-
-export interface Vector {
-	type: 'vector';
-	value: Expr[];
-}
+export interface FunctionDefinition	{ type: 'funcdef';		expr: Expr; args: Assignment[]; }
+export interface ArrayLookup		{ type: 'arraylookup';	array: Expr; index: Expr; }
+export interface Range				{ type:'range';			begin: Expr; step?: Expr; end: Expr; }
+export interface MemberLookup		{ type: 'memberlookup';	expr: Expr; member: string; }
+export interface FunctionCall		{ type: 'functioncall';	name: string; expr: Expr; arguments: Assignment[]; }
+export interface Assert				{ type: 'assert';		expr?: Expr; arguments: Assignment[]; }
+export interface Echo				{ type: 'echo';			expr?: Expr; arguments: Assignment[]; }
+export interface Let				{ type: 'let';			expr: Expr; arguments: Assignment[]; }
+export interface LcIf				{ type: 'lcif';			cond: Expr; ifexpr: Expr; elseexpr?: Expr; }
+export interface LcFor				{ type: 'lcfor';		args: Assignment[]; expr: Expr; }
+export interface LcForC				{ type: 'lcforc';		args: Assignment[]; incrargs: Assignment[]; cond: Expr; expr: Expr; }
+export interface LcEach				{ type: 'lceach';		expr: Expr; }
+export interface LcLet				{ type: 'lcletp';		args: Assignment[]; expr: Expr; }
+export interface Vector				{ type: 'vector';		value: Expr[]; }
 
 export type Expr =
 	| Literal<boolean | number | string | undefined>
@@ -318,7 +236,6 @@ class Ctx {
 }
 
 const Rule = makeRule<Ctx>(stampLoc);
-
 
 const fwd_child_statement				= Forward<ModuleInstantiation>(() => child_statement);
 const fwd_expr							= Forward<Expr>(() => expr);
@@ -567,55 +484,6 @@ const vector_element = Rules(
 	expr,
 );
 
-//const vector_elements = Rules(
-//	Rule([vector_element],
-//		$ => {
-//			return {type: 'vector', value: [$[0]]};
-//		}),
-//	Rule([fwd_vector_elements, ',', vector_element],
-//		$ => {
-//			$[0].value.push($[2]);
-//			return $[0];
-//		}),
-//);
-
-//const parameters = Rules(
-//	Rule([/*, empty, */],
-//		_ => {
-//			return [];
-//		}),
-//	Rule([fwd_parameter_list, optional_trailing_comma]),
-//);
-
-//const parameter_list = Rules(
-//	Rule([fwd_parameter],
-//		$ => {
-//			return [$[0]];
-//		}),
-//	Rule([fwd_parameter_list, ',', fwd_parameter],
-//		$ => {
-//			$[0].push($[2]);
-//			return $[0];
-//		}),
-//);
-
-/*
-const argument_list = Rules(
-	Rule([fwd_argument],	$ => [$[0]]),
-	Rule([fwd_argument_list, ',', fwd_argument],	$ => {
-			$[0].push($[2]);
-			return $[0];
-		}),
-);
-*/
-//const arguments_ = Rules(
-//	Rule([/*, empty, */],
-//		_ => {
-//			return [];
-//		}),
-//	Rule([argument_list, optional_trailing_comma]),
-//);
-
 const input = Rules<void>(self => [
 	Rule([]),
 	Rule([self, USE], ($, ctx) => ctx.rootfile.registerUse($[1], {...$.pos, filename: ctx.currfile.path})),
@@ -646,7 +514,7 @@ export const parser = {
 export function parse(code: string, filename = 'main.scad', files?: FileAccess): SourceFile {
 	const ctx = new Ctx(filename, files);
 	const parseOne = (text: string, file: SourceFile) => {
-		ctx.file_stack.push(file);								// stampPos/registerUse record the right file
+		ctx.file_stack.push(file);
 		ctx.scope_stack.push(file.scope);
 		lalr.parse(text, ctx);
 		ctx.scope_stack.pop();
@@ -654,8 +522,8 @@ export function parse(code: string, filename = 'main.scad', files?: FileAccess):
 	};
 	parseOne(code, ctx.rootfile);
 	if (files)
-		for (const [, full] of ctx.rootfile.includes) {		// Map iterators see entries added while iterating,
-			const text = files.read(full);						// so nested includes drain in the same loop
+		for (const [, full] of ctx.rootfile.includes) {
+			const text = files.read(full);
 			if (!text)
 				throw new Error(`Missing included file: ${full}`);
 			parseOne(text, new SourceFile(full));

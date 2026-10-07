@@ -7,6 +7,7 @@ import { GgufViewerProvider } from './GgufViewer';
 import { ScadViewerProvider, exportStl } from './ScadViewer';
 import { MeshViewerProvider } from './MeshViewer';
 import { FontViewerProvider } from './FontViewer';
+import type { MessageIn, EditOp, LayerOp } from '../webview/bitmap';
 
 // `use`/`include` read through the file system, as OpenSCAD's own lexer does. A path that is not there relative to
 // the including file falls back to each directory in scad.libraryPath, the way OpenSCAD's own OPENSCADPATH lets a
@@ -52,6 +53,9 @@ export async function readShader(assetPath: vscode.Uri) {
 }
 
 
+const editViewer = () => activeViewer as {postMessage(message: MessageIn): unknown} | undefined;
+const editOps: (EditOp | LayerOp)[]	= ['fill', 'clear', 'invert', 'flipHorizontal', 'flipVertical', 'rotateClockwise', 'rotateAnticlockwise', 'crop', 'selectAll', 'deselect', 'newLayer', 'deleteLayer', 'raiseLayer', 'lowerLayer'];
+
 export function activate(context: vscode.ExtensionContext) {
 	new BitmapViewerProvider(context);
 	new GgufViewerProvider(context);
@@ -76,6 +80,9 @@ export function activate(context: vscode.ExtensionContext) {
 				path.basename(uri.fsPath)
 			);
 		}),
+		// the bitmap editor's whole-image operations (from the title menu), done by the viewer; only its menu offers them,
+		// so the active viewer is one that takes them
+		...editOps.map(op => vscode.commands.registerCommand(`bitmap.${op}`, () => editViewer()?.postMessage({command: 'imageOp', op}))),
 		vscode.commands.registerCommand('bitmap.fit', () => activeViewer?.postMessage({command: 'fitToWindow'})),
 		vscode.commands.registerCommand('bitmap.reset', () => activeViewer?.postMessage({command: 'resetZoom'})),
 	);

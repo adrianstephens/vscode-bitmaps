@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as bin from '@isopodlabs/binary';
-import { load, asyncLoad, Font, makeCurveVertex, quadraticCurve, bezier2Curve, curvepathDistance2 } from '@isopodlabs/binary_fonts';
+import { load, loadAsync, Font, makeCurveVertex, bezier2Curve, curvepathDistance2, mapCurve } from '@isopodlabs/binary_fonts';
 import { float2 } from '@isopodlabs/maths/vector';
 import type { GlyphAtlas } from '../../webview/sdf';
 
@@ -66,7 +66,7 @@ async function scanFonts(): Promise<FontEntry[]> {
 								(offset, data) => file.read(data, 0, data.length, offset).then(r => r.bytesRead),
 							);
 
-							const result = await asyncLoad(stream);
+							const result = await loadAsync(stream);
 							if (result) {
 								if ('fonts' in result) {
 									// asyncLoadTTC reads a collection's faces one at a time (they share the stream's
@@ -173,8 +173,7 @@ export function findFont(spec: string | undefined, warn: (message: string) => vo
 // this composes with `apply` rather than multiplying matrices together (float2x3.matmul is for a different shape
 // of composition and gives nonsense here; chaining the two functions is exact and needs no matrix algebra at all).
 export function glyphContours(font: Font, glyphId: number, apply: (p: float2) => float2, tol: number) {
-	const curves = font.getGlyphCurves(glyphId);
-	return quadraticCurve(curves.map(v => makeCurveVertex(apply(v.pos), v.flags)), tol);
+	return bezier2Curve(mapCurve(font.getGlyphCurves(glyphId), apply), tol);
 }
 
 export interface TextParams {
@@ -262,7 +261,7 @@ export function layoutText(params: TextParams, warn: (message: string) => void) 
 function commonFont(): Font | undefined {
 	const windows = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'Fonts');
 	const candidates = process.platform === 'darwin'
-		? ['/System/Library/Fonts/Supplemental/STIXGeneral.otf', '/System/Library/Fonts/Helvetica.ttc', '/Library/Fonts/Arial.ttf', '/System/Library/Fonts/Supplemental/Arial.ttf']
+		? ['/System/Library/Fonts/Helvetica.ttc', '/Library/Fonts/Arial.ttf', '/System/Library/Fonts/Supplemental/Arial.ttf']
 		: process.platform === 'win32'
 		? [path.join(windows, 'arial.ttf'), path.join(windows, 'segoeui.ttf')]
 		: ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/TTF/DejaVuSans.ttf'];

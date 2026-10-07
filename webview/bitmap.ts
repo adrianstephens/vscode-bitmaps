@@ -2,6 +2,13 @@ import { Tooltip, vscode, RPC, handleResult, sendResult, RpcMessage } from '@iso
 import { Canvas3D, ShaderProgram, rectGeometry, cubeGeometry, bitmapToImage, getImageData, getPixel } from './opengl.js';
 import { float3, float3x3, float3x4, float4x4, normalise, lerp, orthonormalise } from '@isopodlabs/maths/vector';
 import { unitQuaternion } from '@isopodlabs/maths/quaternion';
+import { Painter, EditOp, DocumentChange, HistoryEntry } from './paint.js';
+import { LayerStack, LayerData, Snapshot, fromData, expand, exportLayer, flipLayers, rotateLayers, cropLayers } from './layers.js';
+import { LayerOps, LayerOp } from './layerops.js';
+import { LayerFan } from './layerfan.js';
+import { LayerCompositor } from './gpulayers.js';
+import { Rect, flip, rotate, crop } from './edit.js';
+export type { EditOp, LayerOp, LayerData };
 
 interface ImageData0 {
 	pixels: ArrayLike<number>;
@@ -9,24 +16,40 @@ interface ImageData0 {
 	height: number;
 }
 
-export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d';
+// the type getTexture is given to get the pixels themselves
+export const RAW_IMAGE = 'image/x-rgba';
+export interface RawImage {
+	width:	number;
+	height:	number;
+	pixels:	ArrayBuffer;	// 8 bits a channel, rgba, the first row on top, not premultiplied
+	// a picture of layers has them too, bottom first, each cut down to what is not transparent; `pixels` is then what they make
+	layers?: (Omit<LayerData, 'pixels' | 'mask'> & {pixels: ArrayBuffer, mask?: Omit<NonNullable<LayerData['mask']>, 'pixels'> & {pixels: ArrayBuffer}})[];
+}
+
+export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d'|'layer'|'composite';
 export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'getShaders', type: shaderType, requestId: number}//result: {vert: string, frag: string}};
+	| {command: 'edited', label: string};	// the image has been changed, undoably
 
 export type MessageIn =
-	| {command: 'load2d', image: ImageData0}
+	| {command: 'load2d', image: ImageData0, layers?: LayerData[]}	// layers, bottom first, over the canvas the image is the size of
 	| {command: 'load2dArray', image: ImageData0, layers: number}
 	| {command: 'loadCube', image: ImageData0}
 	| {command: 'load3d', image: ImageData0, depth: number}
 	| {command: 'loadTexture', data: ArrayBuffer, mimeType: string}
+	| {command: 'imageOp', op: EditOp | LayerOp}	// do a whole-image editing operation, or one to the layers
+	| {command: 'undo'}
+	| {command: 'redo'}
 	| {command: 'fitToWindow'}
 	| {command: 'resetZoom'};
 
 export type MessageRpc =
 	| {command: 'getImage', result: ImageData0}
-	| {command: 'getTexture', type: string, result: ArrayBuffer}
+	// The image as a file of the given type, which a canvas can write (PNG, JPEG); or, for RAW_IMAGE, its raw pixels,
+	// for the extension to write as whatever else it likes
+	| {command: 'getTexture', type: string, result: ArrayBuffer | RawImage}
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -49,6 +72,8 @@ let atlasHeight = 0;
 let animation	= 0;
 
 let programBG:		ShaderProgram;
+let programLayer:	ShaderProgram | undefined;
+let programComposite: ShaderProgram | undefined;
 let program2D:		ShaderProgram;
 let program2DArray:	ShaderProgram;
 let programCube:	ShaderProgram;
@@ -57,6 +82,133 @@ let program3D:		ShaderProgram;
 let program3D2D:	ShaderProgram;
 
 const tooltip = new Tooltip();
+
+// editing, which is only possible with a plain 2D image
+let stack: LayerStack | null = null;	// the layers of a picture which has them; `image` is then only its size, as the picture is on the GPU
+let compositor: LayerCompositor | undefined;	// which has the layers as textures, and makes the picture of them
+
+// The colour of a pixel of the picture. With layers it is read from where it is made.
+function pixelAt(x: number, y: number) {
+	if (!image || x < 0 || y < 0 || x >= image.width || y >= image.height)
+		return undefined;
+	if (!stack || !compositor)
+		return getPixel(image, x, y);
+	const d = compositor.read({x, y, w: 1, h: 1});
+	return {r: d[0], g: d[1], b: d[2], a: d[3]};
+}
+
+// The picture as pixels, all of them (with layers they are read back first)
+function pictureImage() {
+	if (image && stack && compositor)
+		image.data.set(compositor.read({x: 0, y: 0, w: image.width, h: image.height}));
+	return image;
+}
+
+const painter = new Painter({
+	canvas,
+	image:		() => mode !== '2d' ? null : stack ? stack.layer.image : image,
+	pick:		(x, y) => mode === '2d' ? pixelAt(x, y) : undefined,
+	view:	() => ({scale, offset}),
+	toImage(clientX, clientY) {
+		const point = canvas3d.toCanvas(clientX, clientY);
+		return {x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale};
+	},
+	changed(changed, rect) {
+		if (stack) {
+			// a layer's pixels, which may lie anywhere on the canvas
+			const layer = stack.layers.find(l => l.image === changed);
+			if (layer)
+				compositor?.upload(layer, rect);
+			recompose(layer && rect ? {x: rect.x + layer.left, y: rect.y + layer.top, w: rect.w, h: rect.h} : undefined);
+		} else {
+			if (texture && image)
+				canvas3d.updateTexture(texture, image, rect);
+			render();
+		}
+	},
+	transform: transformDocument,
+	edited:	label => postMessage({command: 'edited', label}),
+	panelOpened: () => tooltip.hide(),
+}, $('paint-options'), $('overlay'));
+
+const layerOps = new LayerOps({
+	stack:		() => stack,
+	record:		(label, undo, redo) => painter.record(label, undo, redo),
+	changed:	() => recompose(),
+});
+
+// the layers, fanned out at the right edge
+const fan = new LayerFan({
+	canvas3d, canvas,
+	stage:		$('bitmap-stage'),
+	stack:		() => stack,
+	view:		() => ({scale, offset}),
+	programs:	() => programLayer && {background: programBG, layer: programLayer},
+	layerTexture: layer => compositor?.layerTexture(layer),
+	render:		() => render(),
+	opened(open) {
+		// what is drawn over the picture is not part of the fan
+		$('overlay').style.visibility = open ? 'hidden' : '';
+		if (open)
+			tooltip.hide();
+		else
+			painter.draw();
+	},
+}, layerOps);
+
+// the picture again from the layers (all of it, or a part), and what shows of it
+function recompose(rect?: Rect) {
+	if (!stack || !compositor)
+		return;
+	compositor.compose(stack.width, stack.height, stack.layers, rect);
+	texture = compositor.texture ?? null;
+	render();
+}
+
+// a new picture, perhaps of another size, shown from the start
+function showImage(newImage: ImageData) {
+	image		= newImage;
+	atlasWidth	= image.width;
+	atlasHeight	= image.height;
+	setTexture(canvas3d.createTextureFromImage(image));
+	fitView();
+	render();
+}
+
+// Flip, rotate or crop all of the document. The layers go with it, each as it lies on the canvas (so a crop leaves
+// a layer's pixels outside it, to come back with an undo).
+function transformDocument(change: DocumentChange): HistoryEntry | undefined {
+	if (stack) {
+		const layers = stack;
+		const before = layers.snapshot();
+		const after: Snapshot = change.kind === 'flip' ? flipLayers(before, change.horizontal)
+			: change.kind === 'rotate' ? rotateLayers(before, change.clockwise)
+			: cropLayers(before, change.rect);
+		const use = (s: Snapshot) => () => {
+			layers.restore(s);
+			expand(layers.layer, layers.width, layers.height);	// what the tools draw on covers the canvas
+			fan.reset();
+			image		= new ImageData(layers.width, layers.height);
+			atlasWidth	= image.width;
+			atlasHeight	= image.height;
+			recompose();
+			fitView();
+			render();
+		};
+		use(after)();
+		return {undo: use(before), redo: use(after)};
+	}
+
+	if (!image)
+		return;
+	const before = image;
+	const r = change.kind === 'flip' ? flip(before, change.horizontal)
+		: change.kind === 'rotate' ? rotate(before, change.clockwise)
+		: crop(before, change.rect);
+	const after = new ImageData(r.data as Uint8ClampedArray<ArrayBuffer>, r.width, r.height);
+	showImage(after);
+	return {undo: () => showImage(before), redo: () => showImage(after)};
+}
 
 let mode		= '';
 let currentLayer = 0;
@@ -135,6 +287,10 @@ function render() {
 
 	switch (mode) {
 		case '2d':
+			if (fan.active) {
+				fan.draw();
+				break;
+			}
 			if (program2D) {
 				canvas3d.bindTexture(gl.TEXTURE_2D, texture);
 				program2D.draw({
@@ -145,6 +301,7 @@ function render() {
 					u_offset:  	[offset.x, offset.y],
 				});
 			}
+			painter.draw();
 			break;
 
 		case '2d-array':
@@ -268,7 +425,7 @@ canvas.addEventListener('pointermove', event => {
 			const point = canvas3d.toCanvas(event.clientX, event.clientY);
 			const x = Math.floor((point.x - offset.x) / scale);
 			const y = Math.floor((point.y - offset.y) / scale);
-			const colour = getPixel(image, x, y);
+			const colour = pixelAt(x, y);
 			if (colour) {
 				tooltip.show(`Pixel ${x}, ${y} — R:${colour.r} G:${colour.g} B:${colour.b} A:${colour.a}`, event.clientX + 12, event.clientY + 12);
 				return;
@@ -317,15 +474,17 @@ canvas.addEventListener('pointerleave', () => {
 
 function resizeCanvas() {
 	canvas3d.resize();
+	painter.resize();
 
 	scale	= clampScale(scale);
 	offset	= clampOffset(offset.x, offset.y);
 }
 
-window.addEventListener('resize', () => {
+// the canvas changes size with the window, and with the tool bars of the editor coming and going or wrapping
+new ResizeObserver(() => {
 	resizeCanvas();
 	render();
-});
+}).observe(canvas);
 
 function clampScale(scale: number) {
 	const minScale = Math.min(canvas.width / atlasWidth, canvas.height / atlasHeight);
@@ -354,6 +513,14 @@ function clampOffset(x: number, y: number) {
 }
 
 canvas.addEventListener('pointerdown', event => {
+	if (mode === '2d') {
+		if (fan.pointerDown(event) || painter.pointerDown(event))
+			return;
+		// a right click (or control-click) opens the context menu, which takes the button's release with it: a drag begun
+		// here would never end
+		if (event.button === 2 || (event.button === 0 && event.ctrlKey && navigator.platform.toLowerCase().includes('mac')))
+			return;
+	}
 	canvas.setPointerCapture(event.pointerId);
 	let onMove: (event: PointerEvent) => void;
 
@@ -419,11 +586,13 @@ canvas.addEventListener('pointerdown', event => {
 		canvas.removeEventListener('pointermove', onMove);
 		canvas.removeEventListener('pointerup', onUp);
 		canvas.removeEventListener('pointercancel', onUp);
+		canvas.removeEventListener('lostpointercapture', onUp);
 	};
 
 	canvas.addEventListener('pointermove', onMove);
 	canvas.addEventListener('pointerup', onUp);
 	canvas.addEventListener('pointercancel', onUp);
+	canvas.addEventListener('lostpointercapture', onUp);
 });
 
 canvas.addEventListener('wheel', event => {
@@ -530,8 +699,14 @@ window.addEventListener('message', async event => {
 		return;
 
 	const message = event.data as MessageIn | RpcMessage<MessageRpc>;
-	if (message.command.startsWith('load'))
+	if (message.command.startsWith('load')) {
 		tooltip.hide();
+		stack = null;
+		fan.reset();
+		compositor?.release();
+		compositor = undefined;
+		texture = null;
+	}
 
 	switch (message.command) {
 		case 'loadTexture': {
@@ -542,6 +717,8 @@ window.addEventListener('message', async event => {
 			atlasHeight	= image.height;
 			setTexture(canvas3d.createTextureFromImage(image));
 			mode	= '2d';
+			painter.reset();
+			painter.enabled(true);
 			fitView();
 			render();
 			break;
@@ -549,11 +726,23 @@ window.addEventListener('message', async event => {
 		case 'load2d':
 			await init2d();
 			image	= convertImage(message.image);
+			if (message.layers?.length) {
+				stack = new LayerStack(image.width, image.height, message.layers.map(fromData));
+				expand(stack.layer, stack.width, stack.height);
+				programLayer		??= canvas3d.createProgram(await RPC<{vert: string, frag: string}>({command: 'getShaders', type: 'layer'}), rectGeometry);
+				programComposite	??= canvas3d.createProgram(await RPC<{vert: string, frag: string}>({command: 'getShaders', type: 'composite'}), rectGeometry);
+				compositor = new LayerCompositor(canvas3d, programComposite);
+				compositor.compose(stack.width, stack.height, stack.layers);
+				texture = compositor.texture ?? null;
+			}
 			atlasWidth	= image.width;
 			atlasHeight	= image.height;
-			setTexture(canvas3d.createTextureFromImage(image));
+			if (!stack)
+				setTexture(canvas3d.createTextureFromImage(image));
 			mode	= '2d';
 			$('layer-control').classList.add('hidden');
+			painter.reset();
+			painter.enabled(true);
 			fitView();
 			render();
 			break;
@@ -569,6 +758,7 @@ window.addEventListener('message', async event => {
 			atlasHeight	= sliceHeight;
 			setTexture(canvas3d.create2DArrayTexture(image, message.layers));
 			mode		= '2d-array';
+			painter.enabled(false);
 			currentLayer = 0;
 			layerSlider.max = String(message.layers - 1);
 			layerSlider.value = '0';
@@ -592,6 +782,7 @@ window.addEventListener('message', async event => {
 			sliceHeight	= image.height / 6;
 			setTexture(canvas3d.createCubeTextureFromImage(image));
 			mode	= 'cube';
+			painter.enabled(false);
 			fitView();
 			render();
 			break;
@@ -609,8 +800,24 @@ window.addEventListener('message', async event => {
 			sliceHeight	= image.height / message.depth;
 			setTexture(canvas3d.create3DTextureFromImage(image, message.depth));
 			mode	= '3d';
+			painter.enabled(false);
 			fitView();
 			render();
+			break;
+
+		case 'imageOp':
+			if (message.op === 'newLayer' || message.op === 'deleteLayer' || message.op === 'raiseLayer' || message.op === 'lowerLayer')
+				layerOps.run(message.op);
+			else
+				painter.run(message.op);
+			break;
+
+		case 'undo':
+			painter.undo();
+			break;
+
+		case 'redo':
+			painter.redo();
 			break;
 
 		case 'fitToWindow':
@@ -639,15 +846,28 @@ window.addEventListener('message', async event => {
 
 		//RPC cases
 		case 'getImage':
-			if (image)
-				sendResult(message.requestId, { pixels: image.data, width: image.width, height: image.height });
+			if (pictureImage())
+				sendResult(message.requestId, { pixels: image!.data, width: image!.width, height: image!.height });
 			else
 				sendResult(message.requestId);
 			break;
 
 		case 'getTexture':
-			if (image) {
-				getImageData(image, message.type)?.then(async blob => {
+			if (pictureImage() && message.type === RAW_IMAGE) {
+				const raw: RawImage = {width: image!.width, height: image!.height, pixels: image!.data.slice().buffer};
+				if (stack) {
+					raw.layers = stack.layers.map(layer => {
+						const {pixels, mask, ...data} = exportLayer(layer);
+						return {
+							...data,
+							pixels:	(pixels as Uint8ClampedArray).slice().buffer,
+							mask:	mask && {...mask, pixels: (mask.pixels as Uint8ClampedArray).slice().buffer},
+						};
+					});
+				}
+				sendResult(message.requestId, raw);
+			} else if (image) {
+				getImageData(pictureImage()!, message.type)?.then(async blob => {
 					if (blob)
 						sendResult(message.requestId, await blob.arrayBuffer());
 					else

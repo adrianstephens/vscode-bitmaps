@@ -8,9 +8,9 @@ import * as path from 'path';
 import { files, setActiveViewer, readShader } from './extension';
 import { webviewPage } from './BitmapViewer';
 import type { MessageOut, MessageIn } from '../webview/sdf';
-import { evaluateWithImages, FileCache } from './scad/evaluate';
+import { evaluateWithFiles, FileCacheEntry } from './scad/evaluate';
 import { buildIndex, digitAtlas } from './scad/fonts';
-import { bounds, emitGlsl, countPrimitives, emptyReason, materials, union } from './scad/sdf';
+import { bounds3, emitGlsl, countPrimitives, emptyReason, materials, union } from './scad/sdf';
 import { float3 } from '@isopodlabs/maths/vector';
 
 import { meshAdaptive, checkMesh, Cancelled } from './scad/mesher';
@@ -25,7 +25,7 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 	// a render that waits on a surface()'s PNG can be overtaken by a later edit's, and only the latest is drawn
 	private renders		= 0;
 	// what the files this document reads amount to, so an edit does not rebuild an imported mesh that has not changed
-	private fileCache	= new FileCache();
+	private fileCache	= new Map<string, FileCacheEntry>();
 
 	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, public document: vscode.TextDocument) {
 		super(webviewPanel, assets);
@@ -66,19 +66,19 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 		const text = this.document.getText();
 		const name = this.document.uri.fsPath;
 		try {
-			const evaluated = await evaluateWithImages(text, name, files, this.fileCache);
+			const evaluated = await evaluateWithFiles(text, name, files, this.fileCache);
 			const {warnings} = evaluated;
 			let sdf = evaluated.sdf;
 			if (evaluated.flat) {
 				// 2-D shapes outside an extrude are drawn as sheets, a thousandth of the picture thick
-				const all = bounds(union([sdf, evaluated.flat(0)]));
+				const all = bounds3(union([sdf, evaluated.flat(0)]));
 				if (all)
 					sdf = union([sdf, evaluated.flat(Math.max(all.max.x - all.min.x, all.max.y - all.min.y, all.max.z - all.min.z) * 1e-3)]);
 			}
 			const empty = emptyReason(sdf, warnings);
 			if (empty)
 				return {error: empty};
-			const box = bounds(sdf)!;
+			const box = bounds3(sdf)!;
 
 			const {helpers, body, data} = emitGlsl(sdf);
 			// map() returns the distance and the material together, so both come out of the one evaluation
@@ -184,13 +184,13 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 
 	try {
 		// a final export, not the live preview -- OpenSCAD's own $preview is false for this too
-		const result	= await evaluateWithImages(document.getText(), target.fsPath, files, undefined, false);
+		const result	= await evaluateWithFiles(document.getText(), target.fsPath, files, new Map<string, FileCacheEntry>, false);
 		const empty		= emptyReason(result.sdf, result.warnings);
 		if (empty)
 			throw empty;
 
 		const sdf		= result.sdf;
-		const box		= bounds(sdf)!;
+		const box		= bounds3(sdf)!;
 		const size		= box.max.sub(box.min);
 		const longest	= Math.max(size.x, size.y, size.z);
 

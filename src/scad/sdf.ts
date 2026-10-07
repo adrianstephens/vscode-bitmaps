@@ -3,6 +3,7 @@
 // are primitives, and the combinators are exactly the SDF operations the scad constructs mean. Each term can be
 // emitted as glsl for the raymarcher, or evaluated here, which is how the model can be measured without a GPU.
 import { vec, E3, float2, float3, float3x3, float3x4, safeNormalise } from '@isopodlabs/maths/vector';
+import { curvepathDistance2, bezier2Curve, parseCurve } from '@isopodlabs/binary_fonts';
 import { eigenSymmetric } from '@isopodlabs/maths/linear';
 import { type TriMesh, trimeshDistance } from './meshfield';
 
@@ -23,13 +24,6 @@ export interface Support {
 	bound:	number;				// how far the operand can reach from the origin, for the bounding box
 }
 
-// One segment of a curvepath2, ending at `b` (a straight line, or a quadratic Bezier through control point `c`).
-// The segment's own start point is implicit: the path's own start for the first segment, or the previous segment's
-// `b` for every other one -- the same convention polygon2's paths use for their points, one step removed.
-export type Seg2 =
-	| {t: 'line', b: float2}
-	| {t: 'quad', c: float2, b: float2};
-
 export type Sdf =
 	| {k: 'empty'}
 	| {k: 'sphere', r: number}
@@ -44,7 +38,8 @@ export type Sdf =
 	| {k: 'intersection', children: Sdf[]}
 	| {k: 'difference', base: Sdf, cuts: Sdf[]}
 	| {k: 'domain', m: float3x4, scale: number, body: Sdf}		// the body is built in the frame m
-	| {k: 'dilate', body: Sdf, support: Support}			// body grown by the operand's support function
+	| Warp														// the body is built flat and bent into a revolution
+	| {k: 'dilate', body: Sdf, support: Support}				// body grown by the operand's support function
 	// hull() of exactly two same-radius spheres/circles is a capsule/stadium, not a dilated solid hull (a solid hull
 	// needs 4 non-coplanar points; two spheres give only a segment) -- see hullOf() below
 	| {k: 'capsule', a: float3, b: float3, r: number}
@@ -56,20 +51,20 @@ export type Sdf =
 	// surface(): a height at each point of a grid (x the column, y the row, a unit apart), over a solid down to `bottom`
 	// -- built by heightmap(), which says what the tiles are for
 	| Heightmap
-	| TriMesh												// import()ed meshes and polyhedron()s that are not convex
+	| TriMesh													// import()ed meshes and polyhedron()s that are not convex
 	// 2-D shapes: fields of the plane that no z can change. They are not solids, so a union skips them for bounds
 	// and anything left at the top level is reported rather than drawn as the infinite prism the field describes.
-	| {k: 'circle2', r: number, n: number}				// n = 0 is a smooth circle, otherwise an n-gon
+	| {k: 'circle2', r: number, n: number}						// n = 0 is a smooth circle, otherwise an n-gon
 	| {k: 'square2', size: float2, center: boolean}
-	| {k: 'polygon2', paths: float2[][]}		// each path a closed loop; more than one is holes/islands by even-odd fill
+	| {k: 'polygon2', paths: float2[][]}						// each path a closed loop; more than one is holes/islands by even-odd fill
 	// a closed path of lines and quadratic Beziers (text()'s glyph outlines, in the font's own curves rather than a
 	// flattened polygon), each path its own start point and the segments that lead from it back around to it again
-	| {k: 'curvepath2', paths: {start: float2, segs: Seg2[]}[]}
-	| {k: 'stadium2', a: float2, b: float2, r: number}	// hull() of two same-radius circles: 'capsule''s 2-D form
-	| {k: 'offset', r: number, body: Sdf}				// offset(r): the shape grown by a disc
+	| {k: 'curvepath2', paths: bezier2Curve }
+	| {k: 'stadium2', a: float2, b: float2, r: number}			// hull() of two same-radius circles: 'capsule''s 2-D form
+	| {k: 'offset', r: number, body: Sdf}						// offset(r): the shape grown by a disc
 	| {k: 'extrude', h: number, center: boolean, body: Sdf}		// linear_extrude of a 2-D shape
-	| {k: 'revolve', angle: number, body: Sdf}			// rotate_extrude of a 2-D shape, about z
-	| {k: 'material', mat: Material, body: Sdf};			// color()/$variables round the body, which they tint
+	| {k: 'revolve', angle: number, body: Sdf}					// rotate_extrude of a 2-D shape, about z
+	| {k: 'material', mat: Material, body: Sdf};				// color()/$variables round the body, which they tint
 
 export const empty: Sdf = {k: 'empty'};
 
@@ -85,6 +80,72 @@ export interface Heightmap {
 	tilesY:		number;
 	nearTop:	Float32Array;		// per tile: the highest point in it and the tiles round it
 	nearSlope:	Float32Array;		// per tile: 1 / sqrt(1 + L^2), L the steepest slope in it and the tiles round it
+	wrap?:		Wrap;				// absent for OpenSCAD's own flat surface(); see Wrap
+	tiled?:		Tiled;				// absent for a grid that ends; read by wrap(), which see
+}
+
+// Which of a grid's axes repeat: surface()'s `tiled`, false, true or [x, y]. A tiled grid is a tile laid over and
+// over rather than a surface that ends: its columns repeat, and if asked its rows do too. It is only meaningful once
+// the grid is wrapped (see Wrap); a flat surface() still lays out the one rectangle it is, because without a surface
+// to tile over there is no period for the pattern to have.
+export interface Tiled {
+	x:		boolean;
+	y:		boolean;
+}
+
+// A heightmap's grid bent into space rather than laid on the plane: the columns become a turn about z and the rows a
+// height (a cylinder) or a latitude (a sphere), and r is the surface it is bent around -- the base. Both kinds are
+// full turns, so the grid is periodic in its columns -- column `cols` is column 0 again and the last cell meets the
+// first, which is what makes a wrap seamless. A wrapped grid is then measured from that base: heightmap() moves the
+// grid's own floor onto r and its heights become thicknesses, so the solid is the shell from r out to it, a
+// lithophane, and r names the base whatever the grid's z values were -- OpenSCAD's own floor, the one below the
+// lowest height that surface() adds, is simply the innermost of the shell. One thing differs in the tile table a
+// wrapped map carries: `nearSlope` holds the steepest slope L itself, not 1 / sqrt(1 + L^2), because that factor
+// depends on the radius the point has -- see wrappedHeightmapDistance. And a sphere's first and last rows are the
+// poles, one point each, so heightmap() gives each its own mean height.
+//
+// A tiled grid's columns -- and, if asked, its rows -- repeat rather than ending. The turn is still a whole one, but
+// the grid is no longer fitted to it: one column covers `sx` of arc and one row `sy`, so scaling the grid sets the
+// size of the tile and with it how many times the tile comes round, where an untiled grid's own width fills the turn
+// whatever it is. On a sphere the rows still run pole to pole unless they are tiled too, since the poles are where a
+// whole ring of columns meets and a row that did not land on one could not give that point a single height.
+export interface Wrap {
+	kind:	'cylinder' | 'sphere';
+	r:		number;
+	row?:	number;				// how far apart the rows are: the axis one row covers, or a scale before the wrap
+	tileX?:	boolean;			// the columns repeat: sx of arc each, rather than the fitted whole turn
+	tileY?:	boolean;			// the rows repeat: sy each, rather than the fitted meridian or the scaled axis
+	sx?:	number;				// the arc one column covers, when tileX
+	sy?:	number;				// the arc, or length up the axis, one row covers, when tileY
+	part?:	boolean;			// the grid covers only the arc its own width is: the columns end rather than close
+}
+
+// A shape bent into a revolution rather than laid flat: its x becomes a turn about z, its y a height (a cylinder) or
+// a latitude (a sphere), and its z a thickness standing out from the surface of radius r. This is what wrapping a
+// heightmap around a sphere or a cylinder is (see Heightmap's own `wrap`, which is this specialised to a grid bent as
+// one piece, and is tighter and seamless where it applies), and it takes anything: a texture, extruded text, a solid.
+// r is the base -- the surface the body is wrapped around -- whatever the body's own z range is: the body's lowest
+// point sits on it and its height out to its highest is how far the solid stands off. The map is not a similarity, so
+// the body's distance is carried back through it and scaled by the least it stretches there -- a bound on the
+// distance rather than the distance itself, like the flat heightmap's.
+//
+// How far round it goes is the body's own business, as it would be for any other transform: its x is an arc of r, so
+// a piece twice as wide covers twice as much of the turn, and scaling it is how one asks for less than a whole one.
+// A body already a circumference wide is fitted to exactly one turn rather than lapping itself, and one that covers a
+// sphere's poles is fitted to them; the ends of a shorter one are real ends, the solid cut off at those two
+// meridians, and a point carrying a distance that reaches past them is caught by them (see warpDistance).
+//
+// A cylinder's y is the axis, and an axis has no length of its own the way a turn has: it is the body's own height
+// unless the bend was given one (`h`), which is the surface's second dimension as a cylinder primitive has it. A
+// body given one is fitted to it -- its rows are spread over the axis rather than sizing it -- so `h` says how long
+// the tube is rather than how long the body is, and the body's z still says how thick it stands off r.
+export interface Warp {
+	k:		'warp';
+	kind:	'cylinder' | 'sphere';
+	r:		number;
+	box:	Box3;				// the body's own bounds: the slab being bent, and what says how far round it reaches
+	axis?:	number;				// a cylinder's axis, when the bend was given one: the body's y is fitted to it
+	body:	Sdf;
 }
 
 // a glsl float literal, always with a decimal point so it is not read as an int
@@ -125,7 +186,7 @@ const expand3 = (s: number) => float3(s, s, s);
 
 // The box the model lives in, from each primitive's own extents: conservative where a shape's exact box is awkward
 // (an n-gon is taken as its circumcircle), which only makes the camera a little further back and the trace a little longer.
-export function bounds(s: Sdf): Box3 | undefined {
+export function bounds3(s: Sdf): Box3 | undefined {
 	switch (s.k) {
 		case 'empty':
 			return undefined;
@@ -158,14 +219,21 @@ export function bounds(s: Sdf): Box3 | undefined {
 			const r = Math.max(s.r1, s.r2);
 			return {min: s.a.min(s.b).sub(expand3(r)), max: s.a.max(s.b).add(expand3(r))};
 		}
-		case 'heightmap':
-			return {min: float3(0, 0, s.bottom), max: float3(s.cols - 1, s.rows - 1, s.top)};
+		case 'heightmap': {
+			if (!s.wrap)
+				return {min: float3(0, 0, s.bottom), max: float3(s.cols - 1, s.rows - 1, s.top)};
+			// a wrapped map lives on a surface of radius r: the sphere's own box, or the cylinder's, rows one apart
+			const R = Math.max(s.wrap.r + Math.max(s.top, s.bottom), 0), h = (s.rows - 1) / 2 * (s.wrap.row ?? 1);
+			return s.wrap.kind === 'sphere'
+				? {min: expand3(-R), max: expand3(R)}
+				: {min: float3(-R, -R, -h), max: float3(R, R, h)};
+		}
 		case 'trimesh':
 			return {min: s.min, max: s.max};
 		case 'union': {
 			let out: Box3 | undefined;
 			for (const c of s.children) {
-				const b = bounds(c);
+				const b = bounds3(c);
 				if (!b)
 					continue;
 				out = out ? {min: out.min.min(b.min),  max: out.max.max(b.max)} : b;
@@ -177,7 +245,7 @@ export function bounds(s: Sdf): Box3 | undefined {
 			// 2-D shape, say) does not narrow it, the same as it does not widen a union's
 			let out: Box3 | undefined;
 			for (const c of s.children) {
-				const b = bounds(c);
+				const b = bounds3(c);
 				if (!b)
 					continue;
 				out = out ? {min: out.min.max(b.min), max: out.max.min(b.max)} : b;
@@ -186,13 +254,13 @@ export function bounds(s: Sdf): Box3 | undefined {
 			return out && out.min.x <= out.max.x && out.min.y <= out.max.y && out.min.z <= out.max.z ? out : undefined;
 		}
 		case 'difference':
-			return bounds(s.base);
+			return bounds3(s.base);
 		case 'domain': {
 			// A shape with its own corners -- a polyhedron, an n-gon -- is bounded by those, not by the corners of its
 			// axis-aligned box: a rotation carries the box's corners a long way out past the shape they contain.
-			let corners = verticesOf(s.body);
+			let corners = verticesOf3(s.body);
 			if (!corners) {
-				const b = bounds(s.body);
+				const b = bounds3(s.body);
 				if (!b)
 					return undefined;
 				corners = [];
@@ -207,11 +275,21 @@ export function bounds(s: Sdf): Box3 | undefined {
 			}
 			return {min, max};
 		}
+		case 'warp': {
+			// the body's z is the radius it stands off r, and its y runs along the axis (a cylinder) or from pole to
+			// pole (a sphere, which the turn's own angle then cuts a lune out of)
+			const R = s.r + (s.box.max.z - s.box.min.z);	// the body's floor sits on r, its top is the thickness
+			if (s.kind === 'sphere')
+				return {min: expand3(-R), max: expand3(R)};
+			// the axis the bend was given, or the body's own height -- which is what h defaults to, the body fitted
+			// to an axis of its own length being the body itself
+			const h = (s.axis ?? (s.box.max.y - s.box.min.y)) / 2;
+			return {min: float3(-R, -R, -h), max: float3(R, R, h)};
+		}
 		case 'dilate': {
-			const b = bounds(s.body);
+			const b = bounds3(s.body);
 			if (!b)
-				return undefined;
-			// A flat brush grows the body only in its own plane: a disc of radius r whose normal is dir reaches
+				return undefined;			// A flat brush grows the body only in its own plane: a disc of radius r whose normal is dir reaches
 			// r * sqrt(1 - dir_a^2) along axis a, so along the direction it is flat in the box does not grow at all.
 			const brush = s.support.q ? planeBrush(s.body, s.support) : undefined;
 			if (brush) {
@@ -222,7 +300,7 @@ export function bounds(s: Sdf): Box3 | undefined {
 			return {min: b.min.sub(expand3(s.support.bound)), max: b.max.add(expand3(s.support.bound))};
 		}
 		case 'material':
-			return bounds(s.body);
+			return bounds3(s.body);
 		case 'extrude': {
 			// the one place a 2-D shape becomes a solid, and so the one place with bounds
 			const b = bounds2(s.body);
@@ -271,16 +349,8 @@ export function bounds2(s: Sdf): Box2 | undefined {
 		case 'curvepath2': {
 			// a quadratic Bezier always lies within the hull of its own start, control and end points, so their box
 			// is a safe (if occasionally slightly loose, for a curve that doesn't reach its control point's corner) bound
-			let min = expand2(Infinity), max = expand2(-Infinity);
-			let any = false;
-			for (const path of s.paths) {
-				min = min.min(path.start); max = max.max(path.start); any = true;
-				for (const seg of path.segs) {
-					if (seg.t === 'quad') { min = min.min(seg.c); max = max.max(seg.c); }
-					min = min.min(seg.b); max = max.max(seg.b);
-				}
-			}
-			return any ? {min, max} : undefined;
+			const ext = float2.extent.from(s.paths.map(v => float2(v.x, v.y)));
+			return ext;
 		}
 		case 'offset': {
 			const b = bounds2(s.body);
@@ -315,7 +385,7 @@ export function bounds2(s: Sdf): Box2 | undefined {
 // top level" says nothing about which name was undef. Returns undefined when there is something to draw.
 export function emptyReason(sdf: Sdf, warnings: string[]): string | undefined {
 	const why = warnings.length ? `\n\nThe evaluator also reported:\n  ${warnings.join('\n  ')}` : '';
-	const box = bounds(sdf);
+	const box = bounds3(sdf);
 	if (!box)
 		return `nothing is drawn: no geometry reached the top level (check the conditions around it).${why}`;
 	if (!Number.isFinite(box.min.x) || !Number.isFinite(box.min.y) || !Number.isFinite(box.min.z))
@@ -403,10 +473,10 @@ export function tri2(q: float2, a: float2, b: float2, c: float2): number {
 // that cannot be folded into the shape's own distance formula can be rebuilt from its transformed corners instead
 // (see place(), in evaluate.ts). undefined for a shape whose box is the honest answer -- a sphere, a cylinder's
 // round side, anything already a combinator of several bodies rather than one with corners of its own.
-export function verticesOf(s: Sdf): float3[] | undefined {
+export function verticesOf3(s: Sdf): float3[] | undefined {
 	switch (s.k) {
 		case 'material':
-			return verticesOf(s.body);
+			return verticesOf3(s.body);
 		case 'planes': case 'trimesh':
 			return [...s.points];
 		case 'box': {
@@ -527,7 +597,7 @@ export function mitredOffset2(points: float2[], delta: number, ccw: boolean): fl
 // carried out to infinity in z bounds it just as well -- and gives a union of them the same culling any other union
 // gets, instead of every glyph being asked at every step.
 function cullBox(s: Sdf): Box3 | undefined {
-	const b = bounds(s);
+	const b = bounds3(s);
 	if (b || !is2d(s))
 		return b;
 	const b2 = bounds2(s);
@@ -683,6 +753,8 @@ export function evalSdf(s: Sdf, p: float3): number {
 			const q = inv.mulPos(p)
 			return evalSdf(s.body, q) * s.scale;
 		}
+		case 'warp':
+			return warpDistance(s, p);
 		case 'material':
 			return evalSdf(s.body, p);
 		case 'circle2':
@@ -696,7 +768,7 @@ export function evalSdf(s: Sdf, p: float3): number {
 		case 'polygon2':
 			return polygonDistance2(p.x, p.y, s.paths);
 		case 'curvepath2':
-			return curvepathDistance2(p.x, p.y, s.paths);
+			return curvepathDistance2(p.xy, s.paths);
 		case 'offset':
 			return evalSdf(s.body, p) - s.r;
 		case 'extrude': {
@@ -900,103 +972,8 @@ export function polygonDistance2(px: number, py: number, paths: float2[][]): num
 			const t = Math.max(0, Math.min(1, (wx * ex + wy * ey) / (ex * ex + ey * ey || 1)));
 			d2 = Math.min(d2, (wx - ex * t) ** 2 + (wy - ey * t) ** 2);
 			const c0 = py >= ay, c1 = py < by, c2 = ex * wy > ey * wx;
-			if ((c0 && c1 && c2) || (!c0 && !c1 && !c2))
+			if (c0 === c1 && c0 === c2)
 				sign = -sign;
-		}
-	}
-	return sign * Math.sqrt(d2);
-}
-
-// Unsigned squared distance from p to the quadratic Bezier through a, control point c, and b: the exact nearest
-// point, found by solving for the zero of the derivative of |B(t)-p|^2 (a cubic in t) via Cardano's method, one or
-// three real roots, each clamped to [0,1] since the curve is only defined on that range. See sdBezier2 in
-// sdflib.frag for the same formula in GLSL -- kept in step with this one by hand, since nothing generates either
-// from the other.
-function bezierDistance2(p: float2, a: float2, c: float2, b: float2): number {
-	const A = c.sub(a), B = a.sub(c.scale(2)).add(b), C = A.scale(2), D = a.sub(p);
-	const bb = B.dot(B);
-	if (bb < 1e-9) {
-		// the control point is the midpoint of a and b: not really a curve, just the line from a to b
-		const e = b.sub(a), w = p.sub(a);
-		const t = Math.max(0, Math.min(1, w.dot(e) / (e.dot(e) || 1)));
-		const cc = w.sub(e.scale(t));
-		return cc.dot(cc);
-	}
-	const clamp01 = (t: number) => Math.max(0, Math.min(1, t));
-	const at2 = (t: number) => { const qq = D.add(C.add(B.scale(t)).scale(t)); return qq.dot(qq); };
-	const cbrt = (x: number) => Math.sign(x) * Math.pow(Math.abs(x), 1 / 3);
-	const kk = 1 / bb;
-	const kx = kk * A.dot(B);
-	const ky = kk * (2 * A.dot(A) + D.dot(B)) / 3;
-	const kz = kk * D.dot(A);
-	const p1 = ky - kx * kx;
-	const p3 = p1 * p1 * p1;
-	const q = kx * (2 * kx * kx - 3 * ky) + kz;
-	const h = q * q + 4 * p3;
-	if (h >= 0) {
-		const hs = Math.sqrt(h);
-		const t = clamp01(cbrt((hs - q) / 2) + cbrt((-hs - q) / 2) - kx);
-		return at2(t);
-	}
-	const z = Math.sqrt(-p1);
-	const v = Math.acos(q / (p1 * z * 2)) / 3;
-	const m = Math.cos(v), n = Math.sin(v) * Math.sqrt(3);
-	return Math.min(at2(clamp01((m + m) * z - kx)), at2(clamp01((-n - m) * z - kx)), at2(clamp01((n - m) * z - kx)));
-}
-
-// The even-odd crossing multiplier a quadratic Bezier (a, c, b) contributes to a horizontal ray cast from p towards
-// +x -- the curved generalisation of polygonDistance2's per-edge crossing test. A curve need not be monotonic in y
-// the way a straight edge always is, so it can cross the ray 0, 1 or 2 times within one segment; each root of
-// y(t) = p.y is counted only where the crossing is transversal (y'(t) != 0 there -- a tangency touches the ray
-// without crossing it), and only for t in [0, 1), the same half-open convention polygonDistance2 uses so a curve
-// shares no double-count with the segment before it at their shared point.
-function bezierCrossing2(p: float2, a: float2, c: float2, b: float2): number {
-	const A = a.y - 2 * c.y + b.y, B = 2 * (c.y - a.y), C = a.y - p.y;
-	let mult = 1;
-	const consider = (t: number, dy: number) => {
-		if (t >= 0 && t < 1 && Math.abs(dy) > 1e-12) {
-			const x = (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * c.x + t * t * b.x;
-			if (x > p.x)
-				mult = -mult;
-		}
-	};
-	if (Math.abs(A) < 1e-12) {
-		if (Math.abs(B) > 1e-12)
-			consider(-C / B, B);
-	} else {
-		const disc = B * B - 4 * A * C;
-		if (disc >= 0) {
-			const sq = Math.sqrt(disc);
-			consider((-B - sq) / (2 * A), -sq);
-			consider((-B + sq) / (2 * A), sq);
-		}
-	}
-	return mult;
-}
-
-// The distance in the plane to a (possibly multi-path) path of lines and quadratic Beziers, signed the same way
-// polygonDistance2 is -- an odd-even crossing test with one shared parity across every path -- generalised to a
-// curved edge via bezierDistance2/bezierCrossing2 above. This is text()'s glyph outline field.
-export function curvepathDistance2(px: number, py: number, paths: {start: float2, segs: Seg2[]}[]): number {
-	const p = float2(px, py);
-	let d2 = Infinity, sign = 1;
-	for (const path of paths) {
-		let cur = path.start;
-		d2 = Math.min(d2, (px - cur.x) ** 2 + (py - cur.y) ** 2);
-		for (const seg of path.segs) {
-			if (seg.t === 'line') {
-				const {x: ax, y: ay} = cur, {x: bx, y: by} = seg.b;
-				const ex = bx - ax, ey = by - ay, wx = px - ax, wy = py - ay;
-				const t = Math.max(0, Math.min(1, (wx * ex + wy * ey) / (ex * ex + ey * ey || 1)));
-				d2 = Math.min(d2, (wx - ex * t) ** 2 + (wy - ey * t) ** 2);
-				const c0 = py >= ay, c1 = py < by, c2 = ex * wy > ey * wx;
-				if ((c0 && c1 && c2) || (!c0 && !c1 && !c2))
-					sign = -sign;
-			} else {
-				d2 = Math.min(d2, bezierDistance2(p, cur, seg.c, seg.b));
-				sign *= bezierCrossing2(p, cur, seg.c, seg.b);
-			}
-			cur = seg.b;
 		}
 	}
 	return sign * Math.sqrt(d2);
@@ -1174,7 +1151,7 @@ function halfSpacesOf(s: Sdf): {n: float3, d: number}[] | undefined {
 		case 'planes':
 			return s.planes;
 		case 'box': {
-			const b = bounds(s)!;
+			const b = bounds3(s)!;
 			return [
 				{n: float3(1, 0, 0), d: b.max.x}, {n: float3(-1, 0, 0), d: -b.min.x},
 				{n: float3(0, 1, 0), d: b.max.y}, {n: float3(0, -1, 0), d: -b.min.y},
@@ -1387,7 +1364,7 @@ export function hullVertices3(s: Sdf): float3[] | undefined {
 			return local?.map(p => s.m.mulPos(p));
 		}
 		default:
-			return verticesOf(s);
+			return verticesOf3(s);
 	}
 }
 
@@ -1426,7 +1403,7 @@ export function weightedPoints3(s: Sdf): WeightedPoint[] | undefined {
 		case 'sphere':
 			return [{p: float3(0, 0, 0), r: s.r}];
 		default: {
-			const verts = verticesOf(s);
+			const verts = verticesOf3(s);
 			return verts?.map(p => ({p, r: 0}));
 		}
 	}
@@ -1778,6 +1755,10 @@ export function strip2d(s: Sdf): {sdf: Sdf, stripped: boolean} {
 				const body = walk(s.body);
 				return body.k === 'empty' ? empty : {k: 'domain', m: s.m, scale: s.scale, body};
 			}
+			case 'warp': {
+				const body = walk(s.body);
+				return body.k === 'empty' ? empty : {k: 'warp', kind: s.kind, r: s.r, box: s.box, axis: s.axis, body};
+			}
 			case 'dilate': {
 				const body = walk(s.body);
 				return body.k === 'empty' ? empty : {k: 'dilate', body, support: s.support};
@@ -1831,6 +1812,143 @@ export function flat2d(s: Sdf, thickness: number): Sdf {
 // surface(): a heightmap
 //-----------------------------------------------------------------------------
 
+const HEIGHTMAP_TILE = 8;
+
+// heights[row * cols + col], row 0 at y = 0; undefined for a grid with no cells (fewer than two rows or columns).
+// `wrap` bends the grid round z: the columns become a turn and the rows a height or a latitude, so the grid gains a
+// cell (the last column meets the first again) and each cell's slope -- which is what makes the field safe -- is
+// measured per unit of arc on the surface it lies on rather than per unit of grid. A wrapped grid is then measured
+// from the surface it is bent around: its own floor is moved to r and its heights become thicknesses, so r names the
+// base radius whatever heights (or transforms) the grid came with -- and OpenSCAD's own floor, the one below the
+// lowest height that surface() adds, is simply the innermost shell there.
+// `tiled` says which of the grid's axes repeat once it is wrapped, and is carried for wrap() to read: it is the flat
+// grid's own property, since it is the grid -- not the bend -- that is a tile (see Tiled).
+export function heightmap(cols: number, rows: number, heights: ArrayLike<number>, bottom: number, wrap?: Wrap, tiled?: Tiled): Heightmap | undefined {
+	if (cols < 2 || rows < 2)
+		return undefined;
+	const h = Float32Array.from(heights);
+	if (wrap) {
+		let floor = Math.min(bottom, h[0]);
+		for (let i = 1; i < h.length; i++)
+			floor = Math.min(floor, h[i]);
+		if (floor !== 0) {
+			for (let i = 0; i < h.length; i++)
+				h[i] -= floor;
+			bottom = 0;
+		}
+	}
+	if (wrap?.kind === 'sphere') {
+		// The first and last rows stand on the poles, where a whole ring of columns is one point: each takes its own
+		// mean, so that point has one radius. Without it the field would jump across the axis -- the surface would be
+		// at a different height depending on which way round one came at the pole -- and no slope could bound it.
+		for (const j of [0, rows - 1]) {
+			let sum = 0;
+			for (let i = 0; i < cols; i++)
+				sum += h[j * cols + i];
+			h.fill(sum / cols, j * cols, (j + 1) * cols);
+		}
+	}
+	const tile = HEIGHTMAP_TILE;
+	// a flat grid has one cell fewer than its columns; a wrapped one has a cell per column, the last closing the ring
+	// -- unless it is only a piece of a surface, where the columns end again and there is no cell to close it
+	const full = wrap && !wrap.part;
+	const cellsX = full ? cols : cols - 1;
+	const tilesX = Math.max(1, Math.ceil(cellsX / tile)), tilesY = Math.max(1, Math.ceil((rows - 1) / tile));
+	const steps = wrap && wrapSteps(wrap, cols, rows);
+	const ownTop = new Float64Array(tilesX * tilesY).fill(-Infinity), ownSlope = new Float64Array(tilesX * tilesY);
+	let top = -Infinity;
+	for (let j = 0; j < rows - 1; j++) {
+		const sx = steps ? steps.x(j) : 1, sy = steps ? steps.y : 1;
+		for (let i = 0; i < cellsX; i++) {
+			const i1 = full ? (i + 1) % cols : i + 1;
+			const k = j * cols + i, k1 = j * cols + i1, k2 = (j + 1) * cols + i, k3 = (j + 1) * cols + i1;
+			const v1 = h[k], v2 = h[k1], v3 = h[k2], v4 = h[k3], m = (v1 + v2 + v3 + v4) / 4;
+			// each triangle's gradient: along its outer edge, and from that edge's midpoint to the centre, the
+			// across-edge part per column step and the along-edge part per row step
+			const slope = Math.max(
+				Math.hypot((v2 - v1) / sx, 2 * (m - (v1 + v2) / 2) / sy),
+				Math.hypot((v4 - v3) / sx, 2 * ((v3 + v4) / 2 - m) / sy),
+				Math.hypot(2 * (m - (v1 + v3) / 2) / sx, (v3 - v1) / sy),
+				Math.hypot(2 * ((v2 + v4) / 2 - m) / sx, (v4 - v2) / sy));
+			const t = Math.floor(j / tile) * tilesX + Math.floor(i / tile);
+			ownTop[t] = Math.max(ownTop[t], v1, v2, v3, v4);
+			ownSlope[t] = Math.max(ownSlope[t], slope);
+			top = Math.max(top, v1, v2, v3, v4);
+		}
+	}
+	const nearTop = new Float32Array(tilesX * tilesY), nearSlope = new Float32Array(tilesX * tilesY);
+	for (let ty = 0; ty < tilesY; ty++) {
+		for (let tx = 0; tx < tilesX; tx++) {
+			let t = -Infinity, l = 0;
+			for (let y = Math.max(ty - 1, 0); y <= Math.min(ty + 1, tilesY - 1); y++)
+				for (let dx = -1; dx <= 1; dx++) {
+					// a wrapped map has no edge in its columns: the tiles round one continue round the ring
+					const x = full ? ((tx + dx) % tilesX + tilesX) % tilesX : tx + dx;
+					if (x < 0 || x >= tilesX)
+						continue;
+					t = Math.max(t, ownTop[y * tilesX + x]);
+					l = Math.max(l, ownSlope[y * tilesX + x]);
+				}
+			// rounded outward in float32, so the bound stays a bound once it is in the texture
+			nearTop[ty * tilesX + tx] = t + 1e-5 * Math.max(1, Math.abs(t));
+			nearSlope[ty * tilesX + tx] = wrap ? l : 1 / Math.sqrt(1 + l * l) * (1 - 1e-6);
+		}
+	}
+	return {k: 'heightmap', cols, rows, heights: h, bottom: Math.min(bottom, top), top, tile, tilesX, tilesY, nearTop, nearSlope, wrap, tiled};
+}
+
+// The arc one step of a wrapped grid covers: one column, and one row. On a cylinder both are the same everywhere; on a
+// sphere a column step is r sin(theta) d(phi), which closes to nothing at the poles, where a whole ring of columns
+// crowds into a point. That is the steepest a cell's own triangles can be, so a cell takes the smallest its span
+// reaches, floored at half a row for the two cells that meet the poles themselves.
+//
+// A tiled grid is measured by its own scale instead: a column is sx of arc and a row sy, so the same grid is a
+// smaller tile and the pattern comes round more often. On a sphere a row's own latitude is where the fold puts it --
+// v past the end of the grid comes back down the other side -- so the column step's sin(theta) reads the folded row.
+function wrapSteps(wrap: Wrap, cols: number, rows: number) {
+	const H = rows - 1;
+	if (wrap.kind === 'cylinder')
+		return {x: (_j: number) => wrap.tileX || wrap.part ? wrap.sx ?? 1 : wrap.r * 2 * Math.PI / cols, y: wrap.tileY ? wrap.sy ?? 1 : wrap.row ?? 1};
+	// one row's angle: the fitted meridian unless the rows repeat, in which case the grid's own row is the arc
+	const dTheta = wrap.tileY ? (wrap.sy ?? 1) / wrap.r : Math.PI / H;
+	const half = Math.sin(Math.min(dTheta, Math.PI) / 2);
+	const dPhi = wrap.tileX || wrap.part ? (wrap.sx ?? 1) / wrap.r : 2 * Math.PI / cols;
+	// the row the fold leaves in place j: the triangle wave of period 2H takes a row past a pole back down again
+	const at = (j: number) => {
+		if (!wrap.tileY)
+			return j;
+		const q = Math.floor(j / H);
+		return q % 2 ? H - (j - q * H) : j - q * H;
+	};
+	return {
+		x: (j: number) => wrap.r * Math.max(Math.min(Math.sin(at(j) * dTheta), Math.sin(at(j + 1) * dTheta)), half) * dPhi,
+		y: wrap.tileY ? wrap.sy ?? 1 : wrap.r * dTheta,
+	};
+}
+
+// A wrapped map's height at a continuous column (periodic: column `cols` is column 0 again) and row, by the same four
+// triangles as heightAt, which share the cell's centre -- the grid has no edge across, so the cell index wraps rather
+// than clamping.
+function heightAtWrap(s: Heightmap, cu: number, cv: number): number {
+	const cy = Math.min(Math.max(cv, 0), s.rows - 1);
+	const cj = Math.min(Math.floor(cy), s.rows - 2);
+	const dv = cy - cj - 0.5;
+	const cx = cu - Math.floor(cu / s.cols) * s.cols;
+	const ci = Math.floor(cx);
+	const du = cx - ci - 0.5;
+	const i1 = ci + 1 < s.cols ? ci + 1 : 0;
+	const h = s.heights, k = cj * s.cols + ci, k1 = cj * s.cols + i1, k2 = k + s.cols, k3 = k1 + s.cols;
+	const v1 = h[k], v2 = h[k1], v3 = h[k2], v4 = h[k3];
+	const m = (v1 + v2 + v3 + v4) / 4;
+	if (dv <= -Math.abs(du))
+		return m + (v2 - v1) * du + 2 * (m - (v1 + v2) / 2) * dv;
+	if (dv >= Math.abs(du))
+		return m + (v4 - v3) * du + 2 * ((v3 + v4) / 2 - m) * dv;
+	if (du < 0)
+		return m + (v3 - v1) * dv + 2 * (m - (v1 + v3) / 2) * du;
+	return m + (v4 - v2) * dv + 2 * ((v2 + v4) / 2 - m) * du;
+}
+
 // Each cell of the grid is OpenSCAD's four triangles, meeting at the cell's centre at the mean of its corners, and the
 // solid stands on the floor at `bottom`. The exact distance to thousands of triangles is not something to work out at
 // every step of a raymarch, so the field is a bound instead: the solid's box, and above or below the surface the
@@ -1840,10 +1958,9 @@ export function flat2d(s: Sdf, thickness: number): Sdf {
 // cut into tiles and each tile knows the steepest slope and the highest point of itself and its neighbours: a point
 // is at least as far as the edge of its tile's neighbourhood from anything outside it, so only the neighbourhood's
 // slope bounds the gap, and far above it the neighbourhood's highest point does better still.
-const HEIGHTMAP_TILE = 8;
 
-// the surface's height at (x, y), clamped into the grid, and the four triangles' corners each cell is made of --
-// shared with sdHeightmap in sdflib.frag, which must agree with it
+// The surface's height at (x, y), clamped into the grid, and the four triangles' corners each cell is made of --
+// shared with sdHeightmap in sdflib.frag, which must agree with it.
 function heightAt(s: Heightmap, x: number, y: number): number {
 	const cx = Math.min(Math.max(x, 0), s.cols - 1), cy = Math.min(Math.max(y, 0), s.rows - 1);
 	const ci = Math.min(Math.floor(cx), s.cols - 2), cj = Math.min(Math.floor(cy), s.rows - 2);
@@ -1860,49 +1977,12 @@ function heightAt(s: Heightmap, x: number, y: number): number {
 	return m + (v4 - v2) * dv + 2 * ((v2 + v4) / 2 - m) * du;
 }
 
-// heights[row * cols + col], row 0 at y = 0; undefined for a grid with no cells (fewer than two rows or columns)
-export function heightmap(cols: number, rows: number, heights: ArrayLike<number>, bottom: number): Heightmap | undefined {
-	if (cols < 2 || rows < 2)
-		return undefined;
-	const h = Float32Array.from(heights);
-	const tile = HEIGHTMAP_TILE;
-	const tilesX = Math.ceil((cols - 1) / tile), tilesY = Math.ceil((rows - 1) / tile);
-	const ownTop = new Float64Array(tilesX * tilesY).fill(-Infinity), ownSlope = new Float64Array(tilesX * tilesY);
-	let top = -Infinity;
-	for (let j = 0; j < rows - 1; j++) {
-		for (let i = 0; i < cols - 1; i++) {
-			const k = j * cols + i;
-			const v1 = h[k], v2 = h[k + 1], v3 = h[k + cols], v4 = h[k + cols + 1], m = (v1 + v2 + v3 + v4) / 4;
-			// each triangle's gradient: along its outer edge, and from that edge's midpoint to the centre
-			const slope = Math.max(
-				Math.hypot(v2 - v1, 2 * (m - (v1 + v2) / 2)),
-				Math.hypot(v4 - v3, 2 * ((v3 + v4) / 2 - m)),
-				Math.hypot(v3 - v1, 2 * (m - (v1 + v3) / 2)),
-				Math.hypot(v4 - v2, 2 * ((v2 + v4) / 2 - m)));
-			const t = Math.floor(j / tile) * tilesX + Math.floor(i / tile);
-			ownTop[t] = Math.max(ownTop[t], v1, v2, v3, v4);
-			ownSlope[t] = Math.max(ownSlope[t], slope);
-			top = Math.max(top, v1, v2, v3, v4);
-		}
-	}
-	const nearTop = new Float32Array(tilesX * tilesY), nearSlope = new Float32Array(tilesX * tilesY);
-	for (let ty = 0; ty < tilesY; ty++) {
-		for (let tx = 0; tx < tilesX; tx++) {
-			let t = -Infinity, l = 0;
-			for (let y = Math.max(ty - 1, 0); y <= Math.min(ty + 1, tilesY - 1); y++)
-				for (let x = Math.max(tx - 1, 0); x <= Math.min(tx + 1, tilesX - 1); x++) {
-					t = Math.max(t, ownTop[y * tilesX + x]);
-					l = Math.max(l, ownSlope[y * tilesX + x]);
-				}
-			// rounded outward in float32, so the bound stays a bound once it is in the texture
-			nearTop[ty * tilesX + tx] = t + 1e-5 * Math.max(1, Math.abs(t));
-			nearSlope[ty * tilesX + tx] = 1 / Math.sqrt(1 + l * l) * (1 - 1e-6);
-		}
-	}
-	return {k: 'heightmap', cols, rows, heights: h, bottom: Math.min(bottom, top), top, tile, tilesX, tilesY, nearTop, nearSlope};
+// The height grid's field: OpenSCAD's flat map, or that grid bent round an axis.
+function heightmapDistance(s: Heightmap, p: float3): number {
+	return s.wrap ? wrappedHeightmapDistance(s, s.wrap, p) : flatHeightmapDistance(s, p);
 }
 
-function heightmapDistance(s: Heightmap, p: float3): number {
+function flatHeightmapDistance(s: Heightmap, p: float3): number {
 	const W = s.cols - 1, H = s.rows - 1;
 	// the box it stands in
 	const qx = Math.abs(p.x - W / 2) - W / 2, qy = Math.abs(p.y - H / 2) - H / 2, qz = Math.abs(p.z - (s.bottom + s.top) / 2) - (s.top - s.bottom) / 2;
@@ -1923,6 +2003,261 @@ function heightmapDistance(s: Heightmap, p: float3): number {
 		? Math.min(Math.max(gap * s.nearSlope[t], p.z - s.nearTop[t]), edge)
 		: -Math.min(-gap * s.nearSlope[t], edge);
 	return Math.max(box, terrain);
+}
+
+// Where a longitude stands on an arc [a, b] of the circle, as the angle the arc's own turn measures it in: the
+// longitude itself while it is on the arc, and the nearer end of it otherwise -- the short way round, so a body
+// reaching past +-pi is asked about the end in front of the point rather than the one behind it. The value is always
+// within [a, b], which is what lets the caller scale it back into the body's own x.
+function arcPoint(phi: number, a: number, b: number): number {
+	const rel = ((phi - a) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+	return rel <= b - a ? a + rel : (2 * Math.PI - rel < rel - (b - a) ? a : b);
+}
+
+// The cut where a turn falls short of a whole one, shared by the general bend and a partial wrapped map: the ends of
+// the turn are real faces, at the meridians the map's own ends stand on. The solid is the body *and* the wedge those
+// two meridians bound, so the field is the body's own distance and the wedge's, the less confident of the two --
+// their max. The wedge's own is the distance to the nearer of its two faces, negative inside it, since a point has to
+// be that far in from the boundary before it can call itself solid. Outside the wedge the body's own distance is what
+// has to stand, for a face is a face only where the body is: the wedge's own term there is a plain distance to the
+// nearer of the two boundary rays. Reading the *plane's* distance instead -- as if a face ran on past the end of the
+// body -- left the field exactly nought all along the empty half-plane, a sheet of surface that reached to the end of
+// the world and lay across the axis, where every longitude meets every other and the two planes cross. Past the
+// wedge's own turn the two crossings mean the farther plane's distance is not a lower bound at all, which is why the
+// nearer ray's is what the term is.
+//
+// A turn *wider* than a half one is instead the complement of the small empty one: the union of the two half-spaces
+// rather than their intersection, whose distance is the lesser of the two terms'. That plane is a face only on its
+// own half, so reading the nearer one there called the start plane's far half a face and laid a sheet of surface down
+// the middle of a piece wider than half a turn (a piece's arc is cols-1 columns, which for the example's photo is
+// 185 degrees).
+function meridianCut(p: float3, a: number, b: number, d: number): number {
+	const w = b - a;
+	const c1 = -p.x * Math.sin(a) + p.y * Math.cos(a);
+	const c2 = p.x * Math.sin(b) - p.y * Math.cos(b);
+	if (w > Math.PI)
+		return Math.max(d, -Math.max(c1, c2));
+	// the angle from the point's longitude to each of the wedge's boundary rays, the short way round, and the nearer
+	const rel = ((Math.atan2(p.y, p.x) - a) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+	const toA = Math.min(rel, 2 * Math.PI - rel);
+	const toB = Math.min(Math.abs(w - rel), 2 * Math.PI - Math.abs(w - rel));
+	// a ray is bounded at the axis, so an angle past a quarter turn is the distance to the axis itself, which is what
+	// floors the edge at rad rather than letting the sine of a widening angle turn back down
+	const edge = Math.hypot(p.x, p.y) * Math.sin(Math.min(toA, toB, Math.PI / 2));
+	return rel > w ? Math.max(d, edge) : Math.max(d, -edge);
+}
+
+// A wrapped map's field, on the same principle as the flat one -- the same tiles, the same gap over the same four
+// triangles -- but reached through the grid's own coordinates: a point is carried to the column and row it stands
+// over, and what it is above is the base surface of radius r displaced by that height, so the gap is radial.
+//
+// Two things need care. The slope a lateral step climbs is per unit of arc, and at radius `rad` a step of one covers
+// only `rad / r` of the arc a step on the surface does: the steepest slope of the tile is scaled by r / rad, which is
+// why a wrapped map's `nearSlope` is the slope itself and this is where it becomes a safety factor. And the flat
+// map's box, which is also what keeps the bound honest where the slope is not, does not apply: here it is the ball the
+// whole map stands in (and, for a cylinder, the slab its rows span), plus the base surface at `bottom`, which is a
+// sphere or cylinder and so exact -- that last one is what bounds the field near the axis, where a sphere's grid
+// pinches to a point and its slope means nothing at all.
+//
+// A tiled map's column is `sx` of arc rather than the fitted turn over cols, and its row `sy` rather than the fitted
+// meridian over H, so the grid is a tile whose size the scale sets; the sampling is modulo the period either way, so
+// the ring closes without a crack whatever the tile count comes to. On a sphere a row past a pole folds: v comes back
+// down the other side and the longitude turns with it, as it does going over a globe's pole, so the far side reads
+// the mirrored row through the shifted columns. That fold is smooth only where it lands on a pole -- the two sides
+// meet at the pole row's own mean height, but their slopes differ -- which is the price of tiling a sphere's rows.
+function wrappedHeightmapDistance(s: Heightmap, wrap: Wrap, p: float3): number {
+	const H = s.rows - 1;
+	const sphere = wrap.kind === 'sphere';
+	// the radius the map's surface is at, which is length(p) on a sphere and the distance from the axis on a cylinder
+	const rad = sphere ? Math.hypot(p.x, p.y, p.z) : Math.hypot(p.x, p.y);
+	const rr = Math.max(rad, 1e-9);
+	// the colatitude from the *south* pole, so the grid's first row lands there: a picture then stands the way up it
+	// does on the plane, and as its rows do up a cylinder's axis, rather than upside down on a globe
+	const theta = sphere ? Math.acos(Math.max(-1, Math.min(1, -p.z / rr))) : 0;
+	const phi = Math.atan2(p.y, p.x);
+	const posPhi = phi < 0 ? phi + 2 * Math.PI : phi;
+	// The column the point stands over: the grid's own arc when the columns repeat or the grid is only a piece of a
+	// surface, the fitted whole turn otherwise.
+	let u = wrap.tileX || wrap.part ? posPhi * wrap.r / (wrap.sx ?? 1) : posPhi / (2 * Math.PI) * s.cols;
+	// The row, and the arc or axis one row covers: the grid's own when the rows repeat, the fitted meridian on a
+	// sphere, the scaled axis on a cylinder. A tiled row past a pole folds back down with the longitude turned.
+	const rowArc = wrap.tileY ? wrap.sy ?? 1 : (sphere ? wrap.r * Math.PI / H : wrap.row ?? 1);
+	let v = sphere ? theta / Math.PI * H : p.z / (wrap.row ?? 1) + H / 2;
+	if (wrap.tileY) {
+		if (sphere) {
+			const raw = wrap.r * theta / (wrap.sy ?? 1);
+			const q = Math.floor(raw / H);
+			v = q % 2 ? H - (raw - q * H) : raw - q * H;
+			// the longitude turns by half a turn, which is half the columns only when the tile is the whole turn
+			u += q % 2 ? (wrap.tileX ? Math.PI * wrap.r / (wrap.sx ?? 1) : s.cols / 2) : 0;
+		} else {
+			// The tile starts where the axis does, as a tiled sphere's first row starts at a pole, so an axis a whole
+			// number of tiles long ends on a tile boundary too. Half the axis is H * row / 2 of the grid's own
+			// units -- which is the H / 2 rows of shift an untiled grid's own height has always asked for.
+			v = (p.z + H * (wrap.row ?? 1) / 2) / (wrap.sy ?? 1);
+			v -= Math.floor(v / H) * H;
+		}
+	}
+	// a piece of a surface has real ends in its columns, so the grid clamps there instead of closing onto itself
+	const sigma = wrap.r + (wrap.part ? heightAt(s, u, v) : heightAtWrap(s, u, v));
+	const gap = rad - sigma;
+
+	// the tile the point is over -- its column wrapped, since the ring has no end -- and how far the point is from
+	// anything outside that tile's neighbourhood
+	const cv = Math.min(Math.max(v, 0), H);
+	const cj = Math.min(Math.floor(cv), s.rows - 2);
+	const cx = wrap.part ? Math.min(Math.max(u, 0), s.cols - 1) : u - Math.floor(u / s.cols) * s.cols;
+	const ci = Math.min(Math.floor(cx), s.cols - 1);
+	const tx = Math.min(Math.floor(ci / s.tile), s.tilesX - 1), ty = Math.min(Math.floor(cj / s.tile), s.tilesY - 1);
+	const t = ty * s.tilesX + tx;
+	// The edge: two points whose directions differ by an angle d, at radii within the map's own reach, are at least
+	// 2 sqrt(rad * least) sin(d / 2) apart, so the angle to the far side of the neighbourhood is a distance. On a
+	// sphere that angle is at least the latitude difference, or -- where the neighbourhood does not reach round the
+	// ring -- the distance to the meridian that bounds it; a cylinder's rows are a plain height, so their separation
+	// is a distance itself.
+	const least = Math.max(wrap.r + Math.min(s.bottom, s.top, 0), 0);
+	const chord = 2 * Math.sqrt(Math.max(rad * least, 0));
+	let edge = Infinity;
+	if (sphere) {
+		const arc = (rows: number) => chord * Math.sin(rows * rowArc / (2 * wrap.r));
+		if (ty - 1 >= 1)			edge = Math.min(edge, arc(cv - (ty - 1) * s.tile));
+		if (ty + 1 <= s.tilesY - 2)	edge = Math.min(edge, arc((ty + 2) * s.tile - cv));
+	} else {
+		if (ty - 1 >= 1)			edge = Math.min(edge, (cv - (ty - 1) * s.tile) * rowArc);
+		if (ty + 1 <= s.tilesY - 2)	edge = Math.min(edge, ((ty + 2) * s.tile - cv) * rowArc);
+	}
+	if (3 * s.tile < s.cols) {
+		const local = ci - tx * s.tile;
+		const dphi = Math.min(s.tile + local, 2 * s.tile - local) * (wrap.tileX || wrap.part ? (wrap.sx ?? 1) / wrap.r : 2 * Math.PI / s.cols);
+		// a colatitude theta stands on a ring of radius rad sin(theta), so a longitude step is only that fraction of
+		// an angle on the sphere -- and closes to nothing at a pole, where the whole turn of columns crowds into the
+		// one point the pole row gives a single height. The gap the point is over floors it there: the neighbourhood
+		// already bounds the field by its own surface, so the column edge must not claim to end nearer than that
+		// (reading cos here instead of sin made every point on the equator, where the ring is widest, read as surface)
+		const d = sphere ? Math.asin(Math.min(1, Math.sin(theta) * Math.sin(dphi))) : dphi;
+		edge = Math.min(edge, Math.max(chord * Math.sin(d / 2), Math.abs(gap)));
+	}
+
+	const l = s.nearSlope[t] * wrap.r / rr;
+	const terrain = gap > 0
+		? Math.min(Math.max(gap / Math.sqrt(1 + l * l), rad - (wrap.r + s.nearTop[t])), edge)
+		: -Math.min(-gap / Math.sqrt(1 + l * l), edge);
+	const rMax = wrap.r + Math.max(s.top, s.bottom);
+	let d = Math.max(rad - rMax, wrap.r + s.bottom - rad, terrain);
+	// a piece of a surface is cut off at the two meridians its ends stand on, exactly as the general bend is
+	// A piece's width is the flat grid's own -- one column fewer than the ring's cols, since its columns end rather
+	// than closing (see heightmap), so (cols - 1) * sx of arc. That is the arc the general bend gave the same grid too.
+	if (wrap.part)
+		d = meridianCut(p, 0, (s.cols - 1) * (wrap.sx ?? 1) / wrap.r, d);
+	// a cylinder ends where its rows do: the axis they are laid on is `h` when the bend was given one, and the grid's
+	// own scaled height otherwise, one row of it per row (see the wrap case in evaluate.ts, which sets `row`)
+	return sphere ? d : Math.max(d, Math.abs(p.z) - H / 2 * (wrap.row ?? 1));
+}
+
+//-----------------------------------------------------------------------------
+// wrap(): a shape bent into a revolution
+//-----------------------------------------------------------------------------
+
+// The flat point a wrapped body is asked about: the turn (and the latitude, or the height up the axis) the query
+// point stands over, and how far past r it is for the body's own z. Its x is the arc its own width is -- a grid's
+// units are arbitrary, so a wrap fits it, and one a circumference round or more is fitted to the whole turn instead
+// -- while its y is a length on a cylinder (centred on the axis, which is the body's own height unless the bend was
+// given one, `h`) and the whole pole-to-pole latitude on a sphere, and its z is a length everywhere.
+function warpPoint(s: Warp, p: float3): float3 {
+	const sphere = s.kind === 'sphere';
+	const rad = sphere ? Math.hypot(p.x, p.y, p.z) : Math.hypot(p.x, p.y);
+	const rr = Math.max(rad, 1e-9);
+	const phi = Math.atan2(p.y, p.x);
+	const ex = s.box.max.x - s.box.min.x, ey = s.box.max.y - s.box.min.y;
+	const ym = (s.box.min.y + s.box.max.y) / 2;
+	// Its own width is the arc it covers, measured from the body's own first column: a longitude is only defined to a
+	// whole turn, so reading `phi` itself asked a body whose arc straddles +-pi about the wrong end of itself, and one
+	// a circumference round or more is fitted to the whole turn instead. Past the ends of a shorter body the *nearest*
+	// end is what a point is asked about -- the short way round, not the side of the axis its longitude is written on
+	// -- which is what keeps the body's own distance a distance from the body's end faces rather than from across the
+	// axis: reading the far side there made that distance as much as three times the real one, and the cut that leans
+	// on it (see meridianCut) laid a sheet of surface down the empty half-plane.
+	const x = ex >= 2 * Math.PI * s.r
+		? s.box.min.x + (phi < 0 ? phi + 2 * Math.PI : phi) / (2 * Math.PI) * ex
+		: arcPoint(phi, s.box.min.x / s.r, s.box.max.x / s.r) * s.r;
+	// a cylinder's axis: the body's own y unless the bend was given a length, which its rows are spread over
+	const axis = s.axis ?? 0;
+	let y = axis > 0 ? ym + p.z * (ey / axis) : ym + p.z;
+	if (sphere) {
+		// a sphere's are an arc from its equator, and one that reaches the poles is fitted to them
+		// measured from the south pole, as in wrappedHeightmapDistance, so the two paths run the rows the same way
+		const theta = Math.acos(Math.max(-1, Math.min(1, -p.z / rr)));
+		y = ey >= Math.PI * s.r ? s.box.min.y + theta / Math.PI * ey : ym + (theta - Math.PI / 2) * s.r;
+	}
+	return float3(x, y, s.box.min.z + rad - s.r);
+}
+
+// The least the map stretches a step of the body's own space by, along the way the body is actually nearest: a step
+// of one in its z is one in space, one in its x the arc a column covers there, on a sphere one in its y the arc a row
+// covers, and along a cylinder's axis the length the body's rows were fitted to (h, or its own height). The way to
+// the body is its own field's gradient -- for a height field that is the surface's normal, so a step to it climbs by
+// one, where the arc a crowded pole leaves would read zero -- and the stretch is measured along it, never more than
+// one so a map that stretches a step cannot inflate a distance measured in its own space. Reading the least over
+// every direction instead left the field leaning on nothing at a pole, which is the fan a bent grid showed there.
+//
+// A body under a non-uniform scale carries a distance folded by the *smallest* axis alone (see place), so this bound
+// under-reports whatever nearest surface lies along a wider one -- a relief's every cliff, by the ratio of the scales.
+// Giving each axis its own scale back along the way the body is nearest was tried and is not sound: |J * u| is the
+// stretch at the point, and it falls along the way to the surface, so the field read up to five times the distance it
+// was meant to bound and the marcher overshot every cliff. A height grid gets its scale exactly on the fused path
+// instead, where the columns and rows carry their own arc; this one stays the honest bound for everything else.
+function warpStretch(s: Warp, p: float3, q: float3, d0: number, g: float3): number {
+	const sphere = s.kind === 'sphere';
+	const rad = sphere ? Math.hypot(p.x, p.y, p.z) : Math.hypot(p.x, p.y);
+	const sin = sphere ? Math.sqrt(Math.max(0, 1 - Math.min(1, (p.z / Math.max(rad, 1e-9)) ** 2))) : 1;
+	const ex = s.box.max.x - s.box.min.x, ey = s.box.max.y - s.box.min.y;
+	// capped at one, so a map that stretches a step never inflates a distance measured in its own space
+	const x = Math.min(1, ex >= 2 * Math.PI * s.r ? 2 * Math.PI * rad * sin / ex : rad * sin / s.r);
+	// a cylinder's axis is a plain length, so a step of one up it is one in space -- unless the body was fitted to
+	// an axis of its own length (h), where a step of one is axis / ey of space, and the field tightens by that
+	const axis = s.axis ?? 0;
+	const y = Math.min(1, sphere
+		? (ey >= Math.PI * s.r ? Math.PI * rad / ey : 1)
+		: (axis > 0 ? axis / ey : 1));
+	// The way to the body is its own field's gradient: for a height field that is the surface's normal, so the
+	// nearest surface lies the way it points. The box is not used for it: at a cliff the nearest surface is the
+	// cliff face, which the way to the box can miss entirely, and the correction below then inflates the field past
+	// the distance it is meant to bound -- a dark edge wherever the relief is steep. Only a gradient too flat to
+	// read falls back to the box.
+	const gl = Math.hypot(g.x, g.y, g.z);
+	let u: float3;
+	if (gl > 1e-12) {
+		// outside, the field falls toward the body; inside, it is the rise to it that points the way
+		u = g.scale((d0 < 0 ? 1 : -1) / gl);
+	} else {
+		const c = q.min(s.box.max).max(s.box.min);
+		const off = q.sub(c);
+		const ol = Math.hypot(off.x, off.y, off.z);
+		if (ol < 1e-9)
+			return Math.min(x, y);
+		u = off.scale(-1 / ol);
+	}
+	return Math.min(1, Math.hypot(x * u.x, y * u.y, u.z));
+}
+
+function warpDistance(s: Warp, p: float3): number {
+	const q = warpPoint(s, p), d0 = evalSdf(s.body, q);
+	// the body's own gradient, a step each way in its own space, to say which way the nearest surface lies
+	const e = Math.max(1e-3, Math.abs(d0) * 1e-2);
+	const g = float3(
+		evalSdf(s.body, q.add(float3(e, 0, 0))) - d0,
+		evalSdf(s.body, q.add(float3(0, e, 0))) - d0,
+		evalSdf(s.body, q.add(float3(0, 0, e))) - d0);
+	const d = d0 * warpStretch(s, p, q, d0, g);
+	const ex = s.box.max.x - s.box.min.x;
+	if (ex >= 2 * Math.PI * s.r)
+		return d;								// all the way round: there are no ends to cut it off at
+	// A turn short of a whole one is cut off by the two meridians its ends stand on, and those faces are part of the
+	// solid: the field is the body's own distance and the wedge's, whichever is the less confident claim, which is
+	// their max. A face is only part of the solid where the body is, so away from it the body's distance has to
+	// stand: letting the meridian plane cap it to nothing there -- as if the plane were a face out to infinity --
+	// laid a sheet of surface right across the empty half-plane, which is the fan a bent grid showed at the axis.
+	return meridianCut(p, s.box.min.x / s.r, s.box.max.x / s.r, d);
 }
 
 //-----------------------------------------------------------------------------
@@ -1951,7 +2286,7 @@ function rim(r: number, z: number, n = RIM_POINTS): float3[] {
 function convexPoints(s: Sdf): float3[] | undefined {
 	switch (s.k) {
 		case 'box': case 'planes': case 'ngonPrism':
-			return verticesOf(s);
+			return verticesOf3(s);
 		case 'cylinder': case 'cone': {
 			const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
 			return s.k === 'cylinder' ? [...rim(s.r, z0), ...rim(s.r, z1)] : [...rim(s.r1, z0), ...rim(s.r2, z1)];
@@ -2182,7 +2517,7 @@ export function projection(body: Sdf, cut: boolean): {sdf: Sdf, traced?: number}
 		const exact = projectExact(s, float3x4.identity(), cut);
 		if (exact)
 			return exact;
-		const b = bounds(s);
+		const b = bounds3(s);
 		if (!b || (cut && (b.min.z > 0 || b.max.z < 0)))
 			return empty;
 		const size = Math.max(b.max.x - b.min.x, b.max.y - b.min.y);
@@ -2392,13 +2727,10 @@ function batchLeaf(term: Sdf, mat: number, ids: Map<Sdf, number>): Omit<BatchLea
 		case 'circle2':		return s.n === 0 ? leaf(BATCH_KINDS.circle2, s.r) : undefined;
 		case 'curvepath2': {
 			const segs: number[] = [];
-			for (const path of s.paths) {
-				let cur = path.start;
-				for (const seg of path.segs) {
-					segs.push(cur.x, cur.y, seg.b.x, seg.b.y, seg.t === 'quad' ? seg.c.x : 0, seg.t === 'quad' ? seg.c.y : 0, seg.t === 'quad' ? 1 : 0, 0);
-					cur = seg.b;
-				}
-			}
+			parseCurve(s.paths).run({
+				Line(a: float2, b: float2)					{ segs.push(a.x, a.y, b.x, b.y, 0, 0, 0, 0); },
+				Bezier2(a: float2, c: float2, b: float2)	{ segs.push(a.x, a.y, b.x, b.y, c.x, c.y, 1, 0); }
+			});
 			return segs.length ? {...leaf(BATCH_KINDS.path2), segs} : undefined;
 		}
 		case 'polygon2': {
@@ -2548,8 +2880,9 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			line(`vec2 ${v} = vec2(length(${p}) - ${f(s.r)}, ${f(mat)});`);
 			return;
 		case 'box': {
-			const c: float3 = s.center ? float3(0, 0, 0) : float3(s.size.x / 2, s.size.y / 2, s.size.z / 2);
-			line(`vec3 ${v}_q = abs(${p} - ${v3(c)}) - ${v3(float3(s.size.x / 2, s.size.y / 2, s.size.z / 2))};`);
+			const h = s.size.scale(0.5);
+			const c = s.center ? float3(0, 0, 0) : h;
+			line(`vec3 ${v}_q = abs(${p} - ${v3(c)}) - ${v3(h)};`);
 			line(`vec2 ${v} = vec2(length(max(${v}_q, vec3(0.0))) + min(max(${v}_q.x, max(${v}_q.y, ${v}_q.z)), 0.0), ${f(mat)});`);
 			return;
 		}
@@ -2711,6 +3044,26 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			line(`vec2 ${v} = vec2(${v}_b.x * ${f(s.scale)}, ${v}_b.y);`);		// only the distance scales
 			return;
 		}
+		case 'warp': {
+			// the body is emitted at the flat point the query point stands over, and its distance scaled by the least
+			// the map stretches there (see warpPoint, warpStretch and warpCut in sdflib.frag, which must agree). The
+			// way to the body is its own field's gradient, so the body is asked a step each way in its own space too.
+			// The axis a cylinder's rows are fitted to is passed after r, and is nothing at all when there is none.
+			const args = `${v3(s.box.min)}, ${v3(s.box.max)}, ${f(s.r)}, ${s.kind === 'sphere' ? 1 : 0}`;
+			const fitted = `${args}, ${f(s.axis ?? 0)}`;
+			line(`vec3 ${v}_q = warpPoint(${p}, ${fitted});`);
+			emit(e, out, `${v}_b`, s.body, `${v}_q`, indent, mat);
+			line(`float ${v}_e = max(1e-3, abs(${v}_b.x) * 1e-2);`);
+			line(`vec3 ${v}_qx = ${v}_q + vec3(${v}_e, 0.0, 0.0);`);
+			line(`vec3 ${v}_qy = ${v}_q + vec3(0.0, ${v}_e, 0.0);`);
+			line(`vec3 ${v}_qz = ${v}_q + vec3(0.0, 0.0, ${v}_e);`);
+			emit(e, out, `${v}_gx`, s.body, `${v}_qx`, indent, mat);
+			emit(e, out, `${v}_gy`, s.body, `${v}_qy`, indent, mat);
+			emit(e, out, `${v}_gz`, s.body, `${v}_qz`, indent, mat);
+			line(`vec3 ${v}_g = vec3(${v}_gx.x - ${v}_b.x, ${v}_gy.x - ${v}_b.x, ${v}_gz.x - ${v}_b.x);`);
+			line(`vec2 ${v} = vec2(warpCut(${p}, ${args}, ${v}_b.x * warpStretch(${p}, ${v}_q, ${v}_b.x, ${v}_g, ${fitted})), ${v}_b.y);`);
+			return;
+		}
 		case 'material':
 			emit(e, out, v, s.body, p, indent, e.ids.get(s) ?? mat);
 			return;
@@ -2720,9 +3073,9 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 				: `vec2 ${v} = vec2(length(${p}.xy) - ${f(s.r)}, ${f(mat)});`);
 			return;
 		case 'square2': {
-			const h: float2 = s.center ? float2(s.size.x / 2, s.size.y / 2) : float2(0, 0);
-			const c: float2 = float2(s.size.x / 2 - h.x, s.size.y / 2 - h.y);
-			line(`vec2 ${v}_q = abs(${p}.xy - ${v2(c)}) - ${v2(float2(s.size.x / 2, s.size.y / 2))};`);
+			const h = s.size.scale(0.5);
+			const c = s.center ? float2(0, 0) : h;
+			line(`vec2 ${v}_q = abs(${p}.xy - ${v2(c)}) - ${v2(h)};`);
 			line(`vec2 ${v} = vec2(length(max(${v}_q, vec2(0.0))) + min(max(${v}_q.x, ${v}_q.y), 0.0), ${f(mat)});`);
 			return;
 		}
@@ -2737,17 +3090,8 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			lines.push(`\tvec2 v0 = ${v2(first)};`);
 			lines.push(`\tfloat d = dot(p - v0, p - v0), s = 1.0;`);
 			for (const pts of s.paths) {
-				for (let i = 0; i < pts.length; i++) {
-					const a = pts[(i + pts.length - 1) % pts.length], b = pts[i];
-					lines.push(`\t{`);
-					lines.push(`\t\tvec2 a = ${v2(a)}, bq = ${v2(b)};`);
-					lines.push(`\t\tvec2 e = bq - a, w = p - a;`);
-					lines.push(`\t\tvec2 c = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);`);
-					lines.push(`\t\td = min(d, dot(c, c));`);
-					lines.push(`\t\tfloat c0 = p.y >= a.y ? 1.0 : 0.0, c1 = p.y < bq.y ? 1.0 : 0.0, c2 = e.x * w.y > e.y * w.x ? 1.0 : 0.0;`);
-					lines.push(`\t\tif (c0 * c1 * c2 > 0.5 || (1.0 - c0) * (1.0 - c1) * (1.0 - c2) > 0.5) s = -s;`);
-					lines.push(`\t}`);
-				}
+				for (let i = 0; i < pts.length; i++)
+					lines.push(`\ts *= sdLine2(p, d, ${v2(pts[(i + pts.length - 1) % pts.length])}, ${v2(pts[i])});`);
 			}
 			lines.push(`\treturn s * sqrt(d);`);
 			lines.push(`}`);
@@ -2762,32 +3106,13 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			// curves it has.
 			const name = `sdShape${e.n++}`;
 			const lines = [`float ${name}(vec2 p) {`];
-			const firstStart = s.paths.find(path => path.segs.length)?.start ?? float2(0, 0);
+			const firstStart = float2(s.paths[0].x, s.paths[0].y);
 			lines.push(`\tvec2 v0 = ${v2(firstStart)};`);
 			lines.push(`\tfloat d = dot(p - v0, p - v0), s = 1.0;`);
-			for (const path of s.paths) {
-				let cur = path.start;
-				for (const seg of path.segs) {
-					if (seg.t === 'line') {
-						lines.push(`\t{`);
-						lines.push(`\t\tvec2 a = ${v2(cur)}, bq = ${v2(seg.b)};`);
-						lines.push(`\t\tvec2 e = bq - a, w = p - a;`);
-						lines.push(`\t\tvec2 c = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);`);
-						lines.push(`\t\td = min(d, dot(c, c));`);
-						lines.push(`\t\tfloat c0 = p.y >= a.y ? 1.0 : 0.0, c1 = p.y < bq.y ? 1.0 : 0.0, c2 = e.x * w.y > e.y * w.x ? 1.0 : 0.0;`);
-						lines.push(`\t\tif (c0 * c1 * c2 > 0.5 || (1.0 - c0) * (1.0 - c1) * (1.0 - c2) > 0.5) s = -s;`);
-						lines.push(`\t}`);
-					} else {
-						lines.push(`\t{`);
-						lines.push(`\t\tvec2 a = ${v2(cur)}, c = ${v2(seg.c)}, bq = ${v2(seg.b)};`);
-						lines.push(`\t\tfloat dd = sdBezier2(p, a, c, bq);`);
-						lines.push(`\t\td = min(d, dd * dd);`);
-						lines.push(`\t\ts *= bezierCrossing2(p, a, c, bq);`);
-						lines.push(`\t}`);
-					}
-					cur = seg.b;
-				}
-			}
+			parseCurve(s.paths).run({
+				Line(a: float2, b: float2)					{ lines.push(`\ts *= sdLine2(p, d, ${v2(a)}, ${v2(b)});`); },
+				Bezier2(a: float2, c: float2, b: float2)	{ lines.push(`\ts *= sdBezier2(p, d, ${v2(a)}, ${v2(c)}, ${v2(b)});`); }
+			});
 			lines.push(`\treturn s * sqrt(d);`);
 			lines.push(`}`);
 			e.helpers.push(lines.join('\n'));
@@ -2867,7 +3192,8 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			line(`vec2 ${v} = vec2(sdRoundCone(${p}, ${v3(s.a)}, ${v3(s.b)}, ${f(s.r1)}, ${f(s.r2)}), ${f(mat)});`);
 			return;
 		case 'heightmap': {
-			// the heights and the tiles go in the batch texture, four floats to a texel (see sdHeightmap in sdflib.frag)
+			// the heights and the tiles go in the batch texture, four floats to a texel (see sdHeightmap and
+			// sdWrappedHeightmap in sdflib.frag)
 			const pack = (values: ArrayLike<number>) => {
 				const at = e.data.length / 4;
 				for (let i = 0; i < values.length; i++)
@@ -2878,7 +3204,12 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			};
 			const heights = pack(s.heights);
 			const tiles = pack(Array.from({length: s.nearTop.length * 2}, (_, i) => i & 1 ? s.nearSlope[i >> 1] : s.nearTop[i >> 1]));
-			line(`vec2 ${v} = vec2(sdHeightmap(${p}, ${heights}, ${tiles}, ${s.cols}, ${s.rows}, ${s.tile}, ${s.tilesX}, ${s.tilesY}, ${f(s.bottom)}, ${f(s.top)}), ${f(mat)});`);
+			const common = `${heights}, ${tiles}, ${s.cols}, ${s.rows}, ${s.tile}, ${s.tilesX}, ${s.tilesY}, ${f(s.bottom)}, ${f(s.top)}`;
+			// a wrapped map also says how its rows are spaced and whether either axis repeats (see sdWrappedHeightmap)
+			line(s.wrap
+				? `vec2 ${v} = vec2(sdWrappedHeightmap(${p}, ${common}, ${f(s.wrap.r)}, ${s.wrap.kind === 'sphere' ? 1 : 0}, ` +
+					`${f(s.wrap.row ?? 1)}, ${s.wrap.tileX ? 1 : 0}, ${s.wrap.tileY ? 1 : 0}, ${f(s.wrap.sx ?? 1)}, ${f(s.wrap.sy ?? 1)}, ${s.wrap.part ? 1 : 0}), ${f(mat)});`
+				: `vec2 ${v} = vec2(sdHeightmap(${p}, ${common}), ${f(mat)});`);
 			return;
 		}
 		case 'trimesh': {
@@ -2917,7 +3248,7 @@ export function countPrimitives(s: Sdf): number {
 		case 'sphere': case 'box': case 'cylinder': case 'ngonPrism': case 'cone': case 'planes': case 'capsule': case 'roundCone': case 'heightmap': case 'trimesh': return 1;
 		case 'union': case 'intersection': return s.children.reduce((n, c) => n + countPrimitives(c), 0);
 		case 'difference': return countPrimitives(s.base) + s.cuts.reduce((n, c) => n + countPrimitives(c), 0);
-		case 'domain': case 'dilate': case 'material': case 'offset': case 'extrude': case 'revolve':
+		case 'domain': case 'warp': case 'dilate': case 'material': case 'offset': case 'extrude': case 'revolve':
 			return countPrimitives(s.body);
 		case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': return 1;
 	}

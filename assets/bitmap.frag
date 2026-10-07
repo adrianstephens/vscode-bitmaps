@@ -94,6 +94,7 @@ void main() {
 	if (texel.x >= 0.0 && texel.y >= 0.0 && texel.x < u_size.x && texel.y < u_size.y) {
 		//vec4 color = premultiply(sampleTex(texel));
 		vec4 color = sampleTex(texel);
+		color.rgb *= color.a;	// the texture is not premultiplied; blend() expects it to be
 
 		if (u_scale >= 10.0) {
 			float edge = 1.0 / u_scale;

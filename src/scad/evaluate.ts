@@ -15,31 +15,37 @@ import { trimesh, mapTrimesh } from './meshfield';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
 import * as meshes from '@isopodlabs/binary_meshes';
 import * as path from 'path';
-import { empty, bounds, bounds2, is2d, strip2d, flat2d, sameMaterial, DEFAULT_MATERIAL, type Material,
-	hullVertices2, hullVertices3, convexHull2, convexHull3, sameRadiusCircles, sameRadiusSpheres, verticesOf, verticesOf2,
-	weightedPoints3, weightedHull3, polytopeOfIntersection,
-	polygonConvexity, mitredOffset2, offsetPreservesEdges, isConformal, projection, heightmap, Seg2 } from './sdf';
-import { float2, float3, float3x3, float3x4, safeNormalise } from '@isopodlabs/maths/vector';
-import { parseCurve } from '@isopodlabs/binary_fonts';
+import { empty,
+	bounds2,	hullVertices2,	convexHull2, verticesOf2, polygonConvexity, sameRadiusCircles, mitredOffset2, offsetPreservesEdges, is2d, strip2d, flat2d,
+	bounds3,	hullVertices3,	convexHull3, verticesOf3, polytopeOfIntersection, sameRadiusSpheres, weightedPoints3, weightedHull3,
+	isConformal, projection, heightmap, type Tiled, type Wrap, type Warp, type Heightmap,
+	sameMaterial, DEFAULT_MATERIAL, type Material,
+} from './sdf';
+import { float2, float3, float4, float3x3, float3x4, float2x3, safeNormalise } from '@isopodlabs/maths/vector';
+import { transformCurve } from '@isopodlabs/binary_fonts';
 import * as dwg from '@isopodlabs/dwg';
 
-interface Discretizer { fn: number, fa: number, fs: number }
+// What evaluation has made of the files it read, by path, for as long as each file's bytes stay the same: a viewer
+// evaluates on every edit, and a big mesh takes seconds to build. surface()'s PNGs and import()'s AMF and 3MF meshes
+// are here too, because decoding them is asynchronous and evaluation is not, so they are loaded between evaluations
+// (see evaluateWithImages): each as its brightness (0..1, row 0 the image's top) or its mesh, or the reason it could not be read.
+export interface FileCacheEntry {
+	bytes:		Uint8Array, 
+	reader?:	(e: FileCacheEntry)=>Promise<any>,
+	error?:		string,
+	image?:		bitmap.Result,
+	model?:		meshes.Model,
+	solid?:		Sdf,
+};
+const extension = (full: string) => path.extname(full).toLowerCase();
 
-// how many segments a circle of radius r takes over `angle` degrees (CurveDiscretizer::getCircularSegmentCount), or
-// undefined for a radius too small to have any
-function segmentCount(d: Discretizer, r: number, angle = 360): number | undefined {
-	if (!(r >= 0.00000095367431640625) || !Number.isFinite(angle))
-		return undefined;
-	const full = d.fn > 0 ? Math.ceil(Math.max(d.fn, 3)) : Math.ceil(Math.max(Math.min(360 / d.fa, r * 2 * Math.PI / d.fs), 5));
-	return Math.max(1, Math.ceil(full * Math.abs(angle) / 360));
-}
+export type FileCache = Map<string, FileCacheEntry>;
+export type ScadFiles = FileAccess & { readBinary(full: string): Uint8Array };
 
-function normalize(v: float3) {
-	return safeNormalise(v) ?? float3(0, 0, 0);
-}
+// What a module instantiation's children see when it calls children()
+interface ChildScope { scope: Scope, env: Env }
 
-// How a construct reached further than the viewer can follow, said once each with a count.
-export class Warnings {
+class Ctx {
 	private seen = new Map<string, number>();
 
 	warn(message: string) {
@@ -49,47 +55,46 @@ export class Warnings {
 	get list(): string[] {
 		return [...this.seen].map(([message, count]) => count > 1 ? `${message} (x${count})` : message);
 	}
-}
 
+	children	= [] as ChildScope[];
+	used		= new Set<string>;	// the cache's entries this evaluation asked for, which are all it keeps
+	unloaded	= new Set<string>;
+	// user-defined modules currently instantiating, outermost first, for $parent_modules/parent_module() -- a
+	// builtin module (translate(), difference(), ...) is not one of OpenSCAD's own either, so it is not pushed here
+	moduleStack	= [] as string[];
+	constructor(public files: ScadFiles, public filename: string, public cache: FileCache) {}
+
+	openFile(module: string, written: string, from: string) {
+		const full = this.files ? this.files.resolve(written, path.dirname(from)) : written;
+		if (!full) {
+			this.warn(`${module}(): '${written}' was not found`);
+			return undefined;
+		}
+		try {
+			let entry		= this.cache.get(full);
+			const bytes		= this.files.readBinary(full);
+			this.used.add(full);
+			if (entry && Buffer.from(entry.bytes.buffer, entry.bytes.byteOffset, entry.bytes.byteLength).equals(bytes))
+				return {full, entry };
+			entry = {bytes}
+			this.cache.set(full, entry);
+			return { full, entry };
+
+		} catch {
+			this.warn(`${module}(): '${written}' could not be read`);
+			return undefined;
+		}
+	}
+
+}
 // A frame the geometry is built in: the transform from the current space to the model's, and the factor a
 // distance measured inside it has to be multiplied by to stay a lower bound outside.
 interface Frame { m: float3x4, scale: number }
-const linear = (m: float3x4) => float3x3(m.x, m.y, m.z);
 
 const identityFrame: Frame = {m: float3x4.identity(), scale: 1};
 
-// What a module instantiation's children see when it calls children()
-interface ChildScope { scope: Scope, env: Env }
-
-interface Ctx {
-	warnings: Warnings;
-	children: ChildScope[];
-	files:		ScadFiles;
-	filename:	string;			// the file being evaluated, for a path in a call whose own location is unknown
-	cache:		FileCache;
-	used:		Set<string>;	// the cache's entries this evaluation asked for, which are all it keeps
-	unloaded:	Set<string>;	// the PNGs surface() and the zipped meshes import() met that were not loaded yet (see evaluateWithImages)
-	// user-defined modules currently instantiating, outermost first, for $parent_modules/parent_module() -- a
-	// builtin module (translate(), difference(), ...) is not one of OpenSCAD's own either, so it is not pushed here
-	moduleStack: string[];
-}
-
-// What evaluation has made of the files it read, by path, for as long as each file's bytes stay the same: a viewer
-// evaluates on every edit, and a big mesh takes seconds to build. surface()'s PNGs and import()'s AMF and 3MF meshes
-// are here too, because decoding them is asynchronous and evaluation is not, so they are loaded between evaluations
-// (see evaluateWithImages): each as its brightness (0..1, row 0 the image's top) or its mesh, or the reason it could not be read.
-export class FileCache {
-	files	= new Map<string, Uint8Array>();
-	images	= new Map<string, bitmap.Result | string>();
-	meshes	= new Map<string, { model: meshes.Model | string; solid?: Sdf }>();
-}
-
-const sameBytes = (a: Uint8Array, b: Uint8Array) => Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(b);
-
-// What evaluation reads besides the source: `use`/`include` go through the parser's FileAccess, and surface() may
-// also want a file's bytes rather than its text, since a PNG is not text.
-export type ScadFiles = FileAccess & { readBinary(full: string): Uint8Array };
-
+const normalize	= (v: float3) => safeNormalise(v) ?? float3(0, 0, 0);
+const linear 	= (m: float3x4) => float3x3(m.x, m.y, m.z);
 const rad		= (deg: number) => deg * Math.PI / 180;
 const deg		= (rad: number) => rad * 180 / Math.PI;
 const affine	= (m: float3x3) => float3x4(m.x, m.y, m.z, float3(0, 0, 0));
@@ -110,10 +115,21 @@ function mirroring(v: float3) {
 	return affine(float3.mirror(normalize(v)));
 }
 
+interface Discretizer { fn: number, fa: number, fs: number }
+
+// how many segments a circle of radius r takes over `angle` degrees (CurveDiscretizer::getCircularSegmentCount), or
+// undefined for a radius too small to have any
+function segmentCount(d: Discretizer, r: number, angle = 360): number | undefined {
+	if (!(r >= 0.00000095367431640625) || !Number.isFinite(angle))
+		return undefined;
+	const full = d.fn > 0 ? Math.ceil(Math.max(d.fn, 3)) : Math.ceil(Math.max(Math.min(360 / d.fa, r * 2 * Math.PI / d.fs), 5));
+	return Math.max(1, Math.ceil(full * Math.abs(angle) / 360));
+}
 
 //-----------------------------------------------------------------------------
 // values
 //-----------------------------------------------------------------------------
+
 // What a scad expression evaluates to: a number, a string, a boolean, undef, or a (possibly nested) vector.
 export type Value = number | string | boolean | undefined | Value[];
 
@@ -138,7 +154,7 @@ function num(v: Value, ctx: Ctx, what: string): number | undefined {
 		return v ? 1 : 0;
 	if (v === undefined)
 		return undefined;
-	ctx.warnings.warn(`${what} is not a number`);
+	ctx.warn(`${what} is not a number`);
 	return undefined;
 }
 
@@ -161,7 +177,7 @@ function vec3(v: Value, ctx: Ctx, what: string): float3 | undefined {
 		if (n.length === 2 && n.every(x => x !== undefined))
 			return float3(n[0]!, n[1]!, 0);
 	}
-	ctx.warnings.warn(`${what} is not a 3-vector`);
+	ctx.warn(`${what} is not a 3-vector`);
 	return undefined;
 }
 
@@ -243,7 +259,7 @@ function place(frame: Frame, body: Sdf): Sdf {
 	// rebuilds one through convexHull3 instead. A singular or otherwise degenerate transform (an axis flattened to
 	// nothing) falls through to the domain wrap below, the same as a 'planes' body that det3x3 rejected above.
 	if (body.k !== 'planes') {
-		const corners = verticesOf(body);
+		const corners = verticesOf3(body);
 		if (corners) {
 			const hull = convexHull3(corners.map(p => m.mulPos(p)));
 			if (hull)
@@ -256,22 +272,16 @@ function place(frame: Frame, body: Sdf): Sdf {
 	// itself qualifies -- no z in the x/y columns, no x/y in the z column; one that turns the shape out of the
 	// plane has no 2-D vertices left to move.
 	if (Math.hypot(m.x.z, m.y.z, m.z.x, m.z.y) <= 1e-12) {
-		const move = (p: float2) => {
-			const q = m.mulPos(float3(p.x, p.y, 0));
-			return float2(q.x, q.y);
-		};
+		const trans	= float2x3(m.x.xy, m.y.xy, m.w.xy);
+		const move	= (p: float2) => trans.mulPos(p);
 		// polygon2 moves path by path -- verticesOf2 flattens every path into one point set for hull purposes, which
 		// would fuse a hole's loop into the outline's, so a polygon2 body is moved directly instead of through it.
 		if (body.k === 'polygon2')
 			return {k: 'polygon2', paths: body.paths.map(path => path.map(move))};
 		// a curvepath2 moves its control points along with its corners -- a Bezier curve under an affine map is
 		// exactly the Bezier curve of the transformed control points, so this is exact, not an approximation
-		if (body.k === 'curvepath2') {
-			return {k: 'curvepath2', paths: body.paths.map(path => ({
-				start: move(path.start),
-				segs: path.segs.map(seg => seg.t === 'line' ? {t: 'line' as const, b: move(seg.b)} : {t: 'quad' as const, c: move(seg.c), b: move(seg.b)}),
-			}))};
-		}
+		if (body.k === 'curvepath2')
+			return {k: 'curvepath2', paths: transformCurve(body.paths, trans)};
 		const pts = verticesOf2(body);
 		if (pts)
 			return {k: 'polygon2', paths: [pts.map(move)]};
@@ -305,7 +315,7 @@ const argGetter = (args: Assignment[], env: Env, ctx: Ctx) => {
 		env,
 		ctx,
 		filename:	() => getLoc(args[0]?.expr)?.filename ?? ctx.filename,
-		warn:	(w: string) => ctx.warnings.warn(w),
+		warn:	(w: string) => ctx.warn(w),
 		get,
 		num: (name: string, index = -1) => {
 			const v = get(name, index);
@@ -316,12 +326,11 @@ const argGetter = (args: Assignment[], env: Env, ctx: Ctx) => {
 			return v === undefined ? undefined : vec3(v, ctx, `the '${name}' argument`);
 		},
 		vec2: (name: string, index = -1) => {
-			const v = get(name, index);
 			return vec2(get(name, index), ctx);
 		},
-		bool: (name: string, index = -1, fallback = false) => {
+		bool: (name: string, index = -1) => {
 			const v = get(name, index);
-			return v === undefined ? fallback : truthy(v);
+			return v === undefined ? undefined : truthy(v);
 		},
 		str: (name: string, index = -1) => {
 			const v = get(name, index);
@@ -370,8 +379,8 @@ function materialOf(values: argGetter): Material | undefined {
 		values.num(name) ?? values.num(`$${name}`) ?? (ambient as any)[name === 'refractive_index' ? 'ior' : name];
 	return {
 		...ambient,
-		rgb:		colour.rgb,
-		opacity:	colour.alpha,
+		rgb:		colour.xyz,
+		opacity:	colour.w,
 		specular:	property('specular'),
 		roughness:	property('roughness'),
 		ior:		values.num('ior') ?? values.num('$ior') ?? values.num('refractive_index') ?? values.num('$refractive_index') ?? ambient.ior,
@@ -382,7 +391,7 @@ function materialOf(values: argGetter): Material | undefined {
 // color(c[, alpha]): c is a name, a "#hex" value, or [r, g, b(, a)]. OpenSCAD's own rules apply -- components
 // missing from the vector are 1, out-of-range ones are used but warned about, and alpha overrides a fourth
 // component. A colour it cannot read tints nothing rather than guessing.
-function colourOf(values: argGetter): {rgb: float3, alpha: number} | undefined {
+function colourOf(values: argGetter): float4 | undefined {
 	const c = values.get('c', 0);
 	if (c === undefined) {
 		values.warn('a color() with no colour, so it tints nothing');
@@ -411,7 +420,7 @@ function colourOf(values: argGetter): {rgb: float3, alpha: number} | undefined {
 		rgba[3] = alpha;
 	if (rgba[3] < 0 || rgba[3] > 1)
 		values.warn('a color() alpha outside 0..1');
-	return {rgb: float3(rgba[0], rgba[1], rgba[2]), alpha: rgba[3]};
+	return float4(rgba[0], rgba[1], rgba[2], rgba[3]);
 }
 
 // let()'s bindings are sequential (let* in Scheme terms, not the order-independent style a module/file scope's
@@ -473,7 +482,7 @@ function forEachIteration(args: Assignment[], env: Env, ctx: Ctx, leaf: (inner: 
 	if (args.length > 0)
 		recurse(0, env);
 	if (truncated)
-		ctx.warnings.warn('a for loop with more than 10000 iterations, which is cut short');
+		ctx.warn('a for loop with more than 10000 iterations, which is cut short');
 }
 
 //-----------------------------------------------------------------------------
@@ -510,9 +519,8 @@ function vectorOfFaces(v: Value): number[][] | undefined {
 function facePlanes(points: float3[], faces: number[][]): {planes: {n: float3, d: number}[], faces: float3[][], convex: boolean} | undefined {
 	if (points.length < 4 || faces.length < 4)
 		return undefined;
-	let centre = float3(0, 0, 0);
-	for (const p of points)
-		centre = centre.add(p.scale(1 / points.length));
+
+	const centre = points.reduce((a, b) => a.add(b), float3(0, 0, 0)).scale(1 / points.length);
 
 	const planes: {n: float3, d: number}[] = [], loops: float3[][] = [];
 	for (const face of faces) {
@@ -530,7 +538,7 @@ function facePlanes(points: float3[], faces: number[][]): {planes: {n: float3, d
 			d = -d;
 		}
 		planes.push({n, d});
-		loops.push(face.map(i => points[i]).filter(Boolean) as float3[]);
+		loops.push([p0, p1, p2]);
 	}
 	if (planes.length === 0)
 		return undefined;
@@ -546,17 +554,16 @@ function facePlanes(points: float3[], faces: number[][]): {planes: {n: float3, d
 // few enough faces to unroll in the shader (testing that is corners times faces), and its triangles otherwise.
 const PLANES_MAX = 256;
 
-function solidOf(poly: meshes.Mesh, ctx: Ctx): Sdf {
-	const {points, faces} = poly;
+function solidOf(points: float3[], faces: number[][], ctx: Ctx): Sdf {
 	const shape = faces.length <= PLANES_MAX ? facePlanes(points, faces) : undefined;
 	if (shape?.convex)
 		return {k: 'planes', planes: shape.planes, points, faces: shape.faces};
-	return warnOpen(trimesh(poly) ?? empty, ctx);
+	return warnOpen(trimesh(points, faces) ?? empty, ctx);
 }
 
 function warnOpen(solid: Sdf, ctx: Ctx) {
 	if (solid.k === 'trimesh' && !solid.closed)
-		ctx.warnings.warn('a mesh that is not closed (an edge not shared by exactly two faces, or faces wound differently), so which side of it is inside is a guess near its gaps');
+		ctx.warn('a mesh that is not closed (an edge not shared by exactly two faces, or faces wound differently), so which side of it is inside is a guess near its gaps');
 	return solid;
 }
 
@@ -738,18 +745,18 @@ const builtins: Record<string, (args: Assignment[], env: Env, ctx: Ctx) => Value
 	rands:		(args, env, ctx) => {
 		const a = args.map(x => env.evalExpr(x.expr, ctx));
 		if (a.length < 3 || a.length > 4 || a.some(v => typeof v !== 'number')) {
-			ctx.warnings.warn('rands() takes (min, max, count) or (min, max, count, seed), all numbers');
+			ctx.warn('rands() takes (min, max, count) or (min, max, count, seed), all numbers');
 			return undefined;
 		}
 		let [min, max] = a as number[];
 		const huge = Number.MAX_VALUE / 2;
-		if (!Number.isFinite(min)) { ctx.warnings.warn('rands() range min cannot be infinite'); min = -huge; }
-		if (!Number.isFinite(max)) { ctx.warnings.warn('rands() range max cannot be infinite'); max = huge; }
+		if (!Number.isFinite(min)) { ctx.warn('rands() range min cannot be infinite'); min = -huge; }
+		if (!Number.isFinite(max)) { ctx.warn('rands() range max cannot be infinite'); max = huge; }
 		if (max < min)
 			[min, max] = [max, min];
 		const wanted = Math.abs(a[2] as number);
 		if (!Number.isFinite(wanted)) {
-			ctx.warnings.warn('rands() cannot create an infinite number of results');
+			ctx.warn('rands() cannot create an infinite number of results');
 			return [];
 		}
 		const count = Math.min(Math.floor(wanted), 10_000_000);
@@ -943,7 +950,7 @@ function binary(op: string, l: Value, r: Value, ctx: Ctx): Value {
 		case '+': case '-': {
 			if (isList(l) || isList(r)) {
 				if (!isList(l) || !isList(r) || l.length !== r.length) {
-					ctx.warnings.warn(`'${op}' between mismatched vectors`);
+					ctx.warn(`'${op}' between mismatched vectors`);
 					return undefined;
 				}
 				return l.map((lv, i) => binary(op, lv, r[i], ctx));
@@ -971,7 +978,7 @@ function binary(op: string, l: Value, r: Value, ctx: Ctx): Value {
 				return scalar === undefined ? undefined : l.map(v => binary('/', v, scalar, ctx));
 			}
 			if (isList(r)) {
-				ctx.warnings.warn("a number divided by a vector");
+				ctx.warn("a number divided by a vector");
 				return undefined;
 			}
 			break;
@@ -990,7 +997,7 @@ function binary(op: string, l: Value, r: Value, ctx: Ctx): Value {
 		case '<<': return a << b;
 		case '>>': return a >> b;
 		default:
-			ctx.warnings.warn(`the operator '${op}'`);
+			ctx.warn(`the operator '${op}'`);
 			return undefined;
 	}
 }
@@ -1003,7 +1010,7 @@ function binary(op: string, l: Value, r: Value, ctx: Ctx): Value {
 function matMul(l: Value[], r: Value[], ctx: Ctx): Value {
 	const row = (v: Value, what: string): number[] | undefined => {
 		if (!isList(v) || v.some(isList)) {
-			ctx.warnings.warn(`'*': ${what} is not a row of numbers`);
+			ctx.warn(`'*': ${what} is not a row of numbers`);
 			return undefined;
 		}
 		const out = v.map(x => num(x, ctx, "an element of '*'"));
@@ -1014,7 +1021,7 @@ function matMul(l: Value[], r: Value[], ctx: Ctx): Value {
 		if (rows.some(a => !a))
 			return undefined;
 		if (!rows.every(a => a!.length === rows[0]!.length)) {
-			ctx.warnings.warn(`'*' with a matrix on the ${side} whose rows are not all the same length`);
+			ctx.warn(`'*' with a matrix on the ${side} whose rows are not all the same length`);
 			return undefined;
 		}
 		return rows as number[][];
@@ -1032,7 +1039,7 @@ function matMul(l: Value[], r: Value[], ctx: Ctx): Value {
 		: [rRows[0]];
 
 	if (lRows[0].length !== cols[0].length) {
-		ctx.warnings.warn("'*' between a matrix/vector and one of the wrong size");
+		ctx.warn("'*' between a matrix/vector and one of the wrong size");
 		return undefined;
 	}
 	const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0);
@@ -1129,7 +1136,7 @@ class Env {
 			case 'identifier': {
 				const name = expr.name;
 				if (!env.has(name) && !name.startsWith('$'))
-					ctx.warnings.warn(`'${name}' is used before it is assigned`);
+					ctx.warn(`'${name}' is used before it is assigned`);
 				return env.get(name, ctx);
 			}
 
@@ -1205,7 +1212,7 @@ class Env {
 				const name = expr.callee.type === 'identifier' ? expr.callee.name : undefined;
 				if (name !== undefined)
 					return env.callFunction(name, expr.arguments ?? [], ctx);
-				ctx.warnings.warn('a call to something other than a named function');
+				ctx.warn('a call to something other than a named function');
 				return undefined;
 			}
 
@@ -1213,11 +1220,11 @@ class Env {
 				return env.callFunction(expr.name, expr.arguments ?? [], ctx);
 
 			case 'memberlookup':
-				ctx.warnings.warn('a member lookup');
+				ctx.warn('a member lookup');
 				return undefined;
 
 			default:
-				ctx.warnings.warn(`'${(expr as {type: string}).type}' is not evaluated`);
+				ctx.warn(`'${(expr as {type: string}).type}' is not evaluated`);
 				return undefined;
 		}
 	}
@@ -1239,7 +1246,7 @@ class Env {
 		const builtin = builtins[name];
 		if (builtin)
 			return builtin(args, this, ctx);
-		ctx.warnings.warn(`the function '${name}'`);
+		ctx.warn(`the function '${name}'`);
 		return undefined;
 	}
 
@@ -1371,10 +1378,10 @@ class Env {
 				else if (isList(v) && v.length >= 2)
 					size = float2(num(v[0], ctx, "square()'s x") ?? 0, num(v[1], ctx, "square()'s y") ?? 0);
 				else if (isList(v) && v.length === 1) {
-					ctx.warnings.warn('a square() with one size, taken as a square of it');
+					ctx.warn('a square() with one size, taken as a square of it');
 					size = float2(num(v[0], ctx, "square()'s size") ?? 0, num(v[0], ctx, "square()'s size") ?? 0);
 				} else {
-					ctx.warnings.warn('a square() whose size is neither a number nor a vector, so 1 x 1 is used');
+					ctx.warn('a square() whose size is neither a number nor a vector, so 1 x 1 is used');
 					size = float2(1, 1);
 				}
 				return place(frame, {k: 'square2', size, center: values.bool('center', 1) ?? false});
@@ -1394,7 +1401,7 @@ class Env {
 						points.push(q);
 					}
 				if (points.length < 3) {
-					ctx.warnings.warn('a polygon() with fewer than three readable points, so nothing is drawn');
+					ctx.warn('a polygon() with fewer than three readable points, so nothing is drawn');
 					return empty;
 				}
 				const pathsArg = values.get('paths', 1);
@@ -1415,7 +1422,7 @@ class Env {
 							paths.push(loop);
 					}
 					if (paths.length === 0) {
-						ctx.warnings.warn('a polygon() whose paths described no usable loop, so nothing is drawn');
+						ctx.warn('a polygon() whose paths described no usable loop, so nothing is drawn');
 						return empty;
 					}
 				} else {
@@ -1428,7 +1435,7 @@ class Env {
 				const textArg = values.get('text', 0);
 				if (typeof textArg !== 'string') {
 					if (textArg !== undefined)
-						ctx.warnings.warn('a text() whose text is not a string, so nothing is drawn');
+						ctx.warn('a text() whose text is not a string, so nothing is drawn');
 					return empty;
 				}
 				const size		= values.num('size', 1) ?? 10;
@@ -1436,33 +1443,24 @@ class Env {
 				const font		= typeof fontArg === 'string' ? fontArg : undefined;
 				const halignArg = values.get('halign', 3);
 				if (halignArg !== undefined && halignArg !== 'left' && halignArg !== 'center' && halignArg !== 'right')
-					ctx.warnings.warn(`a text() with an unrecognised halign (${JSON.stringify(halignArg)}), drawn as "left"`);
+					ctx.warn(`a text() with an unrecognised halign (${JSON.stringify(halignArg)}), drawn as "left"`);
 				const halign	= halignArg === 'center' || halignArg === 'right' ? halignArg : 'left';
 				const valignArg	= values.get('valign', 4);
 				if (valignArg !== undefined && valignArg !== 'top' && valignArg !== 'center' && valignArg !== 'baseline' && valignArg !== 'bottom')
-					ctx.warnings.warn(`a text() with an unrecognised valign (${JSON.stringify(valignArg)}), drawn as "baseline"`);
+					ctx.warn(`a text() with an unrecognised valign (${JSON.stringify(valignArg)}), drawn as "baseline"`);
 				const valign	= valignArg === 'top' || valignArg === 'center' || valignArg === 'bottom' ? valignArg : 'baseline';
 				const spacing	= values.num('spacing', 5) ?? 1;
 				if (values.get('direction', 6) !== undefined || values.get('language', 7) !== undefined || values.get('script', 8) !== undefined)
-					ctx.warnings.warn("a text() with direction=/language=/script=, which this viewer does not use -- left to right, in the font's own default script");
+					ctx.warn("a text() with direction=/language=/script=, which this viewer does not use -- left to right, in the font's own default script");
 				const fn		= num(values.special('$fn'), ctx, '$fn') ?? 0;
-				const glyphs	= layoutText({text: textArg, size, font, halign, valign, spacing, fn}, m => ctx.warnings.warn(m));
+				const glyphs	= layoutText({text: textArg, size, font, halign, valign, spacing, fn}, m => ctx.warn(m));
 				if (glyphs.length === 0)
 					return empty;
 				// one curvepath2 per glyph, each with its own paths (for its own holes) built from the font's own
 				// curves, unioned rather than merged into one multi-path shape -- an even-odd fill across unrelated
 				// glyphs would punch a hole wherever two letters' outlines happened to overlap, which is not what a
 				// hole in one letter's own counter means
-				const children: Sdf[] = glyphs.map(curve => {
-					const paths: {start: float2, segs: Seg2[]}[] = [];
-					let path: {start: float2, segs: Seg2[]};
-					parseCurve(curve).run({
-						Begin(a: float2)							{ path = {start: a, segs: []}; paths.push(path); },
-						Line(_a: float2, b: float2)					{ path.segs.push({t: 'line' as const, b}); },
-						Bezier2(_a: float2, c: float2, b: float2)	{ path.segs.push({t: 'quad' as const, c, b}); }
-					});
-					return {k: 'curvepath2', paths}
-				});
+				const children: Sdf[] = glyphs.map(curve => ({k: 'curvepath2', paths: curve}));
 				return place(frame, children.length === 1 ? children[0] : {k: 'union', children});
 			}
 
@@ -1477,14 +1475,14 @@ class Env {
 				const r		= values.num('r') ?? 0;
 				const delta = values.num('delta');
 				if (r !== undefined && delta !== undefined)
-					ctx.warnings.warn('an offset() given both r and delta, which OpenSCAD resolves to r');
+					ctx.warn('an offset() given both r and delta, which OpenSCAD resolves to r');
 				// children are placed in the *local* frame: `frame` is applied once, below, to the offset node as a
 				// whole. Placing them in `frame` here too would double-apply it -- e.g. a translate() above an
 				// offset() would move the result twice.
 				const children = childrenOf(scope, env, identityFrame, ctx);
 				const body = children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (!is2d(body))
-					ctx.warnings.warn('an offset() of something that is not 2-D, which OpenSCAD rejects');
+					ctx.warn('an offset() of something that is not 2-D, which OpenSCAD rejects');
 				if (r === undefined && delta !== undefined) {
 					const verts = body.k === 'square2' || body.k === 'circle2' || (body.k === 'polygon2' && body.paths.length === 1)
 						? verticesOf2(body) : undefined;
@@ -1492,7 +1490,7 @@ class Env {
 					const mitred = convexity && verts && mitredOffset2(verts, delta, convexity.ccw);
 					if (mitred && offsetPreservesEdges(verts!, mitred))
 						return place(frame, {k: 'polygon2', paths: [mitred]});
-					ctx.warnings.warn('an offset(delta), whose mitred corners are drawn round here -- exact mitring only works for a single convex outline (a square, a $fn-sided circle, or a convex polygon())');
+					ctx.warn('an offset(delta), whose mitred corners are drawn round here -- exact mitring only works for a single convex outline (a square, a $fn-sided circle, or a convex polygon())');
 				}
 				return place(frame, {k: 'offset', r: r ?? delta ?? 1, body});
 			}
@@ -1502,13 +1500,13 @@ class Env {
 				const center = values.bool('center', 1) ?? false;
 				for (const name of ['twist', 'scale', 'slices'])
 					if (values.get(name))
-						ctx.warnings.warn(`a linear_extrude ${name}, which this viewer does not vary along its height`);
+						ctx.warn(`a linear_extrude ${name}, which this viewer does not vary along its height`);
 				// children are placed in the *local* frame, as offset()'s are (see the comment there): `frame` is
 				// applied once, below, to the extruded solid as a whole.
 				const children = childrenOf(scope, env, identityFrame, ctx);
 				const body = children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (!is2d(body) && body.k !== 'empty')
-					ctx.warnings.warn('a linear_extrude of something that is not a 2-D shape (circle, square or polygon)');
+					ctx.warn('a linear_extrude of something that is not a 2-D shape (circle, square or polygon)');
 				return place(frame, {k: 'extrude', h: height, center, body});
 			}
 
@@ -1519,10 +1517,10 @@ class Env {
 				const children	= childrenOf(scope, env, identityFrame, ctx);
 				const body		= children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (is2d(body))
-					ctx.warnings.warn('a projection() of a 2-D shape, which OpenSCAD ignores');
+					ctx.warn('a projection() of a 2-D shape, which OpenSCAD ignores');
 				const {sdf, traced} = projection(body, cut);
 				if (traced !== undefined)
-					ctx.warnings.warn(`a projection() whose outline is not known exactly (a cut, an intersection, a minkowski, a rotate_extrude or a mesh), so it is traced to about ${Number(traced.toPrecision(2))} units`);
+					ctx.warn(`a projection() whose outline is not known exactly (a cut, an intersection, a minkowski, a rotate_extrude or a mesh), so it is traced to about ${Number(traced.toPrecision(2))} units`);
 				return place(frame, sdf);
 			}
 
@@ -1534,7 +1532,7 @@ class Env {
 				const children	= childrenOf(scope, env, identityFrame, ctx);
 				const body		= children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (!is2d(body))
-					ctx.warnings.warn('a rotate_extrude of something that is not a 2-D shape (circle, square or polygon)');
+					ctx.warn('a rotate_extrude of something that is not a 2-D shape (circle, square or polygon)');
 				return place(frame, {k: 'revolve', angle, body});
 			}
 
@@ -1604,7 +1602,7 @@ class Env {
 						}
 						let term = terms?.[0];
 						if (!term) {
-							ctx.warnings.warn(is2d(built[i])
+							ctx.warn(is2d(built[i])
 								? 'a 2-D minkowski operand that is not a circle, which this viewer cannot sum'
 								: 'a 2-D minkowski operand that is a 3-D shape, which this viewer cannot sum');
 							const box = bounds2(place(frame, built[i]));
@@ -1647,7 +1645,7 @@ class Env {
 					const branches: (Support & {shift: float3})[][] = [];
 					const addSupport = (a: Support & {shift: float3}, b: Support & {shift: float3}): Support & {shift: float3} => {
 						if (a.q || b.q)
-							ctx.warnings.warn('a minkowski sum of several operands where one is not a ball (a non-uniformly-scaled sphere), which this viewer sums by radius only, dropping the direction it is not round in');
+							ctx.warn('a minkowski sum of several operands where one is not a ball (a non-uniformly-scaled sphere), which this viewer sums by radius only, dropping the direction it is not round in');
 						return {r: a.r + b.r, q: null, shift: a.shift.add(b.shift), bound: a.bound + b.bound};
 					};
 					for (let i = 0; i < insts.length; i++) {
@@ -1663,10 +1661,10 @@ class Env {
 							// not a sphere: grow by the bounding sphere of what it is, and say so. A 2-D operand is not
 							// a solid at all, and growing a solid by its flat bounding sphere is not what the file meant.
 							const built = i === 0 ? probe : new Env(env).instantiate(insts[i], frame, ctx);
-							ctx.warnings.warn(is2d(built)
+							ctx.warn(is2d(built)
 								? 'a minkowski operand that is a 2-D shape, which is not a solid to grow by'
 								: 'a minkowski operand that is not a sphere, so it is grown by its bounding sphere');
-							const box = bounds(built);
+							const box = bounds3(built);
 							const radius = box ? Math.max(Math.abs(box.min.x), Math.abs(box.min.y), Math.abs(box.min.z), Math.abs(box.max.x), Math.abs(box.max.y), Math.abs(box.max.z)) : 0;
 							term = {r: radius, q: null, shift: float3(0, 0, 0), bound: radius};
 						}
@@ -1723,7 +1721,7 @@ class Env {
 						if (roundHull)
 							return {k: 'offset', r: round.r, body: {k: 'polygon2', paths: [roundHull]}};
 					}
-					ctx.warnings.warn('a 2-D hull this viewer cannot build exactly -- circles of different sizes, or a cut shape among its children -- drawn as a union of its children');
+					ctx.warn('a 2-D hull this viewer cannot build exactly -- circles of different sizes, or a cut shape among its children -- drawn as a union of its children');
 					return body;
 
 				} else {
@@ -1750,7 +1748,7 @@ class Env {
 					const mixedHull = weighted && weightedHull3(weighted);
 					if (mixedHull)
 						return mixedHull;
-					ctx.warnings.warn('a hull this viewer cannot build exactly -- a curved side other than a sphere, a cut shape, or a sphere large enough to change which points are on the hull -- drawn as a union of its children');
+					ctx.warn('a hull this viewer cannot build exactly -- a curved side other than a sphere, a cut shape, or a sphere large enough to change which points are on the hull -- drawn as a union of its children');
 					return body;
 				}
 			}
@@ -1764,7 +1762,7 @@ class Env {
 			case 'children': {
 				const outer = ctx.children.at(-1);
 				if (!outer) {
-					ctx.warnings.warn('children() outside a module call');
+					ctx.warn('children() outside a module call');
 					return empty;
 				}
 				if (values.positional.length === 0)
@@ -1816,7 +1814,7 @@ class Env {
 				const minScaleFactor = (v: float3) => Math.min(Math.abs(v.x), Math.abs(v.y), Math.abs(v.z));
 
 				if (minScaleFactor(v) === 0 || !Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) {
-					ctx.warnings.warn('scale() with a zero factor, which flattens the shape: the viewer draws it only as a minkowski operand');
+					ctx.warn('scale() with a zero factor, which flattens the shape: the viewer draws it only as a minkowski operand');
 					return empty;
 				}
 				return transformed(scaling(v), minScaleFactor(v));
@@ -1829,7 +1827,7 @@ class Env {
 			case 'multmatrix': {
 				const rows = values.get('m', 0);
 				if (!isList(rows)) {
-					ctx.warnings.warn('multmatrix with something other than a matrix');
+					ctx.warn('multmatrix with something other than a matrix');
 					return child();
 				}
 				const at = (r: number, c: number) => (rows as any[])?.[r]?.[c] ?? (r === c ? 1 : 0);
@@ -1868,7 +1866,7 @@ class Env {
 				};
 				const r = radius('d', 'r', -1), r1 = radius('d1', 'r1', 1), r2 = radius('d2', 'r2', 2);
 				if (r !== undefined && (r1 !== undefined || r2 !== undefined))
-					ctx.warnings.warn('a cylinder() given both r or d and r1/r2 or d1/d2, which OpenSCAD calls ambiguous (r1/r2 win for their own end)');
+					ctx.warn('a cylinder() given both r or d and r1/r2 or d1/d2, which OpenSCAD calls ambiguous (r1/r2 win for their own end)');
 
 				const baseR1	= r1 ?? r ?? 1, baseR2 = r2 ?? r ?? 1;
 				const tapered	= Math.abs(baseR1 - baseR2) > 1e-9;
@@ -1906,88 +1904,247 @@ class Env {
 				const points	= vectorOfPoints(values.get('points', 0), ctx);
 				const faces		= vectorOfFaces(values.get('faces', 1));
 				if (!points || !faces) {
-					ctx.warnings.warn('polyhedron without readable points and faces');
+					ctx.warn('polyhedron without readable points and faces');
 					return empty;
 				}
-				return place(frame, solidOf({points, faces}, ctx));
+				return place(frame, solidOf(points, faces, ctx));
 			}
 
 			case 'import': {
 				const written	= values.get('file', 0) ?? values.get('filename');
 				if (typeof written !== 'string') {
-					ctx.warnings.warn('import() without a file name');
+					ctx.warn('import() without a file name');
 					return empty;
 				}
 
 				const from		= getLoc(inst)?.filename ?? ctx.filename;
-				const file		= openFile('import', written, from, ctx);
+				const file		= ctx.openFile('import', written, from);
 				if (!file)
 					return empty;
 
-				const {full, bytes}	= file;
-				let cached		= ctx.cache.meshes.get(full);
-				if (!cached) {
+				const {full, entry}	= file;
+				if (!entry.model) {
 					const ext = path.extname(written).toLowerCase();
 					if (MESH_READERS[ext]) {
 						try {
-							const model	= MESH_READERS[ext](bytes);
-							const solid = solidOf(meshes.flatten(model), ctx);
-							cached = {model, solid};
-							ctx.cache.meshes.set(full, cached);
+							entry.model = MESH_READERS[ext](entry.bytes);
 						} catch (error: any) {
-							ctx.warnings.warn(`import(): '${written}' could not be read (${error?.message ?? String(error)})`);
+							ctx.warn(`import(): '${written}' could not be read (${error?.message ?? String(error)})`);
+							return empty;
 						}
+					} else if (ASYNC_MESH_READERS[ext]) {
+						ctx.unloaded.add(full);
+						entry.reader = async e => e.model = await ASYNC_MESH_READERS[ext](e.bytes);
+						return empty;
 					}
-
-				} else if (!cached.solid && typeof cached.model !== 'string') {
-					cached.solid = solidOf(meshes.flatten(cached.model), ctx);
+				}
+				
+				if (!entry.solid) {
+					const {points, faces} = meshes.flatten(entry.model!);
+					entry.solid = solidOf(points, faces, ctx);
 				}
 
-				if (cached && cached.solid) {
-					const center	= values.bool('center') ?? false;
-					const layer		= values.get('layer', 1) ?? values.get('layername');
-					const scale		= num(values.get('scale', 4), ctx, "import()'s scale") ?? 1;
+				const center	= values.bool('center') ?? false;
+				const layer		= values.get('layer', 1) ?? values.get('layername');
+				const scale		= num(values.get('scale', 4), ctx, "import()'s scale") ?? 1;
 
-					// $fn, $fa and $fs, with OpenSCAD's defaults and floors, for what a file's curves are broken into
-					const value			= (name: string, fallback: number) => num(values.special(name) ?? fallback, ctx, name) ?? fallback;
-					const discretizer	= {fn: Math.max(value('$fn', 0), 0), fa: Math.max(value('$fa', 12), 0.01), fs: Math.max(value('$fs', 2), 0.01)};
+				// $fn, $fa and $fs, with OpenSCAD's defaults and floors, for what a file's curves are broken into
+				const value			= (name: string, fallback: number) => num(values.special(name) ?? fallback, ctx, name) ?? fallback;
+				const discretizer	= {fn: Math.max(value('$fn', 0), 0), fa: Math.max(value('$fa', 12), 0.01), fs: Math.max(value('$fs', 2), 0.01)};
 
-					if ((center || scale !== 1) && typeof cached.model !== 'string') {
-						const mesh 		= meshes.flatten(cached.model);
-						const mid		= mesh.points.reduce((a, p) => a.min(p)).add(mesh.points.reduce((a, p) => a.max(p))).scale(0.5);
-						const frame2	= {m: frame.m.mulAffine(float3.translate(mid.neg())), scale: frame.scale * scale };
-						return place(frame2, cached.solid)
-					}
-
-					return place(frame, cached.solid);
+				if (center || scale !== 1) {
+					const mesh 		= meshes.flatten(entry.model!);
+					const mid		= mesh.points.reduce((a, p) => a.min(p)).add(mesh.points.reduce((a, p) => a.max(p))).scale(0.5);
+					const frame2	= {m: frame.m.mulAffine(float3.translate(mid.neg())), scale: frame.scale * scale };
+					return place(frame2, entry.solid)
 				}
-				return empty;
+
+				return place(frame, entry.solid);
 			}
 
 			case 'surface': {
 				const written	= values.get('file', 0);
 				const center	= values.bool('center', 1) ?? false;
 				const invert	= values.bool('invert') ?? false;
+				const tiled		= tiledOf(values.get('tiled'));
 				if (typeof written !== 'string') {
-					ctx.warnings.warn("surface() without a file name");
+					ctx.warn("surface() without a file name");
 					return empty;
 				}
-				const map = readSurface(written, invert, getLoc(inst)?.filename ?? ctx.filename, ctx);
+				// surface() is OpenSCAD's own, flat only -- bending the grid is wrap()'s job, which is what lets a
+				// transform written inside the wrap() be applied to the grid before the bend (see that case).
+				const map = readSurface(written, invert, tiled, getLoc(inst)?.filename ?? ctx.filename, ctx);
 				if (!map)
 					return empty;
-				// OpenSCAD's centre is the grid's own middle, in x and y only
+				// OpenSCAD's centre is the flat grid's own middle, in x and y only
 				return place(center ? {m: frame.m.mulAffine(float3.translate(float3(-(map.cols - 1) / 2, -(map.rows - 1) / 2, 0))), scale: frame.scale} : frame, map);
 			}
 
 			case 'resize':
-				ctx.warnings.warn('resize, which is drawn at its own size');
+				ctx.warn('resize, which is drawn at its own size');
 				return child();
 
+			// wrap("cylinder"/"sphere", r = <radius>) bends what is inside it into a revolution about z: its x
+			// becomes an arc of r, its y a height up the axis or a latitude, and its z a thickness standing out
+			// from the surface of radius r. A cylinder can be given the length of its axis too (h) -- r and h being
+			// the surface's two dimensions, as a cylinder primitive has them -- and then the body's own height is
+			// fitted to it rather than being it. Being a wrapper is the point: a transform *inside* it is applied to
+			// the flat shape before the bend, so `wrap("sphere", r = 50) scale([1, 1, 0.1]) surface("map.png")`
+			// thins the relief and leaves the sphere alone, where a scale outside it would flatten the sphere.
+			case 'wrap': {
+				const how	= values.str('kind', 0);
+				const r		= values.num('r') ?? (values.num('d') ?? 0) / 2;
+				const h		= values.num('h');
+				if (how !== 'cylinder' && how !== 'sphere')
+					ctx.warn(`wrap(): "${how}", which is neither "cylinder" nor "sphere"`);
+				else if (!(r > 0))
+					ctx.warn(`wrap(): "${how}" needs a positive r or d`);
+				// a sphere's meridian is a half turn of r whatever its grid, so it has no second dimension to give
+				else if (h !== undefined && how === 'sphere')
+					ctx.warn(`wrap(): h, which is the length of a cylinder's axis; a sphere's meridian is pi * r`);
+				else if (h !== undefined && !(h > 0))
+					ctx.warn('wrap(): h, which should be a positive length');
+				else {
+					// children are placed in the *local* frame, as offset()'s and rotate_extrude()'s are: `frame` is
+					// applied once, below, to the whole bend. Placing them in `frame` here too would not merely move
+					// the result twice -- a bent body's z *is* the radius it stands off r, so the frame's own
+					// translate would be folded into that radius, and a translate above the wrap would resize it.
+					const children = childrenOf(scope, env, identityFrame, ctx);
+					const body = children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
+					// A flat height field is a whole surface already -- its columns are a ring and its rows reach the
+					// poles -- so it is bent as the grid it is: fitted to the turn, seamless, and tighter than the
+					// general bend. Scaled across, though -- x anywhere, or y too on a sphere -- it is a piece of a
+					// surface rather than the whole of one, and the general bend takes it, its own width being the
+					// arc it covers. A scale in z is only how thick the shell stands off r, and one along a
+					// cylinder's y only how much of its axis the rows cover: neither makes it a piece. That axis is
+					// what h names instead, when the bend was given one -- the length the rows are then fitted to, or
+					// repeat over, rather than the length the grid's own scale asks for.
+					//
+					// A tiled grid is the exception, and the reason for tiling: there the scale sets the size of the
+					// tile, not how much of the surface is covered, so the fused path still applies and the mapping
+					// is the grid's own arc (see wrappedHeightmapDistance). That is also what keeps a scaled sphere
+					// sane at its poles, where the general bend's stretch falls to nothing.
+					const placed = placedBody(body);
+					const map = placed?.body.k === 'heightmap' && !placed.body.wrap ? placed.body : undefined;
+					const tiled = map?.tiled;
+					// A scaled grid that is not tiled is a piece of the surface its own width asks for: its columns
+					// end where the grid does, of the arc (cols - 1) * sx, and a meridian through each end is a face
+					// of the solid. It is bent on the fused path, which carries that scale exactly. The general bend
+					// cannot: it folds a non-uniform scale into its distance by the smallest axis alone (see place),
+					// so a relief a hundredth as thick as the grid is wide comes out with a gradient a hundredth of
+					// the distance's -- the surface still where it should be, but shaded as the flat sheet that
+					// gradient describes. That is what a scaled sphere's poles and its every cliff suffered too.
+					//
+					// A sphere's rows are fitted to the whole meridian by that map, so a piece of one has to be a grid
+					// tall enough to span pole to pole; a cylinder's rows are a length up the axis, which the grid's
+					// own height or h gives, so its piece needs nothing but its width.
+					const part = !!(map && placed && !tiled
+						&& Math.abs(placed.scale.x) > 0
+						&& Math.abs(placed.scale.x - 1) >= 1e-9
+						&& (map.cols - 1) * Math.abs(placed.scale.x) < 2 * Math.PI * r
+						&& (how === 'cylinder' || (map.rows - 1) * Math.abs(placed.scale.y) >= Math.PI * r));
+					// The other side of the same case: a scaled grid at least a circumference wide is fitted to the
+					// whole turn rather than ending at a meridian, so it is a whole surface again and the scale stops
+					// saying how much of it is covered -- exactly as an untiled grid with no scale at all is. The
+					// general bend fits it too, but it can only carry the scale of the thinnest of the three axes
+					// (see place), so a relief a hundredth as thick as the grid is wide is shaded flat; the fused map
+					// is where the columns are a whole turn over cols and the scale is carried exactly.
+					const fitted = !!(map && placed && !tiled && !part
+						&& Math.abs(placed.scale.x - 1) >= 1e-9
+						&& (map.cols - 1) * Math.abs(placed.scale.x) >= 2 * Math.PI * r
+						&& (how === 'cylinder' || (map.rows - 1) * Math.abs(placed.scale.y) >= Math.PI * r));
+					const fused = map && placed && (!!tiled || part || fitted
+						|| (Math.abs(placed.scale.x - 1) < 1e-9 && (how === 'cylinder' || Math.abs(placed.scale.y - 1) < 1e-9)));
+					if (fused && map && placed) {
+						const heights = Float64Array.from(map.heights, v => placed.scale.z * v);
+						// A negative scale is a mirror, and the fused mapping has no room for one -- a signed arc
+						// would send the columns or the rows round the wrong way -- so a mirrored axis is turned
+						// round in the grid itself instead and the arc taken as a size. On a sphere the rows' mirror
+						// is nothing at all: the fitted or tiled meridian puts row 0 on the north pole either way, so
+						// the same rows lie on the same latitudes. A cylinder's axis is a plain length with no such
+						// anchor, so its rows are reversed when the scale is.
+						const mirror = (x: boolean, y: boolean) => {
+							for (let j = 0; j < map.rows; j++)
+								for (let i = 0; x && i < map.cols >> 1; i++) {
+									const k = j * map.cols + i, k2 = j * map.cols + map.cols - 1 - i;
+									[heights[k], heights[k2]] = [heights[k2], heights[k]];
+								}
+							for (let j = 0; y && j < map.rows >> 1; j++)
+								for (let i = 0; i < map.cols; i++) {
+									const k = j * map.cols + i, k2 = (map.rows - 1 - j) * map.cols + i;
+									[heights[k], heights[k2]] = [heights[k2], heights[k]];
+								}
+						};
+						const wrap: Wrap = {kind: how, r, row: 1};
+						if (tiled) {
+							// a tiled grid's scale sets the size of its tile rather than how much of the surface it
+							// covers, so the columns repeat round the whole turn and the rows up the axis
+							if (tiled.x) { wrap.tileX = true; wrap.sx = Math.abs(placed.scale.x); }
+							if (tiled.y) { wrap.tileY = true; wrap.sy = Math.abs(placed.scale.y); }
+						} else if (part) {
+							// one column is sx of arc and the columns end there: the grid covers that much of the turn
+							wrap.part = true;
+							wrap.sx = Math.abs(placed.scale.x);
+						}
+						// A cylinder's axis: h when it was given, else the grid's own scaled height, which is the
+						// length a scale in y asks for and what h then names instead. One row covers one row of it,
+						// so `row` is that length divided by the grid's rows: the rows are spread over the axis when
+						// it is not their own height, and a tiled grid's tile repeats over however long it is.
+						if (how === 'cylinder') {
+							const H = map.rows - 1;
+							const axis = h ?? H * Math.abs(placed.scale.y);
+							wrap.row = H > 0 ? axis / H : axis;
+						}
+						mirror((!!tiled?.x || part || fitted) && placed.scale.x < 0, how === 'cylinder' && placed.scale.y < 0);
+						const folded = heightmap(map.cols, map.rows, heights,
+							placed.scale.z * map.bottom, wrap);
+						return folded ? place(frame, folded) : empty;
+					}
+					const box = bounds3(body);
+					if (!box)
+						ctx.warn(is2d(body)
+							? 'wrap(): a 2-D shape, which wants an extrude before it can be bent'
+							: 'wrap() of nothing');
+					else
+						// the axis h names is fitted to here too, so a body that is not a grid covers the tube rather
+						// than being it; undefined is the body's own height, which is what the map already is
+						return place(frame, {k: 'warp', kind: how, r, box, body, axis: how === 'cylinder' ? h : undefined});
+				}
+				return empty;
+			}
+
 			default:
-				ctx.warnings.warn(`the module '${name}', which is not drawn`);
+				ctx.warn(`the module '${name}', which is not drawn`);
 				return empty;
 		}
 	}
+}
+
+// The body a wrap() is handed under nothing but per-axis scales and translates, with the scales composed into the
+// one they amount to -- undefined for anything else, a turn or a shear being beyond what the wrap can read its own
+// terms off. A whole turn can fold those scales in exactly and keep a height field's own tile table: a shrink in z
+// is a thinner relief whatever radius it is bent onto -- the whole reason to bend a field after the fact rather than
+// to have made the map and the bend one thing -- and on a cylinder a scale in y is how much of the axis the rows
+// cover. A scale in x is nothing either way, since the columns fill the turn whatever their own width -- unless the
+// grid is tiled, where x and y are the arc each cell covers and so the size of the tile (see the wrap case above). A
+// translate is nothing on any axis: the wrap fits the body to the surface it bends it around, a translate being no
+// part of a shape.
+function placedBody(body: Sdf): {body: Sdf, scale: float3} | undefined {
+	let s = body, scale = float3(1, 1, 1);
+	for (;;) {
+		if (s.k === 'material') {
+			s = s.body;
+			continue;
+		}
+		if (s.k !== 'domain')
+			break;
+		const m = s.m;
+		if (Math.hypot(m.x.y, m.x.z, m.y.x, m.y.z, m.z.x, m.z.y) > 1e-12)
+			return undefined;
+		scale = float3(scale.x * m.x.x, scale.y * m.y.y, scale.z * m.z.z);
+		s = s.body;
+	}
+	return {body: s, scale};
 }
 
 //-----------------------------------------------------------------------------
@@ -2001,75 +2158,64 @@ class Env {
 // always done.
 // A file a call names, found as OpenSCAD finds it (beside the file the call is written in, then the library path) and
 // read as bytes where the files allow, or as text; undefined, reported, when it cannot be.
-function openFile(module: string, written: string, from: string, ctx: Ctx) {
-	const files = ctx.files;
-	const full = files ? files.resolve(written, path.dirname(from)) : written;
-	if (!full) {
-		ctx.warnings.warn(`${module}(): '${written}' was not found`);
-		return undefined;
-	}
-	try {
-		const cached	= ctx.cache.files.get(full);
-		const bytes		= files.readBinary(full);
-		ctx.used.add(full);
-		if (cached && sameBytes(cached, bytes))
-			return {full, bytes: cached };
-		ctx.unloaded.add(full);
-		return { full, bytes };
 
-	} catch {
-		ctx.warnings.warn(`${module}(): '${written}' could not be read`);
-		return undefined;
-	}
+function imageReader<T extends {load(a: Uint8Array): bitmap.Image | Promise<bitmap.Image>}>(e: FileCacheEntry, format: T) {
+	e.reader = async e => e.image = await (await format.load(e.bytes)).getPixels({plane: 'Y', array: Float32Array, luma: 'rec709'});
 }
 
-function readSurface(written: string, invert: boolean, from: string, ctx: Ctx) {
-	const file = openFile('surface', written, from, ctx);
+function readSurface(written: string, invert: boolean, tiled: Tiled | undefined, from: string, ctx: Ctx) {
+	const file = ctx.openFile('surface', written, from);
 	if (!file)
 		return undefined;
 
-	const {full, bytes} = file;
-	const image = ctx.cache.images.get(full);
-	if (!image)
-		return undefined;
-
-	if (typeof image === 'string') {
-		const text = new TextDecoder().decode(bytes);
-		const rows: number[][] = [];
-		let lowest = 1;
-		for (const raw of text.split(/\r?\n/)) {
-			const line = raw.trim();
-			if (!line || line.startsWith('#'))
-				continue;
-			const row: number[] = [];
-			for (const token of line.split(/[ \t]+/)) {
-				const v = Number(token);
-				if (!Number.isFinite(v)) {
-					ctx.warnings.warn(`surface(): '${written}' has a value that is not a number: '${token}'`);
-					return undefined;
+	const {full, entry} = file;
+	if (!entry.image) {
+		switch (extension(full)) {
+			case '.png':	imageReader(entry, bitmap.PNG); break;
+			case '.jpg':	imageReader(entry, bitmap.JPEG); break;
+			case '.jpeg':	imageReader(entry, bitmap.JPEG); break;
+			case '.bmp':	imageReader(entry, bitmap.BMP); break;
+			default: {
+				const text = new TextDecoder().decode(entry.bytes);
+				const rows: number[][] = [];
+				let lowest = 1;
+				for (const raw of text.split(/\r?\n/)) {
+					const line = raw.trim();
+					if (!line || line.startsWith('#'))
+						continue;
+					const row: number[] = [];
+					for (const token of line.split(/[ \t]+/)) {
+						const v = Number(token);
+						if (!Number.isFinite(v)) {
+							ctx.warn(`surface(): '${written}' has a value that is not a number: '${token}'`);
+							return undefined;
+						}
+						row.push(v);
+						lowest = Math.min(lowest, v);
+					}
+					rows.push(row);
 				}
-				row.push(v);
-				lowest = Math.min(lowest, v);
+				const cols		= rows.reduce((n, r) => Math.max(n, r.length), 0);
+				const heights	= new Float64Array(cols * rows.length);
+				rows.forEach((r, j) => r.forEach((v, i) => heights[j * cols + i] = v));
+				return checkedHeightmap(cols, rows.length, heights, lowest - 1, tiled, written, ctx);
 			}
-			rows.push(row);
 		}
-		const cols		= rows.reduce((n, r) => Math.max(n, r.length), 0);
-		const heights	= new Float64Array(cols * rows.length);
-		rows.forEach((r, j) => r.forEach((v, i) => heights[j * cols + i] = v));
-		return checkedHeightmap(cols, rows.length, heights, lowest - 1, written, ctx);
-
-	} else {
-		const {width, height, pixels: gray} = image;
-		const heights = new Float64Array(width * height);
-		let lowest = Infinity;
-		for (let y = 0; y < height; y++)
-			for (let x = 0; x < width; x++) {
-				const z = 100 * (invert ? -gray[y * width + x] : gray[y * width + x]);
-				heights[(height - 1 - y) * width + x] = z;
-				lowest = Math.min(lowest, z);
-			}
-		return checkedHeightmap(width, height, heights, lowest - 1, written, ctx);
+		ctx.unloaded.add(full);
+		return undefined;
 	}
+
+	const {width, height, pixels: gray} = entry.image;
+	const heights = new Float64Array(width * height);
+	let lowest = Infinity;
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const z = 100 * (invert ? -gray[y * width + x] : gray[y * width + x]);
+			heights[(height - 1 - y) * width + x] = z;
+			lowest = Math.min(lowest, z);
+		}
+	}
+	return checkedHeightmap(width, height, heights, lowest - 1, tiled, written, ctx);
 }
 
 // import()'s mesh formats, by extension as OpenSCAD decides; AMF and 3MF may be zipped, which only reads asynchronously,
@@ -2152,10 +2298,11 @@ function loadDXF(module: string, args: argGetter) {
 		args.warn(`${module}() without a file name`);
 		return undefined;
 	}
-	const read = openFile(module, written, args.filename(), args.ctx);
+	const read = args.ctx.openFile(module, written, args.filename());
 	if (read) {
-		const model = MESH_READERS.dxf(read.bytes);
-		return model.extras.document as dwg.DXF;
+		if (!read.entry.model)
+			read.entry.model = MESH_READERS.dxf(read.entry.bytes);
+		return read.entry.model.extras.document as dwg.DXF;
 	}
 }
 
@@ -2281,10 +2428,21 @@ function dxfCross(args: argGetter): Value {
 	return [a[0].x + ua * (a[1].x - a[0].x), a[0].y + ua * (a[1].y - a[0].y)];
 }
 
-function checkedHeightmap(cols: number, rows: number, heights: Float64Array, bottom: number, written: string, ctx: Ctx) {
-	const map = heightmap(cols, rows, heights, bottom);
+// surface()'s `tiled`: false (the default), true for both axes, or [x, y] -- a one-element list tiling x alone, since
+// that is the axis a wrapped surface most often wants repeated. Undefined when neither axis repeats, so that a plain
+// surface() carries no tiled property at all and wrap() reads it as the untiled grid it is. `tiled` is the grid's own
+// property, read when a wrap() bends it (see Tiled and Wrap in sdf.ts).
+function tiledOf(v: Value): Tiled | undefined {
+	const t = isList(v)
+		? {x: truthy(v[0]), y: v.length > 1 ? truthy(v[1]) : false}
+		: {x: truthy(v), y: truthy(v)};
+	return t.x || t.y ? t : undefined;
+}
+
+function checkedHeightmap(cols: number, rows: number, heights: Float64Array, bottom: number, tiled: Tiled | undefined, written: string, ctx: Ctx) {
+	const map = heightmap(cols, rows, heights, bottom, undefined, tiled);
 	if (!map)
-		ctx.warnings.warn(`surface(): '${written}' has fewer than two rows or columns, so there is no surface`);
+		ctx.warn(`surface(): '${written}' has fewer than two rows or columns, so there is no surface`);
 	return map;
 }
 
@@ -2319,7 +2477,7 @@ function topLevel<T>(env: Env, name: string, ctx: Ctx, convert: (v: Value) => T 
 // could not be found, the path as written, which `files.read` below then fails on and this reports as a warning).
 // A library's own `use`s are loaded too, each path read at most once; a name already bound -- by this file, or by
 // a library asked for earlier -- is left alone, so the first (most local) definition wins.
-function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: FileAccess | undefined, env: Env, warnings: Warnings, seen: Set<string>) {
+function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: FileAccess | undefined, env: Env, ctx: Ctx, seen: Set<string>) {
 	if (!files)
 		return;
 	for (const path of file.usedlibs) {
@@ -2330,11 +2488,11 @@ function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: File
 		try {
 			text = files.read(path);
 		} catch {
-			warnings.warn(`a use<>d library that could not be read: ${path}`);
+			ctx.warn(`a use<>d library that could not be read: ${path}`);
 			continue;
 		}
 		const lib = parse(text, path, files);
-		loadUsedLibraries(lib, files, env, warnings, seen);
+		loadUsedLibraries(lib, files, env, ctx, seen);
 		for (const [name, mod] of lib.scope.modules)
 			if (!env.modules.has(name))
 				env.modules.set(name, mod);
@@ -2361,56 +2519,50 @@ function rootDefaults(preview: boolean): Env {
 // `preview` is false only for a final export (see exportStl()): OpenSCAD's own $preview, which a file may use to
 // skip a preview-only simplification, since here that step -- unlike a re-evaluation on a moved camera -- is one
 // this viewer already always pays for.
-export function evaluate(code: string, filename: string, files: ScadFiles, cache = new FileCache(), preview = true): Evaluated {
-	const warnings = new Warnings();
+export function evaluate(code: string, filename: string, files: ScadFiles, cache: FileCache, preview = true) {
 	const file = parse(code, filename, files);
 	const env = new Env(rootDefaults(preview));
-	loadUsedLibraries(file, files, env, warnings, new Set([filename]));
-	const ctx: Ctx = {warnings, children: [], files, filename, cache, used: new Set(), unloaded: new Set(), moduleStack: []};
+	const ctx = new Ctx(files, filename, cache);
+	loadUsedLibraries(file, files, env, ctx, new Set([filename]));
+
 	const raw = env.evalScope(file.scope, identityFrame, ctx);
 	const {sdf, stripped} = strip2d(raw);
 	if (stripped)
-		warnings.warn('a 2-D shape (circle, square or polygon) outside linear_extrude/rotate_extrude, which the viewer draws as a flat sheet and an export leaves out');
-	for (const entries of [cache.images, cache.meshes])
-		for (const key of entries.keys())
-			if (!ctx.used.has(key))
-				entries.delete(key);
+		ctx.warn('a 2-D shape (circle, square or polygon) outside linear_extrude/rotate_extrude, which the viewer draws as a flat sheet and an export leaves out');
+
+	for (const key of cache.keys())
+		if (!ctx.used.has(key))
+			cache.delete(key);
+
 	for (const full of ctx.unloaded)
-		warnings.warn(ASYNC_MESH_READERS[path.extname(full).toLowerCase()]
+		ctx.warn(ASYNC_MESH_READERS[path.extname(full).toLowerCase()]
 			? `import(): '${path.basename(full)}' is only drawn when it has been loaded first (see evaluateWithImages)`
 			: `surface(): '${path.basename(full)}' is a PNG, which is only drawn when it has been loaded first (see evaluateWithImages)`);
+
 	const camera = {
 		vpt: topLevel(env, '$vpt', ctx, vecOf),
 		vpr: topLevel(env, '$vpr', ctx, vecOf),
 		vpd: topLevel(env, '$vpd', ctx, numOf),
 		vpf: topLevel(env, '$vpf', ctx, numOf),
 	};
-	return {sdf, flat: stripped ? (thickness: number) => flat2d(raw, thickness) : undefined, warnings: warnings.list, unloaded: [...ctx.unloaded], camera};
-}
-
-// the brightness OpenSCAD's surface() uses: Rec. 709's weights, unrounded, alpha ignored
-async function loadBrightness(bytes: Uint8Array): Promise<bitmap.Result | string> {
-	try {
-		return await (await bitmap.PNG.load(bytes)).getPixels({plane: 'Y', array: Float32Array, luma: 'rec709'});
-	} catch (error: any) {
-		return `a PNG that could not be decoded (${error?.message ?? error})`;
-	}
+	return {sdf, flat: stripped ? (thickness: number) => flat2d(raw, thickness) : undefined, warnings: ctx.list, unloaded: [...ctx.unloaded], camera};
 }
 
 // evaluate(), with the PNGs its surface() calls and the AMF and 3MF files its import() calls read loaded first: evaluated
 // once to find which they are (a file name can be computed, so there is no knowing sooner), then again with them.
-export async function evaluateWithImages(code: string, filename: string, files: ScadFiles, cache = new FileCache(), preview = true): Promise<Evaluated> {
+export async function evaluateWithFiles(code: string, filename: string, files: ScadFiles, cache: FileCache, preview = true) {
 	for (;;) {
 		const result = evaluate(code, filename, files, cache, preview);
 		if (result.unloaded.length === 0)
 			return result;
 		for (const full of result.unloaded) {
-			const bytes = files!.readBinary!(full);
-			const reader = ASYNC_MESH_READERS[path.extname(full).toLowerCase()];
-			if (reader)
-				cache.meshes.set(full, {model: await reader(bytes).catch(error => String(error?.message ?? error))});
-			else
-				cache.images.set(full, await loadBrightness(bytes));
+			const entry = cache.get(full)!;
+			try {
+				if (entry.reader)
+					await entry.reader(entry);
+			} catch (e: any) {
+				entry.error = e.message;
+			}
 		}
 	}
 }

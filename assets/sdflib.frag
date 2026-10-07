@@ -79,93 +79,6 @@ float sdRoundCone(vec3 p, vec3 a, vec3 b, float r1, float r2) {
 	return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
 }
 
-// Unsigned distance from p to the quadratic Bezier through a, control point c, and b: the exact nearest point,
-// found by solving for the zero of the derivative of |B(t)-p|^2 (a cubic in t) via Cardano's method -- one or three
-// real roots, each clamped to [0,1] since the curve is only defined on that range. Used for text()'s glyph
-// outlines, built from the font's own quadratic curves rather than a flattened polygon, so a letterform stays exact
-// at any zoom instead of faceted at whatever segment count it was tessellated to. Kept in step by hand with
-// bezierDistance2 in sdf.ts, since nothing generates either from the other.
-float sdBezier2(vec2 p, vec2 a, vec2 c, vec2 b) {
-	vec2 A = c - a;
-	vec2 B = a - 2.0 * c + b;
-	vec2 C = A * 2.0;
-	vec2 D = a - p;
-	float bb = dot(B, B);
-	if (bb < 1e-9) {
-		// the control point is the midpoint of a and b: not really a curve, just the line from a to b
-		vec2 e = b - a, w = p - a;
-		float t = clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-		vec2 cc = w - t * e;
-		return length(cc);
-	}
-	float kk = 1.0 / bb;
-	float kx = kk * dot(A, B);
-	float ky = kk * (2.0 * dot(A, A) + dot(D, B)) / 3.0;
-	float kz = kk * dot(D, A);
-	float p1 = ky - kx * kx;
-	float p3 = p1 * p1 * p1;
-	float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-	float h = q * q + 4.0 * p3;
-	float res;
-	if (h >= 0.0) {
-		h = sqrt(h);
-		vec2 x = (vec2(h, -h) - q) / 2.0;
-		vec2 uv = sign(x) * pow(abs(x), vec2(1.0 / 3.0));
-		float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-		vec2 qq = D + (C + B * t) * t;
-		res = dot(qq, qq);
-	} else {
-		float z = sqrt(-p1);
-		float v = acos(q / (p1 * z * 2.0)) / 3.0;
-		float m = cos(v), n = sin(v) * 1.7320508075688772;
-		vec3 t = clamp(vec3(m + m, -n - m, n - m) * z - kx, 0.0, 1.0);
-		vec2 qx = D + (C + B * t.x) * t.x;
-		vec2 qy = D + (C + B * t.y) * t.y;
-		vec2 qz = D + (C + B * t.z) * t.z;
-		res = min(dot(qx, qx), min(dot(qy, qy), dot(qz, qz)));
-	}
-	return sqrt(res);
-}
-
-// The even-odd crossing multiplier a quadratic Bezier (a, c, b) contributes to a horizontal ray cast from p towards
-// +x -- the curved generalisation of the straight-edge crossing test text()'s glyph shapes also use for their line
-// segments (see evaluate.ts's emit() for 'curvepath2'). A curve need not be monotonic in y the way a straight edge
-// always is, so it can cross the ray 0, 1 or 2 times within one segment; each root of y(t) = p.y counts only where
-// the crossing is transversal (y'(t) != 0 there -- a tangency touches the ray without crossing it), and only for t
-// in [0, 1), the same half-open convention the straight-edge test uses so a curve shares no double-count with the
-// segment before it at their shared point.
-float bezierCrossing2(vec2 p, vec2 a, vec2 c, vec2 b) {
-	float A = a.y - 2.0 * c.y + b.y;
-	float B = 2.0 * (c.y - a.y);
-	float C = a.y - p.y;
-	float mult = 1.0;
-	if (abs(A) < 1e-12) {
-		if (abs(B) > 1e-12) {
-			float t = -C / B;
-			if (t >= 0.0 && t < 1.0) {
-				float x = (1.0 - t) * (1.0 - t) * a.x + 2.0 * (1.0 - t) * t * c.x + t * t * b.x;
-				if (x > p.x) mult = -mult;
-			}
-		}
-	} else {
-		float disc = B * B - 4.0 * A * C;
-		if (disc >= 0.0) {
-			float sq = sqrt(disc);
-			float t1 = (-B - sq) / (2.0 * A);
-			float t2 = (-B + sq) / (2.0 * A);
-			if (t1 >= 0.0 && t1 < 1.0 && abs(2.0 * A * t1 + B) > 1e-12) {
-				float x = (1.0 - t1) * (1.0 - t1) * a.x + 2.0 * (1.0 - t1) * t1 * c.x + t1 * t1 * b.x;
-				if (x > p.x) mult = -mult;
-			}
-			if (t2 >= 0.0 && t2 < 1.0 && abs(2.0 * A * t2 + B) > 1e-12) {
-				float x = (1.0 - t2) * (1.0 - t2) * a.x + 2.0 * (1.0 - t2) * t2 * c.x + t2 * t2 * b.x;
-				if (x > p.x) mult = -mult;
-			}
-		}
-	}
-	return mult;
-}
-
 // A big union of simple shapes, walked as data rather than emitted as code (batchUnion / emitBatch in sdf.ts, which
 // says how the texture is laid out). The hierarchy is walked nearest box first with an explicit stack, and whatever
 // cannot beat the best found so far is skipped -- except a box that holds the point, which is always asked, since
@@ -220,6 +133,220 @@ float sdHeightmap(vec3 p, int heights, int tiles, int cols, int rows, int tile, 
 		? min(max(gap * nearSlope, p.z - nearTop), edge)
 		: -min(-gap * nearSlope, edge);
 	return max(box, terrain);
+}
+
+// A wrapped map's height at a continuous column (which is periodic: column `cols` is column 0 again) and row, by the
+// same four triangles as sdHeightmap, which meet at the cell's centre -- the grid has no edge across, so the cell
+// index wraps rather than clamping. heightAtWrap in sdf.ts, which must agree with it.
+float heightmapHeightWrapped(int heights, int cols, int rows, float cu, float cv) {
+	float cy = clamp(cv, 0.0, float(rows - 1));
+	int cj = min(int(floor(cy)), rows - 2);
+	float dv = cy - float(cj) - 0.5;
+	float cx = cu - floor(cu / float(cols)) * float(cols);
+	int ci = int(floor(cx));
+	float du = cx - float(ci) - 0.5;
+	int i1 = ci + 1 < cols ? ci + 1 : 0;
+	int k = cj * cols + ci, k1 = cj * cols + i1, k2 = k + cols, k3 = k1 + cols;
+	float v1 = heightmapValue(heights, k), v2 = heightmapValue(heights, k1), v3 = heightmapValue(heights, k2), v4 = heightmapValue(heights, k3);
+	float m = (v1 + v2 + v3 + v4) * 0.25, h;
+	if (dv <= -abs(du))
+		h = m + (v2 - v1) * du + 2.0 * (m - (v1 + v2) * 0.5) * dv;
+	else if (dv >= abs(du))
+		h = m + (v4 - v3) * du + 2.0 * ((v3 + v4) * 0.5 - m) * dv;
+	else if (du < 0.0)
+		h = m + (v3 - v1) * dv + 2.0 * (m - (v1 + v3) * 0.5) * du;
+	else
+		h = m + (v4 - v2) * dv + 2.0 * ((v2 + v4) * 0.5 - m) * du;
+	return h;
+}
+
+// The same height where the grid has real edges: the column clamps into the grid rather than closing onto itself, as
+// heightAt in sdf.ts does for a flat map and a wrapped map uses when it is only a piece of a surface.
+float heightmapHeight(int heights, int cols, int rows, float x, float y) {
+	float cy = clamp(y, 0.0, float(rows - 1));
+	int cj = min(int(floor(cy)), rows - 2);
+	float dv = cy - float(cj) - 0.5;
+	float cx = clamp(x, 0.0, float(cols - 1));
+	int ci = min(int(floor(cx)), cols - 2);
+	float du = cx - float(ci) - 0.5;
+	int k = cj * cols + ci;
+	float v1 = heightmapValue(heights, k), v2 = heightmapValue(heights, k + 1), v3 = heightmapValue(heights, k + cols), v4 = heightmapValue(heights, k + cols + 1);
+	float m = (v1 + v2 + v3 + v4) * 0.25, h;
+	if (dv <= -abs(du))
+		h = m + (v2 - v1) * du + 2.0 * (m - (v1 + v2) * 0.5) * dv;
+	else if (dv >= abs(du))
+		h = m + (v4 - v3) * du + 2.0 * ((v3 + v4) * 0.5 - m) * dv;
+	else if (du < 0.0)
+		h = m + (v3 - v1) * dv + 2.0 * (m - (v1 + v3) * 0.5) * du;
+	else
+		h = m + (v4 - v2) * dv + 2.0 * ((v2 + v4) * 0.5 - m) * du;
+	return h;
+}
+
+float warpCut(vec3 p, vec3 lo, vec3 hi, float r, int sphere, float d);
+
+// A wrapped map's field: the grid's columns are a turn about z and its rows a height or a latitude, each height
+// displacing the base surface of radius `r` -- wrappedHeightmapDistance in sdf.ts, which says why it is this bound and
+// which this must agree with. `sphere` is 1 for a sphere and 0 for a cylinder, and a tile's second float is the
+// steepest slope itself, since the safety factor it becomes depends on the point's own radius. `row` is the axis one
+// row covers, and tileX/tileY say whether the columns and rows repeat (sx and sy the arc each then covers); `part`
+// says the grid is only a piece of a surface, its columns ending rather than closing.
+float sdWrappedHeightmap(vec3 p, int heights, int tiles, int cols, int rows, int tile, int tilesX, int tilesY, float bottom, float top, float r, int sphere, float row, int tileX, int tileY, float sx, float sy, int part) {
+	float H = float(rows - 1);
+	float rad = sphere == 1 ? length(p) : length(p.xy);
+	float rr = max(rad, 1e-9);
+	// from the south pole, so the grid's first row lands there as it does on the plane (sdf.ts's wrappedHeightmapDistance)
+	float theta = sphere == 1 ? acos(clamp(-p.z / rr, -1.0, 1.0)) : 0.0;
+	float phi = atan(p.y, p.x);
+	float posPhi = phi < 0.0 ? phi + 6.283185307179586 : phi;
+	// the column the point stands over: the grid's own arc when the columns repeat or the grid is a piece, else fitted
+	float u = (tileX == 1 || part == 1) ? posPhi * r / sx : posPhi / 6.283185307179586 * float(cols);
+	// the row, and the arc or axis one row covers; a tiled row past a pole folds back down with the longitude turned
+	float rowArc = tileY == 1 ? sy : (sphere == 1 ? r * 3.141592653589793 / H : row);
+	float v = sphere == 1 ? theta / 3.141592653589793 * H : p.z / row + H * 0.5;
+	if (tileY == 1) {
+		if (sphere == 1) {
+			float raw = r * theta / sy;
+			float q = floor(raw / H);
+			float frac = raw - q * H;
+			v = mod(q, 2.0) < 0.5 ? frac : H - frac;
+			// the longitude turns by half a turn, which is half the columns only when the tile is the whole turn
+			u += mod(q, 2.0) < 0.5 ? 0.0 : (tileX == 1 ? 3.141592653589793 * r / sx : float(cols) * 0.5);
+		} else {
+			// the tile starts where the axis does, as a tiled sphere's first row starts at a pole (sdf.ts's
+			// wrappedHeightmapDistance)
+			v = (p.z + H * row * 0.5) / sy;
+			v -= floor(v / H) * H;
+		}
+	}
+	// a piece of a surface has real ends in its columns, so the grid clamps there instead of closing onto itself
+	float sigma = r + (part == 1 ? heightmapHeight(heights, cols, rows, u, v) : heightmapHeightWrapped(heights, cols, rows, u, v));
+
+	float cv = clamp(v, 0.0, H);
+	int cj = min(int(floor(cv)), rows - 2);
+	float cx = part == 1 ? clamp(u, 0.0, float(cols - 1)) : u - floor(u / float(cols)) * float(cols);
+	int ci = min(int(floor(cx)), cols - 1);
+	int tx = min(ci / tile, tilesX - 1), ty = min(cj / tile, tilesY - 1);
+	int t = ty * tilesX + tx;
+
+	float least = max(r + min(min(bottom, top), 0.0), 0.0);
+	float chord = 2.0 * sqrt(max(rad * least, 0.0));
+	float edge = 1e20;
+	if (sphere == 1) {
+		float perRow = rowArc / r;
+		if (ty - 1 >= 1)			edge = min(edge, chord * sin((cv - float((ty - 1) * tile)) * perRow * 0.5));
+		if (ty + 1 <= tilesY - 2)	edge = min(edge, chord * sin((float((ty + 2) * tile) - cv) * perRow * 0.5));
+	} else {
+		if (ty - 1 >= 1)			edge = min(edge, (cv - float((ty - 1) * tile)) * rowArc);
+		if (ty + 1 <= tilesY - 2)	edge = min(edge, (float((ty + 2) * tile) - cv) * rowArc);
+	}
+	if (3 * tile < cols) {
+		float local = float(ci - tx * tile);
+		float dphi = min(float(tile) + local, 2.0 * float(tile) - local) * ((tileX == 1 || part == 1) ? sx / r : 6.283185307179586 / float(cols));
+		// sin, not cos: the ring a colatitude stands on has radius rad sin(theta), so it is widest at the equator and
+		// closes to nothing at a pole, where the gap the point is over floors the edge instead (sdf.ts's
+		// wrappedHeightmapDistance, which this mirrors)
+		float d = sphere == 1 ? asin(min(1.0, sin(theta) * sin(dphi))) : dphi;
+		edge = min(edge, max(chord * sin(d * 0.5), abs(rad - sigma)));
+	}
+
+	float l = heightmapValue(tiles, 2 * t + 1) * r / rr;
+	float gap = rad - sigma;
+	float terrain = gap > 0.0
+		? min(max(gap / sqrt(1.0 + l * l), rad - (r + heightmapValue(tiles, 2 * t))), edge)
+		: -min(-gap / sqrt(1.0 + l * l), edge);
+	float rMax = r + max(top, bottom);
+	float d = max(max(rad - rMax, r + bottom - rad), terrain);
+	// a piece is cut off at the two meridians its ends stand on, exactly as the general bend is. Its width is the flat
+	// grid's own, (cols - 1) * sx, one column fewer than the ring's cols (sdf.ts's wrappedHeightmapDistance)
+	if (part == 1)
+		d = warpCut(p, vec3(0.0), vec3(float(cols - 1) * sx, 0.0, 0.0), r, sphere, d);
+	return sphere == 0 ? max(d, abs(p.z) - H * 0.5 * row) : d;
+}
+
+// A wrapped shape: the flat point a bent body is asked about, how much the map stretches there, and the cut where the
+// turn falls short of a whole one -- warpPoint, warpStretch and warpDistance in sdf.ts, which must agree with them.
+// How far round a body goes is its own business: its x is an arc of r, so one twice as wide covers twice as much, and
+// one already a circumference round is fitted to exactly one turn; a sphere's y is an arc from its equator, fitted to
+// the poles when it reaches them, and a cylinder's a plain length up its axis, fitted to `axis` -- the length the bend
+// was given (h) -- when there is one. r is the surface it is wrapped around: the body's own floor lands on it.
+// Where a longitude stands on an arc [a, b] of the circle: the longitude itself while it is on the arc, the nearer
+// end of it otherwise, the short way round (sdf.ts's arcPoint, which its warpPoint uses)
+float arcPoint(float phi, float a, float b) {
+	float rel = mod(mod(phi - a, 6.283185307179586) + 6.283185307179586, 6.283185307179586);
+	return rel <= b - a ? a + rel : (6.283185307179586 - rel < rel - (b - a) ? a : b);
+}
+
+vec3 warpPoint(vec3 p, vec3 lo, vec3 hi, float r, int sphere, float axis) {
+	float rad = sphere == 1 ? length(p) : length(p.xy);
+	float rr = max(rad, 1e-9);
+	float phi = atan(p.y, p.x);
+	float ex = hi.x - lo.x, ey = hi.y - lo.y, ym = (lo.y + hi.y) * 0.5;
+	// its own width is the arc it covers, measured from the body's own first column, and past the ends of a shorter
+	// body the nearest end is what a point is asked about (sdf.ts's warpPoint)
+	float x = ex >= 6.283185307179586 * r
+		? lo.x + (phi < 0.0 ? phi + 6.283185307179586 : phi) / 6.283185307179586 * ex
+		: arcPoint(phi, lo.x / r, hi.x / r) * r;
+	// a cylinder's axis: the body's own y unless the bend was given a length, which its rows are spread over
+	float y = axis > 0.0 ? ym + p.z * (ey / axis) : ym + p.z;
+	if (sphere == 1) {
+		// from the south pole, as in sdWrappedHeightmap
+		float theta = acos(clamp(-p.z / rr, -1.0, 1.0));
+		y = ey >= 3.141592653589793 * r ? lo.y + theta / 3.141592653589793 * ey : ym + (theta - 1.570796326794897) * r;
+	}
+	return vec3(x, y, lo.z + rad - r);
+}
+
+// The least the map stretches a step of the body's own space by, along the way the body is actually nearest: the way
+// is the body's own field's gradient g, and the stretch is measured along it, never more than one (sdf.ts's
+// warpStretch, which mirrors it).
+float warpStretch(vec3 p, vec3 q, float d0, vec3 g, vec3 lo, vec3 hi, float r, int sphere, float axis) {
+	float rad = sphere == 1 ? length(p) : length(p.xy);
+	float rr = max(rad, 1e-9);
+	float sin = sphere == 1 ? sqrt(max(0.0, 1.0 - min(1.0, (p.z / rr) * (p.z / rr)))) : 1.0;
+	float ex = hi.x - lo.x, ey = hi.y - lo.y;
+	float x = min(1.0, ex >= 6.283185307179586 * r ? 6.283185307179586 * rad * sin / ex : rad * sin / r);
+	// a cylinder's axis is a plain length, so a step of one up it is one in space -- unless the body was fitted to an
+	// axis of its own length (h), where a step of one is axis / ey of space
+	float y = min(1.0, sphere == 1
+		? (ey >= 3.141592653589793 * r ? 3.141592653589793 * rad / ey : 1.0)
+		: (axis > 0.0 ? axis / ey : 1.0));
+	float gl = length(g);
+	vec3 u;
+	if (gl > 1e-12) {
+		u = g * ((d0 < 0.0 ? 1.0 : -1.0) / gl);
+	} else {
+		vec3 off = q - clamp(q, lo, hi);
+		float ol = length(off);
+		if (ol < 1e-9)
+			return min(x, y);
+		u = off * (-1.0 / ol);
+	}
+	return min(1.0, length(vec3(x * u.x, y * u.y, u.z)));
+}
+
+// The ends of a turn short of a whole one are real faces: the solid is the body and the wedge its two end meridians
+// bound, so the field is the body's own distance and the wedge's, whichever is the less confident claim (their max).
+// Inside the wedge the wedge's own is the distance to the nearer face, negative; outside it is the distance to the
+// nearer boundary ray, and the body's own distance is what stands -- the plane's own distance there is nought all
+// along the empty half-plane, a sheet of surface (sdf.ts's meridianCut, which this mirrors). A turn wider than a half
+// one is the complement of the small empty turn -- the union of the two half-spaces, whose distance is the lesser.
+float warpCut(vec3 p, vec3 lo, vec3 hi, float r, int sphere, float d) {
+	float ex = hi.x - lo.x;
+	if (ex >= 6.283185307179586 * r)
+		return d;
+	float a = lo.x / r, b = hi.x / r;
+	float w = b - a;
+	float c1 = -p.x * sin(a) + p.y * cos(a);
+	float c2 = p.x * sin(b) - p.y * cos(b);
+	if (w > 3.141592653589793)
+		return max(d, -max(c1, c2));
+	float rel = mod(mod(atan(p.y, p.x) - a, 6.283185307179586) + 6.283185307179586, 6.283185307179586);
+	float toA = min(rel, 6.283185307179586 - rel);
+	float toB = min(abs(w - rel), 6.283185307179586 - abs(w - rel));
+	// a ray ends at the axis, so the edge is floored at rad rather than falling back down the far side of the sine
+	float edge = length(p.xy) * sin(min(min(toA, toB), 1.570796326794897));
+	return rel > w ? max(d, edge) : max(d, -edge);
 }
 
 // A triangle mesh's signed distance (meshfield.ts, which lays out the data and must agree with this): the nearest
@@ -301,6 +428,91 @@ float batchBoxDist(vec3 p, vec3 lo, vec3 hi) {
 	return length(max(max(lo - p, p - hi), vec3(0.0)));
 }
 
+float sdLine2(vec2 p, inout float d, vec2 a, vec2 bq) {
+	vec2 e = bq - a, w = p - a;
+	vec2 c = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
+	d = min(d, dot(c, c));
+	// the ray towards +x crosses the edge when all three tests agree, all true or all false
+	bool	c0 = p.y >= a.y,
+			c1 = p.y < bq.y,
+			c2 = e.x * w.y > e.y * w.x;
+	return c0 == c1 && c1 == c2 ? -1.0 : 1.0;
+}
+	
+// whether the curve a + 2 e1 t + e2 t^2 is at parameter t within [0, 1) and to the right of p
+bool crossesRight(vec2 p, vec2 a, vec2 e1, vec2 e2, float t) {
+	return t >= 0.0 && t < 1.0 && a.x + (2.0 * e1.x + e2.x * t) * t > p.x;
+}
+
+// One quadratic Bezier (a, control point c, b) of a closed path, for text()'s glyph outlines, which keep the font's own
+// curves rather than a flattened polygon so a letterform stays exact at any zoom. It folds the curve into the running
+// state of the path: d, the squared distance to the nearest segment so far, is lowered if this curve is nearer, and the
+// result is the even-odd crossing multiplier (-1 or 1) of a ray cast from p towards +x, to be multiplied into the sign.
+// Kept in step by hand with bezierDistance2 and bezierCrossing2 in sdf.ts, since nothing generates either from the other.
+//
+// Both halves work from the same polynomial B(t) = a + 2 e1 t + e2 t^2 (t in [0,1]), with e1 = c - a and
+// e2 = a - 2c + b, and w = a - p, the curve's start relative to the point.
+float sdBezier2(vec2 p, inout float d, vec2 a, vec2 c, vec2 b) {
+	vec2 e1 = c - a, e2 = a - 2.0 * c + b, w = a - p;
+	float ee = dot(e2, e2);
+	// the control point is the midpoint of a and b: not really a curve, just the line from a to b
+	if (ee < 1e-9)
+		return sdLine2(p, d, a, b);
+
+	// distance: the nearest point is a zero of the derivative of |B(t) - p|^2, a cubic in t, solved by Cardano's method
+	// (one or three real roots), each clamped to [0,1] since the curve only exists there
+	float kk = 1.0 / ee;
+	float kx = kk * dot(e1, e2);
+	float ky = kk * (2.0 * dot(e1, e1) + dot(w, e2)) / 3.0;
+	float kz = kk * dot(w, e1);
+	float p1 = ky - kx * kx;
+	float p3 = p1 * p1 * p1;
+	float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+	float h = q * q + 4.0 * p3;
+	float res;
+	if (h >= 0.0) {
+		h = sqrt(h);
+		vec2 x = (vec2(h, -h) - q) / 2.0;
+		vec2 uv = sign(x) * pow(abs(x), vec2(1.0 / 3.0));
+		float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+		vec2 r = w + (2.0 * e1 + e2 * t) * t;
+		res = dot(r, r);
+	} else {
+		float z = sqrt(-p1);
+		float v = acos(q / (p1 * z * 2.0)) / 3.0;
+		float m = cos(v), n = sin(v) * 1.7320508075688772;
+		vec3 t = clamp(vec3(m + m, -n - m, n - m) * z - kx, 0.0, 1.0);
+		vec2 rx = w + (2.0 * e1 + e2 * t.x) * t.x;
+		vec2 ry = w + (2.0 * e1 + e2 * t.y) * t.y;
+		vec2 rz = w + (2.0 * e1 + e2 * t.z) * t.z;
+		res = min(dot(rx, rx), min(dot(ry, ry), dot(rz, rz)));
+	}
+	d = min(d, res);
+
+	// crossing: the ray y = p.y meets the curve where e2.y t^2 + 2 e1.y t + w.y = 0. A curve need not be monotonic in y
+	// the way a straight edge is, so that is 0, 1 or 2 crossings; each counts only where it is transversal (y'(t) != 0 --
+	// a tangency touches the ray without crossing it), only for t in [0, 1), the half-open convention the straight-edge
+	// test uses so a curve shares no double-count with the segment before it at their shared point, and only if it is
+	// to the right of p.
+	float mult = 1.0;
+	if (abs(e2.y) < 1e-12) {
+		// linear in y: one root, and y' = 2 e1.y everywhere
+		if (abs(e1.y) > 5e-13 && crossesRight(p, a, e1, e2, -0.5 * w.y / e1.y))
+			mult = -mult;
+	} else {
+		// y' = +-2 sqrt(disc) at the two roots, so they are transversal unless disc vanishes
+		float disc = e1.y * e1.y - e2.y * w.y;
+		if (disc > 2.5e-25) {
+			float sq = sqrt(disc);
+			if (crossesRight(p, a, e1, e2, (-e1.y - sq) / e2.y))
+				mult = -mult;
+			if (crossesRight(p, a, e1, e2, (-e1.y + sq) / e2.y))
+				mult = -mult;
+		}
+	}
+	return mult;
+}
+
 // The signed distance in the plane to a closed path of lines and quadratic Beziers whose n segments start at texel
 // `at`, two texels each: (start, end) and (control, kind), kind 0 a line and 1 a curve. This is what curvepath2 and
 // polygon2 emit as unrolled code, with the segments read from the texture instead, so a glyph costs no more shader
@@ -311,16 +523,9 @@ float batchPath(vec2 p, int at, int n) {
 		vec4 ab = batchTexel(at + 2 * i), cq = batchTexel(at + 2 * i + 1);
 		vec2 a = ab.xy, b = ab.zw;
 		if (cq.z < 0.5) {
-			vec2 e = b - a, w = p - a;
-			vec2 c = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-			d2 = min(d2, dot(c, c));
-			float c0 = p.y >= a.y ? 1.0 : 0.0, c1 = p.y < b.y ? 1.0 : 0.0, c2 = e.x * w.y > e.y * w.x ? 1.0 : 0.0;
-			if (c0 * c1 * c2 > 0.5 || (1.0 - c0) * (1.0 - c1) * (1.0 - c2) > 0.5)
-				s = -s;
+			s *= sdLine2(p, d2, a, b);
 		} else {
-			float dd = sdBezier2(p, a, cq.xy, b);
-			d2 = min(d2, dd * dd);
-			s *= bezierCrossing2(p, a, cq.xy, b);
+			s *= sdBezier2(p, d2, a, cq.xy, b);
 		}
 	}
 	return s * sqrt(d2);

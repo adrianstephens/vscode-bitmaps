@@ -11,18 +11,12 @@
 // with it). They are the one mesher, differing only in that choice.
 import { float2, float3, float3x4, safeNormalise } from '@isopodlabs/maths/vector';
 import { eigenSymmetric } from '@isopodlabs/maths/linear';
-import { Sdf, evalSdf, bounds, surfaceNormal, faceFrame, polygonDistance2, inverseOrIdentity, planeBrush, polyhedronOf, PlaneBrush } from './sdf';
-import type { Polyhedron } from './polyhedron';
+import { Sdf, evalSdf, bounds3, surfaceNormal, faceFrame, polygonDistance2, inverseOrIdentity, planeBrush, polyhedronOf, PlaneBrush } from './sdf';
+import type { Mesh } from '@isopodlabs/binary_meshes';
 
 //-----------------------------------------------------------------------------
 // what either makes: a mesh, a vertex for a cube, and whether the result is closed
 //-----------------------------------------------------------------------------
-
-// the triangles a field comes to, as a polyhedron, and how finely it was taken
-export interface Mesh extends Polyhedron {
-	cell:			number;								// the side of a cube
-	thin:			number;								// cubes holding a wall or gap thinner than they are, which the mesh has missed
-}
 
 export interface MeshStats {
 	triangles:		number;
@@ -69,7 +63,7 @@ export function solveQef(points: float3[], normals: float3[]): float3 {
 }
 
 // Is it a closed surface a slicer will accept: every edge shared by exactly two faces, running opposite ways?
-export function checkMesh(poly: Polyhedron): MeshStats {
+export function checkMesh(poly: Mesh): MeshStats {
 	const {points, faces} = poly;
 	const nv = points.length;
 	const edges = new Map<number, number>();		// undirected edge -> +1 for each traversal low->high, and 1000 for each face
@@ -100,7 +94,7 @@ export function checkMesh(poly: Polyhedron): MeshStats {
 // The side of the finest cube, and where the grid starts: two cubes outside the model's box and a hair off a multiple of
 // the cube, since a surface exactly through grid corners puts the field at zero there, which is no side to be on.
 function gridFrame(sdf: Sdf, cells: number) {
-	const box = bounds(sdf);
+	const box = bounds3(sdf);
 	if (!box)
 		throw new Error('the model has no bounds to mesh');
 	const extent = box.max.sub(box.min);
@@ -227,6 +221,8 @@ export interface AdaptiveOptions {
 }
 
 export interface AdaptiveMesh extends Mesh {
+	cell:			number;								// the side of a cube
+	thin:			number;								// cubes holding a wall or gap thinner than they are, which the mesh has missed
 	leaves:			number;								// cubes the mesh was made from
 	finest:			number;								// how many of them are as small as they get
 }

@@ -3,7 +3,7 @@
 import * as vscode from 'vscode';
 import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
-import { load, Font, parseCurve, makeCurveVertex } from '@isopodlabs/binary_fonts';
+import { load, Font, WOFF, WOFF2, TTF_OTF, parseCurve, curveVertex } from '@isopodlabs/binary_fonts';
 import type { FontInfo, GlyphDetail, TableNode, MessageIn, MessageOut } from '../webview/font';
 
 import { setActiveViewer } from './extension';
@@ -202,7 +202,7 @@ export function curveOf(points: number[]) {
 	for (let i = 0; i < points.length; i += 3) {
 		if (i === 0 && points[2] !== 0)
 			throw new Error('an outline begins with a begin point');
-		curve.push(makeCurveVertex({x: points[i], y: -points[i + 1]} as any, points[i + 2]));
+		curve.push(curveVertex(points[i], -points[i + 1], points[i + 2]));
 	}
 	return curve;
 }
@@ -298,13 +298,14 @@ export class FontDocument implements vscode.CustomDocument {
 	}
 
 	bytes() {
-		return this.fonts[0].save();
+		// as an SFNT file whatever it was read from, which is what a backup holds and what load() reads
+		return TTF_OTF.write(this.fonts[0]);
 	}
 
 	// the file is written in the format its name says: WOFF for .woff, WOFF2 for .woff2, else an SFNT (TrueType or OpenType)
 	async write(target: vscode.Uri) {
 		const font = this.fonts[0];
-		const data = /\.woff2$/i.test(target.fsPath) ? await font.saveWOFF2() : /\.woff$/i.test(target.fsPath) ? await font.saveWOFF() : font.save();
+		const data = /\.woff2$/i.test(target.fsPath) ? await WOFF2.write(font) : /\.woff$/i.test(target.fsPath) ? await WOFF.write(font) : TTF_OTF.write(font);
 		await vscode.workspace.fs.writeFile(target, data);
 		if (target.toString() === this.uri.toString()) {
 			this.saved = data;

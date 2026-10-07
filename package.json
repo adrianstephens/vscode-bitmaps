@@ -188,6 +188,76 @@
 				"command": "scad.exportStl",
 				"title": "Export STL…",
 				"icon": "$(package)"
+			},
+			{
+				"command": "bitmap.fill",
+				"title": "Fill Selection with Foreground",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.clear",
+				"title": "Clear Selection",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.invert",
+				"title": "Invert Colours",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.flipHorizontal",
+				"title": "Flip Horizontal",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.flipVertical",
+				"title": "Flip Vertical",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.rotateClockwise",
+				"title": "Rotate 90° Clockwise",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.rotateAnticlockwise",
+				"title": "Rotate 90° Anticlockwise",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.crop",
+				"title": "Crop to Selection",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.selectAll",
+				"title": "Select All",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.deselect",
+				"title": "Deselect",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.newLayer",
+				"title": "New Layer",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.deleteLayer",
+				"title": "Delete Layer",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.raiseLayer",
+				"title": "Raise Layer",
+				"category": "Bitmap"
+			},
+			{
+				"command": "bitmap.lowerLayer",
+				"title": "Lower Layer",
+				"category": "Bitmap"
 			}
 		],
 		"menus": {
@@ -221,6 +291,76 @@
 					"command": "gguf.nextSlice",
 					"when": "activeCustomEditorId == gguf.viewer",
 					"group": "navigation@3"
+				},
+				{
+					"command": "bitmap.fill",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "2_edit@0"
+				},
+				{
+					"command": "bitmap.clear",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "2_edit@1"
+				},
+				{
+					"command": "bitmap.invert",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "2_edit@2"
+				},
+				{
+					"command": "bitmap.flipHorizontal",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_image@3"
+				},
+				{
+					"command": "bitmap.flipVertical",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_image@4"
+				},
+				{
+					"command": "bitmap.rotateClockwise",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_image@5"
+				},
+				{
+					"command": "bitmap.rotateAnticlockwise",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_image@6"
+				},
+				{
+					"command": "bitmap.crop",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_image@7"
+				},
+				{
+					"command": "bitmap.selectAll",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "1_select@8"
+				},
+				{
+					"command": "bitmap.deselect",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "1_select@9"
+				},
+				{
+					"command": "bitmap.newLayer",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "4_layers@0"
+				},
+				{
+					"command": "bitmap.deleteLayer",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "4_layers@1"
+				},
+				{
+					"command": "bitmap.raiseLayer",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "4_layers@2"
+				},
+				{
+					"command": "bitmap.lowerLayer",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "4_layers@3"
 				}
 			]
 		},

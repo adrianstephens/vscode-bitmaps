@@ -7,7 +7,7 @@
 //
 // sdMesh in sdflib.frag walks the same hierarchy in the same order over the same data, so the two must agree.
 import { float3 } from '@isopodlabs/maths/vector';
-import type { Polyhedron } from './polyhedron';
+import type { Mesh } from '@isopodlabs/binary_meshes';
 
 export interface TriMesh {
 	k:			'trimesh';
@@ -28,7 +28,7 @@ const LEAF = 4;
 export const TRI_TEXELS = 10;
 
 // the field of a polyhedron, or undefined when no face of it has any area
-export function trimesh({points: corners, faces}: Polyhedron): TriMesh | undefined {
+export function trimesh(corners: float3[], faces: number[][]): TriMesh | undefined {
 	// weld corners at the same place, since a triangle soup (an STL) repeats each at every triangle that uses it; the
 	// hash only picks a bucket, the corners in it are compared exactly
 	const buckets = new Map<number, number[]>(), points: float3[] = [], remap = new Int32Array(corners.length);
@@ -322,5 +322,5 @@ export function mapTrimesh(s: TriMesh, f: (p: float3) => float3, mirrors: boolea
 	const faces: number[][] = [];
 	for (let t = 0; t < s.tris.length; t += 3)
 		faces.push(mirrors ? [s.tris[t], s.tris[t + 2], s.tris[t + 1]] : [s.tris[t], s.tris[t + 1], s.tris[t + 2]]);
-	return trimesh({points: s.points.map(f), faces});
+	return trimesh(s.points.map(f), faces);
 }

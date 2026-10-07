@@ -195,7 +195,7 @@ export function createVertexArray(gl: WebGL2RenderingContext, program: WebGLProg
 //-----------------------------------------------------------------------------
 
 type Filter			= 'nearest' | 'linear';
-type TextureFormat	= 'rgba8' | 'r8' | 'r8ui' | 'r16f' | 'r32f' | 'rgba32f';
+type TextureFormat	= 'rgba8' | 'r8' | 'r8ui' | 'r16f' | 'r32f' | 'rgba16f' | 'rgba32f';
 
 export interface TextureOptions {
 	format?:	TextureFormat;
@@ -208,6 +208,8 @@ function textureFormat(gl: WebGL2RenderingContext, format: TextureFormat) {
 		? {internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT}
 		: format === 'r32f'
 		? {internal: gl.R32F, format: gl.RED, type: gl.FLOAT}
+		: format === 'rgba16f'
+		? {internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT}
 		: format === 'rgba32f'
 		? {internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT}
 		: format === 'r8'
@@ -232,13 +234,24 @@ function newTexture(gl: WebGL2RenderingContext, target: number, options: Texture
 	return texture;
 }
 
-export function getImageData(image: ImageData, type: string) {
+// the image encoded as a file of the given type (PNG or JPEG: what a canvas can write)
+export async function getImageData(image: ImageData, type: string) {
 	const offscreen = new OffscreenCanvas(image.width, image.height);
 	const ctx = offscreen.getContext('2d');
 	if (!ctx)
 		return;
 	ctx.putImageData(image, 0, 0);
-	return offscreen.convertToBlob({ type });
+
+	if (type === 'image/jpeg') {
+		// no alpha in a JPEG: what is transparent becomes white rather than black
+		const flat = new OffscreenCanvas(image.width, image.height);
+		const flatCtx = flat.getContext('2d')!;
+		flatCtx.fillStyle = '#fff';
+		flatCtx.fillRect(0, 0, image.width, image.height);
+		flatCtx.drawImage(offscreen, 0, 0);
+		return flat.convertToBlob({type, quality: 0.92});
+	}
+	return offscreen.convertToBlob({type});
 }
 
 export function getPixel(image: ImageData, x: number, y: number) {
@@ -394,6 +407,16 @@ export class Canvas3D {
 		gl.texImage2D(gl.TEXTURE_2D, 0, f.internal, image.width, image.height, 0, f.format, gl.UNSIGNED_BYTE, image.data);
 		gl.bindTexture(gl.TEXTURE_2D, null);
 		return texture;
+	}
+	// bring a texture up to date with the pixels of a rectangle of the image it was made from (all of it, without a rect)
+	updateTexture(texture: WebGLTexture, image: PixelData, rect?: {x: number, y: number, w: number, h: number}) {
+		const gl = this.gl;
+		const r = rect ?? {x: 0, y: 0, w: image.width, h: image.height};
+		gl.bindTexture(gl.TEXTURE_2D, texture);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, image.width);
+		gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x, r.y, r.w, r.h, gl.RGBA, gl.UNSIGNED_BYTE, image.data, (r.y * image.width + r.x) * 4);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+		gl.bindTexture(gl.TEXTURE_2D, null);
 	}
 	// a texture of raw bytes (no pixels), which null data leaves empty for texSubImage2D to fill; integer formats need
 	// nearest filtering, which the caller's options must give
