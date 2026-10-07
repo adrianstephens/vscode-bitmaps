@@ -14,6 +14,7 @@ export interface LayerFanHost {
 	view():		{scale: number, offset: {x: number, y: number}};
 	programs():	{background: ShaderProgram, layer: ShaderProgram} | undefined;
 	layerTexture(layer: Layer): WebGLTexture | undefined;	// a layer's pixels, as the picture is made from
+	maskTexture(layer: Layer): WebGLTexture | undefined;	// and its mask's, or something to bind if it has none
 	render():	void;
 	opened(open: boolean): void;	// the fan has come up, or gone away: the rest of what is drawn on the picture makes way
 }
@@ -24,6 +25,7 @@ const LABEL_HEIGHT	= 20;	// in css pixels, what a label takes of the height
 const EDGE			= 28;	// how close to the right edge of the window the pointer must be (in css pixels)
 const PITCH			= 0.42;	// how far the stack turns, in radians
 const YAW			= -0.48;
+const FLOOR			= 0.2;	// the least that shows of a layer's opacity, and of what its mask and clipping take away
 
 type Matrix = number[];		// 4x4, column by column
 
@@ -411,21 +413,33 @@ export class LayerFan {
 		this.frames = [];
 		this.anchors = [];
 		this.empty ??= canvas3d.createTextureFromImage({data: new Uint8Array(4), width: 1, height: 1});
-		stack.layers.forEach((layer, i) => {
-			// the whole stack turned about the middle of the picture, each layer a step nearer than the one below
-			const model = multiply(translation(centre.x - 0.12 * width * s, centre.y, 0),
-				multiply(rotationX(PITCH * s),
-				multiply(rotationY(YAW * s),
-				multiply(translation(0, 0, (i - (n - 1) / 2) * gap),
-				multiply(scaling(shrink), translation(-centre.x, -centre.y, 0))))));
-			const mvp = multiply(projection, model);
+		// Where each layer goes: the whole stack turned about the middle of the picture, each layer a step nearer than the one
+		// below. Turned, the layers' right edges slide along each other; they are shifted across the window (not in the
+		// picture's own space, which would change their size) to put the top right corners, which have the labels, in a line.
+		const sheet = {x: offset.x, y: offset.y, w: stack.width * scale, h: stack.height * scale};
+		const place = (mvp: Matrix, x: number, y: number) => {
+			const cx = mvp[0] * x + mvp[4] * y + mvp[12], cy = mvp[1] * x + mvp[5] * y + mvp[13], cw = mvp[3] * x + mvp[7] * y + mvp[15];
+			return {x: (cx / cw + 1) / 2 * width, y: (1 - cy / cw) / 2 * height};
+		};
+		const mvps = stack.layers.map((_, i) => multiply(projection,
+			multiply(translation(centre.x - 0.12 * width * s, centre.y, 0),
+			multiply(rotationX(PITCH * s),
+			multiply(rotationY(YAW * s),
+			multiply(translation(0, 0, (i - (n - 1) / 2) * gap),
+			multiply(scaling(shrink), translation(-centre.x, -centre.y, 0))))))));
+		const corners = mvps.map(mvp => place(mvp, sheet.x + sheet.w, sheet.y).x);
+		const line = corners.reduce((sum, x) => sum + x, 0) / Math.max(1, n);
+		mvps.forEach((mvp, i) => {
+			// a shift of the picture on the screen is a shift in clip space of that much (in units of the window) times w
+			const shift = 2 * (line - corners[i]) / width;
+			for (let c = 0; c < 4; c++)
+				mvp[c * 4] += shift * mvp[c * 4 + 3];
+		});
 
+		stack.layers.forEach((layer, i) => {
+			const mvp = mvps[i];
 			const rect = {x: offset.x + layer.left * scale, y: offset.y + layer.top * scale, w: layer.image.width * scale, h: layer.image.height * scale};
-			const project = (x: number, y: number) => {
-				const cx = mvp[0] * x + mvp[4] * y + mvp[12], cy = mvp[1] * x + mvp[5] * y + mvp[13], cw = mvp[3] * x + mvp[7] * y + mvp[15];
-				return {x: (cx / cw + 1) / 2 * width, y: (1 - cy / cw) / 2 * height};
-			};
-			const sheet = {x: offset.x, y: offset.y, w: stack.width * scale, h: stack.height * scale};
+			const project = (x: number, y: number) => place(mvp, x, y);
 			this.frames.push([project(sheet.x, sheet.y), project(sheet.x + sheet.w, sheet.y), project(sheet.x + sheet.w, sheet.y + sheet.h), project(sheet.x, sheet.y + sheet.h)]);
 			this.anchors.push(this.frames[i][1]);
 			this.quads.push(layer.image.width && layer.image.height
@@ -434,25 +448,62 @@ export class LayerFan {
 
 			const current = i === stack.current, hovered = layer === this.hover;
 			const edge = (width: number) => width * dpr / (scale * shrink);
-			const flat = {u_texture: 0, u_mvp: new Float32Array(mvp), u_opacity: layer.visible ? layer.opacity : 0.18};
 
+			// What of the layer the picture shows, which is drawn, but not down to nothing. A layer clipped to another has
+			// that one's pixels to be clipped by (the first below it which is not clipped itself); if that one is hidden so is it.
+			let base: Layer | undefined;
+			if (layer.clipped)
+				for (let j = i - 1; j >= 0 && !base; j--)
+					if (!stack.layers[j].clipped)
+						base = stack.layers[j];
+			const shown = layer.visible && (!base || base.visible) ? layer.opacity : 0;
+			const mask = layer.mask && !layer.mask.disabled && layer.mask.image.width && layer.mask.image.height ? layer.mask : undefined;
+			const clip = base && base.image.width && base.image.height ? base : undefined;
+			const flat = {u_mvp: new Float32Array(mvp), u_floor: FLOOR};
+
+			// (the textures are made before any is bound: making one binds it, on the unit which is active)
 			const texture = this.host.layerTexture(layer);
-			if (texture) {
-				canvas3d.bindTexture(gl.TEXTURE_2D, texture);
-				programs.layer.draw({...flat, u_rect: [rect.x, rect.y, rect.w, rect.h], u_size: [layer.image.width, layer.image.height], u_edge: 0, u_veil: 0, u_outline: [0, 0, 0, 0]});
+			const maskTexture = this.host.maskTexture(layer), baseTexture = clip ? this.host.layerTexture(clip) : undefined;
+			if (texture && maskTexture) {
+				canvas3d.bindTexture(gl.TEXTURE_2D, texture, 0);
+				canvas3d.bindTexture(gl.TEXTURE_2D, maskTexture, 1);
+				canvas3d.bindTexture(gl.TEXTURE_2D, baseTexture ?? this.empty!, 2);
+				programs.layer.draw({
+					...flat,
+					u_texture:		0,
+					u_mask:			1,
+					u_base:			2,
+					u_origin:		[layer.left, layer.top],
+					u_maskRect:		mask ? [mask.left, mask.top, mask.image.width, mask.image.height] : [0, 0, 0, 0],
+					u_maskParams:	[(mask?.defaultColor ?? 255) / 255, mask?.inverted ? 1 : 0, mask ? 1 : 0],
+					u_baseRect:		clip ? [clip.left, clip.top, clip.image.width, clip.image.height] : [0, 0, 0, 0],
+					u_opacity:		shown,
+					u_rect:			[rect.x, rect.y, rect.w, rect.h],
+					u_size:			[layer.image.width, layer.image.height],
+					u_edge:			0,
+					u_veil:			0,
+					u_outline:		[0, 0, 0, 0],
+				});
 			}
 
 			// the sheet it is on, outlined: the corners which show tell the layers apart
 			const outline = current ? [0.1, 0.45, 0.9, 1] : hovered ? [0.95, 0.95, 0.95, 0.95] : [0.75, 0.75, 0.75, 0.6];
-			canvas3d.bindTexture(gl.TEXTURE_2D, this.empty!);
+			canvas3d.bindTexture(gl.TEXTURE_2D, this.empty!, 0);
 			programs.layer.draw({
 				...flat,
-				u_opacity:	1,
-				u_rect:		[sheet.x, sheet.y, sheet.w, sheet.h],
-				u_size:		[stack.width, stack.height],
-				u_edge:		edge(current || hovered ? 2.5 : 1.5),
-				u_veil:		0.05,
-				u_outline:	[outline[0] * outline[3], outline[1] * outline[3], outline[2] * outline[3], outline[3]],
+				u_texture:		0,
+				u_mask:			1,
+				u_base:			2,
+				u_origin:		[0, 0],
+				u_maskRect:		[0, 0, 0, 0],
+				u_maskParams:	[0, 0, 0],
+				u_baseRect:		[0, 0, 0, 0],
+				u_opacity:		1,
+				u_rect:			[sheet.x, sheet.y, sheet.w, sheet.h],
+				u_size:			[stack.width, stack.height],
+				u_edge:			edge(current || hovered ? 2.5 : 1.5),
+				u_veil:			0.05,
+				u_outline:		[outline[0] * outline[3], outline[1] * outline[3], outline[2] * outline[3], outline[3]],
 			});
 		});
 		if (wasDepth)

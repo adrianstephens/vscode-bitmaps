@@ -9,7 +9,7 @@ import {
 } from './parser';
 import type { Sdf, Support } from './sdf';
 import { lookupColor, parseHexColor } from './colors';
-import { layoutText } from './fonts';
+import { findFont, layoutText } from './fonts';
 import { MT19937, seedOf } from './random';
 import { trimesh, mapTrimesh } from './meshfield';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
@@ -25,22 +25,9 @@ import { float2, float3, float4, float3x3, float3x4, float2x3, safeNormalise } f
 import { transformCurve } from '@isopodlabs/binary_fonts';
 import * as dwg from '@isopodlabs/dwg';
 
-// What evaluation has made of the files it read, by path, for as long as each file's bytes stay the same: a viewer
-// evaluates on every edit, and a big mesh takes seconds to build. surface()'s PNGs and import()'s AMF and 3MF meshes
-// are here too, because decoding them is asynchronous and evaluation is not, so they are loaded between evaluations
-// (see evaluateWithImages): each as its brightness (0..1, row 0 the image's top) or its mesh, or the reason it could not be read.
-export interface FileCacheEntry {
-	bytes:		Uint8Array, 
-	reader?:	(e: FileCacheEntry)=>Promise<any>,
-	error?:		string,
-	image?:		bitmap.Result,
-	model?:		meshes.Model,
-	solid?:		Sdf,
-};
 const extension = (full: string) => path.extname(full).toLowerCase();
 
-export type FileCache = Map<string, FileCacheEntry>;
-export type ScadFiles = FileAccess & { readBinary(full: string): Uint8Array };
+export type ScadFiles = FileAccess & { readBinary<T>(full: string, reader: (bytes: Uint8Array) => T | Promise<T>): T; };
 
 // What a module instantiation's children see when it calls children()
 interface ChildScope { scope: Scope, env: Env }
@@ -58,28 +45,20 @@ class Ctx {
 
 	children	= [] as ChildScope[];
 	used		= new Set<string>;	// the cache's entries this evaluation asked for, which are all it keeps
-	unloaded	= new Set<string>;
 	// user-defined modules currently instantiating, outermost first, for $parent_modules/parent_module() -- a
 	// builtin module (translate(), difference(), ...) is not one of OpenSCAD's own either, so it is not pushed here
 	moduleStack	= [] as string[];
-	constructor(public files: ScadFiles, public filename: string, public cache: FileCache) {}
+	constructor(public files: ScadFiles, public filename: string) {}
 
-	openFile(module: string, written: string, from: string) {
+	openFile<T>(module: string, written: string, from: string, reader: (bytes: Uint8Array)=>T | Promise<T>): T | undefined {
 		const full = this.files ? this.files.resolve(written, path.dirname(from)) : written;
 		if (!full) {
 			this.warn(`${module}(): '${written}' was not found`);
 			return undefined;
 		}
 		try {
-			let entry		= this.cache.get(full);
-			const bytes		= this.files.readBinary(full);
 			this.used.add(full);
-			if (entry && Buffer.from(entry.bytes.buffer, entry.bytes.byteOffset, entry.bytes.byteLength).equals(bytes))
-				return {full, entry };
-			entry = {bytes}
-			this.cache.set(full, entry);
-			return { full, entry };
-
+			return this.files.readBinary(full, reader);
 		} catch {
 			this.warn(`${module}(): '${written}' could not be read`);
 			return undefined;
@@ -335,6 +314,16 @@ const argGetter = (args: Assignment[], env: Env, ctx: Ctx) => {
 		str: (name: string, index = -1) => {
 			const v = get(name, index);
 			return typeof v === 'string' ? v : '';
+		},
+		enum: <T extends string>(name: string, index: number, values: T[]): T => {
+			const v = get(name, index);
+			if (v === undefined)
+				return values[0];
+			if (values.every(i => i !== v)) {
+				ctx.warn(`unrecognised ${name} (${JSON.stringify(v)}), using "${values[0]}"`);
+				return values[0];
+			}
+			return v as T;
 		},
 		special: (name: string) => {
 			const byName = named(args, name);
@@ -1255,11 +1244,9 @@ class Env {
 		return out.length === 0 ? empty : out.length === 1 ? out[0] : {k: 'union', children: out};
 	}
 
-	// evalScope's own statement list, before it is combined into the one shape a scope normally means. Split out
-	// so a for loop or an if/else can hand its statements up to whatever contains *them* as separate siblings
-	// (see instantiateList) instead of pre-combining into a union no matter what that container is -- the same
-	// list this union-wraps when a scope is asked for as one shape on its own.
-	evalScopeList(scope: Scope, frame: Frame, ctx: Ctx): Sdf[] {
+	// A scope's modules and functions, and its ordinary assignments (registered lazily), made visible; returns its
+	// statements in the order written.
+	declare(scope: Scope): Statement[] {
 		const env = this;
 		for (const [name, mod] of scope.modules)
 			env.modules.set(name, mod);
@@ -1277,6 +1264,16 @@ class Env {
 		for (const s of stmts)
 			if (!s.inst && !s.name!.startsWith('$'))
 				env.pending.set(s.name!, s.expr);
+		return stmts;
+	}
+
+	// evalScope's own statement list, before it is combined into the one shape a scope normally means. Split out
+	// so a for loop or an if/else can hand its statements up to whatever contains *them* as separate siblings
+	// (see instantiateList) instead of pre-combining into a union no matter what that container is -- the same
+	// list this union-wraps when a scope is asked for as one shape on its own.
+	evalScopeList(scope: Scope, frame: Frame, ctx: Ctx): Sdf[] {
+		const env = this;
+		const stmts = env.declare(scope);
 
 		const out: Sdf[] = [];
 		for (const s of stmts) {
@@ -1325,16 +1322,16 @@ class Env {
 
 		const name	= inst.modname ?? '';
 		const scope	= inst.scope;
-		const values = argGetter(inst.args ?? [], env, ctx);
+		const args	= argGetter(inst.args ?? [], env, ctx);
 
 		// a module the file defines itself
 		const user = env.findModule(name);
 		if (user) {
 			const call	= new Env(env);
-			const p		= values.positional;
+			const p		= args.positional;
 			let pi = 0;
 			for (const param of user.parameters)
-				call.values.set(param.name, values.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr, ctx) : param.expr ? call.evalExpr(param.expr, ctx) : undefined));
+				call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr, ctx) : param.expr ? call.evalExpr(param.expr, ctx) : undefined));
 
 			// $children is the count children() sees for *this* call -- set directly on the call's own env, the
 			// same as a parameter, so it is visible throughout the body without going through the identifier lookup
@@ -1358,20 +1355,20 @@ class Env {
 			case 'color': {
 				const children = childrenOf(scope, env, frame, ctx);
 				const body = children.length === 0 ? empty : children.length === 1 ? children[0] : {k: 'union' as const, children};
-				const mat = materialOf(values);
+				const mat = materialOf(args);
 				// a color() that changes nothing is not a node: the common case stays exactly as it was
 				return mat && !sameMaterial(mat, ambientMaterial(env, ctx)) ? {k: 'material' as const, mat, body} : body;
 			}
 
 			case 'circle': {
-				const d		= values.num('d', 2);
-				const r		= d !== undefined ? d / 2 : values.num('r', 0) ?? 1;
-				const fn	= num(values.special('$fn'), ctx, '$fn') ?? 0;
+				const d		= args.num('d', 2);
+				const r		= d !== undefined ? d / 2 : args.num('r', 0) ?? 1;
+				const fn	= num(args.special('$fn'), ctx, '$fn') ?? 0;
 				return place(frame, {k: 'circle2', r, n: fn >= 3 ? Math.max(3, Math.round(fn)) : 0});
 			}
 
 			case 'square': {
-				const v = values.get('size', 0);
+				const v = args.get('size', 0);
 				let size: float2;
 				if (typeof v === 'number')
 					size = float2(v, v);
@@ -1384,7 +1381,7 @@ class Env {
 					ctx.warn('a square() whose size is neither a number nor a vector, so 1 x 1 is used');
 					size = float2(1, 1);
 				}
-				return place(frame, {k: 'square2', size, center: values.bool('center', 1) ?? false});
+				return place(frame, {k: 'square2', size, center: args.bool('center', 1) ?? false});
 			}
 
 			case 'polygon': {
@@ -1392,7 +1389,7 @@ class Env {
 				// another loop -- the even-odd fill in polygonDistance2 is what makes it read as a hole rather than
 				// an extra island). Omitting paths= means one loop, the points in the order given.
 				const points: float2[] = [];
-				const v = values.get('points', 0);
+				const v = args.get('points', 0);
 				if (isList(v))
 					for (const p of v) {
 						const q = vec2(p, ctx);
@@ -1404,7 +1401,7 @@ class Env {
 					ctx.warn('a polygon() with fewer than three readable points, so nothing is drawn');
 					return empty;
 				}
-				const pathsArg = values.get('paths', 1);
+				const pathsArg = args.get('paths', 1);
 				let paths: float2[][];
 				if (isList(pathsArg) && pathsArg.length > 0) {
 					paths = [];
@@ -1432,36 +1429,34 @@ class Env {
 			}
 
 			case 'text': {
-				const textArg = values.get('text', 0);
+				const textArg = args.get('text', 0);
 				if (typeof textArg !== 'string') {
 					if (textArg !== undefined)
 						ctx.warn('a text() whose text is not a string, so nothing is drawn');
 					return empty;
 				}
-				const size		= values.num('size', 1) ?? 10;
-				const fontArg	= values.get('font', 2);
-				const font		= typeof fontArg === 'string' ? fontArg : undefined;
-				const halignArg = values.get('halign', 3);
-				if (halignArg !== undefined && halignArg !== 'left' && halignArg !== 'center' && halignArg !== 'right')
-					ctx.warn(`a text() with an unrecognised halign (${JSON.stringify(halignArg)}), drawn as "left"`);
-				const halign	= halignArg === 'center' || halignArg === 'right' ? halignArg : 'left';
-				const valignArg	= values.get('valign', 4);
-				if (valignArg !== undefined && valignArg !== 'top' && valignArg !== 'center' && valignArg !== 'baseline' && valignArg !== 'bottom')
-					ctx.warn(`a text() with an unrecognised valign (${JSON.stringify(valignArg)}), drawn as "baseline"`);
-				const valign	= valignArg === 'top' || valignArg === 'center' || valignArg === 'bottom' ? valignArg : 'baseline';
-				const spacing	= values.num('spacing', 5) ?? 1;
-				if (values.get('direction', 6) !== undefined || values.get('language', 7) !== undefined || values.get('script', 8) !== undefined)
-					ctx.warn("a text() with direction=/language=/script=, which this viewer does not use -- left to right, in the font's own default script");
-				const fn		= num(values.special('$fn'), ctx, '$fn') ?? 0;
-				const glyphs	= layoutText({text: textArg, size, font, halign, valign, spacing, fn}, m => ctx.warn(m));
-				if (glyphs.length === 0)
-					return empty;
-				// one curvepath2 per glyph, each with its own paths (for its own holes) built from the font's own
-				// curves, unioned rather than merged into one multi-path shape -- an even-odd fill across unrelated
-				// glyphs would punch a hole wherever two letters' outlines happened to overlap, which is not what a
-				// hole in one letter's own counter means
-				const children: Sdf[] = glyphs.map(curve => ({k: 'curvepath2', paths: curve}));
-				return place(frame, children.length === 1 ? children[0] : {k: 'union', children});
+				const spec	= args.str('font', 2);
+				const m		= /^(.*?):style=(.*)$/i.exec(spec);
+				const {family, style} = m ? {family: m[1].trim(), style: m[2].trim()} : {family: spec.trim()};
+				const font	= findFont(family, style, ctx.files, m => ctx.warn(m));
+
+				if (font) {
+					const size		= args.num('size', 1) ?? 10;
+					const halign	= args.enum('halign', 3, ['left', 'center']);
+					const valign	= args.enum('valign', 4, ['baseline', 'top', 'center', 'bottom']);
+					const spacing	= args.num('spacing', 5) ?? 1;
+
+					if (args.get('direction', 6) !== undefined || args.get('language', 7) !== undefined || args.get('script', 8) !== undefined)
+						ctx.warn("a text() with direction=/language=/script=, which this viewer does not use -- left to right, in the font's own default script");
+
+					const glyphs	= layoutText({font, text: textArg, size, halign, valign, spacing}, ctx.files, m => ctx.warn(m));
+					if (glyphs.length === 0)
+						return empty;
+
+					const children: Sdf[] = glyphs.map(curve => ({k: 'curvepath2', paths: curve}));
+					return place(frame, children.length === 1 ? children[0] : {k: 'union', children});
+				}
+				return empty;
 			}
 
 			case 'offset': {
@@ -1472,8 +1467,8 @@ class Env {
 				// a union, a smooth circle) still draws the round approximation, honestly reported.
 				// r is the first positional argument *or* the named 'r'; delta is named only, since OpenSCAD parses the
 				// signature as offset(r) with delta as a separate name
-				const r		= values.num('r') ?? 0;
-				const delta = values.num('delta');
+				const r		= args.num('r') ?? 0;
+				const delta = args.num('delta');
 				if (r !== undefined && delta !== undefined)
 					ctx.warn('an offset() given both r and delta, which OpenSCAD resolves to r');
 				// children are placed in the *local* frame: `frame` is applied once, below, to the offset node as a
@@ -1487,7 +1482,7 @@ class Env {
 					const verts = body.k === 'square2' || body.k === 'circle2' || (body.k === 'polygon2' && body.paths.length === 1)
 						? verticesOf2(body) : undefined;
 					const convexity = verts && polygonConvexity(verts);
-					const mitred = convexity && verts && mitredOffset2(verts, delta, convexity.ccw);
+					const mitred	= convexity && verts && mitredOffset2(verts, delta, convexity.ccw);
 					if (mitred && offsetPreservesEdges(verts!, mitred))
 						return place(frame, {k: 'polygon2', paths: [mitred]});
 					ctx.warn('an offset(delta), whose mitred corners are drawn round here -- exact mitring only works for a single convex outline (a square, a $fn-sided circle, or a convex polygon())');
@@ -1496,15 +1491,16 @@ class Env {
 			}
 
 			case 'linear_extrude': {
-				const height = values.num('height', 0) ?? 100;
-				const center = values.bool('center', 1) ?? false;
+				const height = args.num('height', 0) ?? 100;
+				const center = args.bool('center', 1) ?? false;
 				for (const name of ['twist', 'scale', 'slices'])
-					if (values.get(name))
+					if (args.get(name))
 						ctx.warn(`a linear_extrude ${name}, which this viewer does not vary along its height`);
+
 				// children are placed in the *local* frame, as offset()'s are (see the comment there): `frame` is
 				// applied once, below, to the extruded solid as a whole.
-				const children = childrenOf(scope, env, identityFrame, ctx);
-				const body = children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
+				const children	= childrenOf(scope, env, identityFrame, ctx);
+				const body		= children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (!is2d(body) && body.k !== 'empty')
 					ctx.warn('a linear_extrude of something that is not a 2-D shape (circle, square or polygon)');
 				return place(frame, {k: 'extrude', h: height, center, body});
@@ -1513,7 +1509,7 @@ class Env {
 			case 'projection': {
 				// the solid's shadow on the xy plane, or with cut = true its slice there -- worked out once as 2-D
 				// shapes (see projection() in sdf.ts); children are placed in the local frame, as offset()'s are
-				const cut		= values.bool('cut', 0) ?? false;
+				const cut		= args.bool('cut', 0) ?? false;
 				const children	= childrenOf(scope, env, identityFrame, ctx);
 				const body		= children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
 				if (is2d(body))
@@ -1527,7 +1523,7 @@ class Env {
 			case 'rotate_extrude': {
 				// the 2-D shape is the profile: its x is the radius and its y becomes the axis, so this is exact for a
 				// full turn and a wedge cut for a partial one
-				const angle		= values.num('angle', 0) ?? 360;
+				const angle		= args.num('angle', 0) ?? 360;
 				// children are placed in the *local* frame, as offset()'s are (see the comment there).
 				const children	= childrenOf(scope, env, identityFrame, ctx);
 				const body		= children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
@@ -1707,45 +1703,46 @@ class Env {
 				const body = child();
 
 				if (is2d(body)) {
-					const verts = hullVertices2(body);
-					const vertexHull = verts && convexHull2(verts);
-					if (vertexHull)
-						return {k: 'polygon2', paths: [vertexHull]};
+					const verts	= hullVertices2(body);
+					const hull	= verts && convexHull2(verts);
+					if (hull)
+						return {k: 'polygon2', paths: [hull]};
+
 					const round = sameRadiusCircles(body);
 					if (round) {
 						if (round.centres.length === 1)
 							return body;					// hull of one circle is that circle, already
 						if (round.centres.length === 2)
 							return {k: 'stadium2', a: round.centres[0], b: round.centres[1], r: round.r};
-						const roundHull = convexHull2(round.centres);
-						if (roundHull)
-							return {k: 'offset', r: round.r, body: {k: 'polygon2', paths: [roundHull]}};
+						const hull = convexHull2(round.centres);
+						if (hull)
+							return {k: 'offset', r: round.r, body: {k: 'polygon2', paths: [hull]}};
 					}
 					ctx.warn('a 2-D hull this viewer cannot build exactly -- circles of different sizes, or a cut shape among its children -- drawn as a union of its children');
 					return body;
 
 				} else {
 					//3D
-					const verts = hullVertices3(body);
-					const vertexHull = verts && convexHull3(verts);
-					if (vertexHull)
-						return {k: 'planes', planes: vertexHull.planes, points: [...new Set(vertexHull.faces.flat())], faces: vertexHull.faces};
+					const verts	= hullVertices3(body);
+					const hull	= verts && convexHull3(verts);
+					if (hull)
+						return {k: 'planes', planes: hull.planes, points: [...new Set(hull.faces.flat())], faces: hull.faces};
 					const round = sameRadiusSpheres(body);
 					if (round) {
 						if (round.centres.length === 1)
 							return body;						// hull of one sphere is that sphere, already
 						if (round.centres.length === 2)
 							return {k: 'capsule', a: round.centres[0], b: round.centres[1], r: round.r};
-						const roundHull = convexHull3(round.centres);
-						if (roundHull)
-							return {k: 'dilate', body: {k: 'planes', planes: roundHull.planes, points: [...new Set(roundHull.faces.flat())], faces: roundHull.faces}, support: {r: round.r, q: null, bound: round.r}};
+						const hull = convexHull3(round.centres);
+						if (hull)
+							return {k: 'dilate', body: {k: 'planes', planes: hull.planes, points: [...new Set(hull.faces.flat())], faces: hull.faces}, support: {r: round.r, q: null, bound: round.r}};
 					}
 					// A mix of sharp corners and spheres of any and varying radii -- a sailboat hull of boxes
 					// and a bow sphere is exactly this -- reduces to a list of weighted points (a sharp corner is r = 0)
 					// and builds an exact hull from them: offset faces, capsules/round cones along the edges, tried only
 					// after the two faster exact cases above, which it would otherwise needlessly outdo in cost.
-					const weighted = weightedPoints3(body);
-					const mixedHull = weighted && weightedHull3(weighted);
+					const weighted	= weightedPoints3(body);
+					const mixedHull	= weighted && weightedHull3(weighted);
 					if (mixedHull)
 						return mixedHull;
 					ctx.warn('a hull this viewer cannot build exactly -- a curved side other than a sphere, a cut shape, or a sphere large enough to change which points are on the hull -- drawn as a union of its children');
@@ -1765,9 +1762,9 @@ class Env {
 					ctx.warn('children() outside a module call');
 					return empty;
 				}
-				if (values.positional.length === 0)
+				if (args.positional.length === 0)
 					return new Env(outer.env).evalScope(outer.scope, frame, ctx);
-				const index		= values.num('index', 0) ?? 0;
+				const index		= args.num('index', 0) ?? 0;
 				const chosen	= outer.scope.moduleInstantiations[index];
 				return chosen ? new Env(outer.env).instantiate(chosen, frame, ctx) : empty;
 			}
@@ -1787,25 +1784,25 @@ class Env {
 			}
 
 			case 'echo': case 'assert':
-				console.log(name.toUpperCase() + ':', values.positional.map(a => show(env.evalExpr(a.expr, ctx))).join(' '));
+				console.log(name.toUpperCase() + ':', args.positional.map(a => show(env.evalExpr(a.expr, ctx))).join(' '));
 				return child();
 
 			case 'translate':
-				arity('translate', values, 1);
-				return transformed(float3.translate(values.vec3('v', 0) ?? float3(0, 0, 0)), 1);
+				arity('translate', args, 1);
+				return transformed(float3.translate(args.vec3('v', 0) ?? float3(0, 0, 0)), 1);
 
 			case 'rotate': {
-				const first = values.get('a', 0);
+				const first = args.get('a', 0);
 				if (typeof first === 'number' || typeof first === 'string') {
-					const axis = values.vec3('v', 1) ?? float3(0, 0, 1);
+					const axis = args.vec3('v', 1) ?? float3(0, 0, 1);
 					return transformed(rotationAxis(num(first, ctx, 'rotate()') ?? 0, axis), 1);
 				}
 				return transformed(rotation(vec3(first, ctx, 'rotate()') ?? float3(0, 0, 0)), 1);
 			}
 
 			case 'scale': {
-				arity('scale', values, 1);
-				const v = values.vec3('v', 0) ?? float3(1, 1, 1);
+				arity('scale', args, 1);
+				const v = args.vec3('v', 0) ?? float3(1, 1, 1);
 				// A zero factor does not make a thinner solid, it makes a flat one, and a field cannot describe that:
 				// there is no distance from a point to a plane of zero thickness. As a Minkowski operand it means
 				// something else entirely -- an offset in the other axes, which is how a shape is rounded in one plane
@@ -1821,11 +1818,11 @@ class Env {
 			}
 
 			case 'mirror':
-				arity('mirror', values, 1);
-				return transformed(mirroring(values.vec3('v', 0) ?? float3(1, 0, 0)), 1);
+				arity('mirror', args, 1);
+				return transformed(mirroring(args.vec3('v', 0) ?? float3(1, 0, 0)), 1);
 
 			case 'multmatrix': {
-				const rows = values.get('m', 0);
+				const rows = args.get('m', 0);
 				if (!isList(rows)) {
 					ctx.warn('multmatrix with something other than a matrix');
 					return child();
@@ -1841,13 +1838,13 @@ class Env {
 			}
 
 			case 'cube': {
-				const size = values.vec3('size', 0) ?? float3(1, 1, 1);
-				return place(frame, {k: 'box', size, center: values.bool('center', 1) ?? false});
+				const size = args.vec3('size', 0) ?? float3(1, 1, 1);
+				return place(frame, {k: 'box', size, center: args.bool('center', 1) ?? false});
 			}
 
 			case 'sphere': {
-				const d = num(values.get('d', 2), ctx, 'sphere()');
-				const r = d !== undefined ? d / 2 : values.num('r', 0) ?? 1;
+				const d = num(args.get('d', 2), ctx, 'sphere()');
+				const r = d !== undefined ? d / 2 : args.num('r', 0) ?? 1;
 				return place(frame, {k: 'sphere', r});
 			}
 
@@ -1856,13 +1853,13 @@ class Env {
 				// and d2 can only be named. A diameter beats the radius of the same name, r / d set both ends, and r1 / r2
 				// (or d1 / d2) then override one end each -- so cylinder(40, 1, 1) is a 1-radius mast, and cylinder(10, 5)
 				// is a taper from 5 down to the default 1, not a straight cylinder.
-				const h			= values.num('h', 0) ?? 1;
-				const center	= values.bool('center', 3) ?? false;
+				const h			= args.num('h', 0) ?? 1;
+				const center	= args.bool('center', 3) ?? false;
 				const radius	= (dName: string, rName: string, position: number): number | undefined => {
-					const d = num(values.get(dName), ctx, `cylinder()'s ${dName}`);
+					const d = num(args.get(dName), ctx, `cylinder()'s ${dName}`);
 					if (d !== undefined)
 						return d / 2;
-					return num(position >= 0 ? values.get(rName, position) : values.get(rName), ctx, `cylinder()'s ${rName}`);
+					return num(position >= 0 ? args.get(rName, position) : args.get(rName), ctx, `cylinder()'s ${rName}`);
 				};
 				const r = radius('d', 'r', -1), r1 = radius('d1', 'r1', 1), r2 = radius('d2', 'r2', 2);
 				if (r !== undefined && (r1 !== undefined || r2 !== undefined))
@@ -1872,7 +1869,7 @@ class Env {
 				const tapered	= Math.abs(baseR1 - baseR2) > 1e-9;
 				const straight	= (baseR1 + baseR2) / 2;		// only used by the untapered paths below
 
-				const fn		= num(values.special('$fn'), ctx, '$fn') ?? 0;
+				const fn		= num(args.special('$fn'), ctx, '$fn') ?? 0;
 				const sides		= fn >= 3 ? Math.max(3, Math.round(fn)) : 0;
 				// A cylinder with $fn is not a round shape approximated: it is that polyhedron, so it is built as one.
 				// That keeps its own distance exact at its vertical edges (which a set of face planes only bounds), and
@@ -1901,8 +1898,8 @@ class Env {
 			}
 
 			case 'polyhedron': {
-				const points	= vectorOfPoints(values.get('points', 0), ctx);
-				const faces		= vectorOfFaces(values.get('faces', 1));
+				const points	= vectorOfPoints(args.get('points', 0), ctx);
+				const faces		= vectorOfFaces(args.get('faces', 1));
 				if (!points || !faces) {
 					ctx.warn('polyhedron without readable points and faces');
 					return empty;
@@ -1911,62 +1908,47 @@ class Env {
 			}
 
 			case 'import': {
-				const written	= values.get('file', 0) ?? values.get('filename');
+				const written	= args.get('file', 0) ?? args.get('filename');
 				if (typeof written !== 'string') {
 					ctx.warn('import() without a file name');
 					return empty;
 				}
 
 				const from		= getLoc(inst)?.filename ?? ctx.filename;
-				const file		= ctx.openFile('import', written, from);
-				if (!file)
-					return empty;
-
-				const {full, entry}	= file;
-				if (!entry.model) {
-					const ext = path.extname(written).toLowerCase();
+				const result	= ctx.openFile('import', written, from, async bytes => {
+					const ext = extension(written);
 					if (MESH_READERS[ext]) {
-						try {
-							entry.model = MESH_READERS[ext](entry.bytes);
-						} catch (error: any) {
-							ctx.warn(`import(): '${written}' could not be read (${error?.message ?? String(error)})`);
-							return empty;
-						}
-					} else if (ASYNC_MESH_READERS[ext]) {
-						ctx.unloaded.add(full);
-						entry.reader = async e => e.model = await ASYNC_MESH_READERS[ext](e.bytes);
-						return empty;
+						const model = await MESH_READERS[ext](bytes);
+						const {points, faces} = meshes.flatten(model);
+						return {model, solid: solidOf(points, faces, ctx)}
 					}
+				});
+				if (result) {
+					const center	= args.bool('center') ?? false;
+					const layer		= args.get('layer', 1) ?? args.get('layername');
+					const scale		= num(args.get('scale', 4), ctx, "import()'s scale") ?? 1;
+
+					// $fn, $fa and $fs, with OpenSCAD's defaults and floors, for what a file's curves are broken into
+					const value			= (name: string, fallback: number) => num(args.special(name) ?? fallback, ctx, name) ?? fallback;
+					const discretizer	= {fn: Math.max(value('$fn', 0), 0), fa: Math.max(value('$fa', 12), 0.01), fs: Math.max(value('$fs', 2), 0.01)};
+
+					if (center || scale !== 1) {
+						const mesh 		= meshes.flatten(result.model!);
+						const mid		= mesh.points.reduce((a, p) => a.min(p)).add(mesh.points.reduce((a, p) => a.max(p))).scale(0.5);
+						const frame2	= {m: frame.m.mulAffine(float3.translate(mid.neg())), scale: frame.scale * scale };
+						return place(frame2, result.solid)
+					}
+
+					return place(frame, result.solid);
 				}
-				
-				if (!entry.solid) {
-					const {points, faces} = meshes.flatten(entry.model!);
-					entry.solid = solidOf(points, faces, ctx);
-				}
-
-				const center	= values.bool('center') ?? false;
-				const layer		= values.get('layer', 1) ?? values.get('layername');
-				const scale		= num(values.get('scale', 4), ctx, "import()'s scale") ?? 1;
-
-				// $fn, $fa and $fs, with OpenSCAD's defaults and floors, for what a file's curves are broken into
-				const value			= (name: string, fallback: number) => num(values.special(name) ?? fallback, ctx, name) ?? fallback;
-				const discretizer	= {fn: Math.max(value('$fn', 0), 0), fa: Math.max(value('$fa', 12), 0.01), fs: Math.max(value('$fs', 2), 0.01)};
-
-				if (center || scale !== 1) {
-					const mesh 		= meshes.flatten(entry.model!);
-					const mid		= mesh.points.reduce((a, p) => a.min(p)).add(mesh.points.reduce((a, p) => a.max(p))).scale(0.5);
-					const frame2	= {m: frame.m.mulAffine(float3.translate(mid.neg())), scale: frame.scale * scale };
-					return place(frame2, entry.solid)
-				}
-
-				return place(frame, entry.solid);
+				return empty;
 			}
 
 			case 'surface': {
-				const written	= values.get('file', 0);
-				const center	= values.bool('center', 1) ?? false;
-				const invert	= values.bool('invert') ?? false;
-				const tiled		= tiledOf(values.get('tiled'));
+				const written	= args.get('file', 0);
+				const center	= args.bool('center', 1) ?? false;
+				const invert	= args.bool('invert') ?? false;
+				const tiled		= tiledOf(args.get('tiled'));
 				if (typeof written !== 'string') {
 					ctx.warn("surface() without a file name");
 					return empty;
@@ -1992,9 +1974,9 @@ class Env {
 			// the flat shape before the bend, so `wrap("sphere", r = 50) scale([1, 1, 0.1]) surface("map.png")`
 			// thins the relief and leaves the sphere alone, where a scale outside it would flatten the sphere.
 			case 'wrap': {
-				const how	= values.str('kind', 0);
-				const r		= values.num('r') ?? (values.num('d') ?? 0) / 2;
-				const h		= values.num('h');
+				const how	= args.str('kind', 0);
+				const r		= args.num('r') ?? (args.num('d') ?? 0) / 2;
+				const h		= args.num('h');
 				if (how !== 'cylinder' && how !== 'sphere')
 					ctx.warn(`wrap(): "${how}", which is neither "cylinder" nor "sphere"`);
 				else if (!(r > 0))
@@ -2159,76 +2141,62 @@ function placedBody(body: Sdf): {body: Sdf, scale: float3} | undefined {
 // A file a call names, found as OpenSCAD finds it (beside the file the call is written in, then the library path) and
 // read as bytes where the files allow, or as text; undefined, reported, when it cannot be.
 
-function imageReader<T extends {load(a: Uint8Array): bitmap.Image | Promise<bitmap.Image>}>(e: FileCacheEntry, format: T) {
-	e.reader = async e => e.image = await (await format.load(e.bytes)).getPixels({plane: 'Y', array: Float32Array, luma: 'rec709'});
-}
-
 function readSurface(written: string, invert: boolean, tiled: Tiled | undefined, from: string, ctx: Ctx) {
-	const file = ctx.openFile('surface', written, from);
-	if (!file)
-		return undefined;
-
-	const {full, entry} = file;
-	if (!entry.image) {
-		switch (extension(full)) {
-			case '.png':	imageReader(entry, bitmap.PNG); break;
-			case '.jpg':	imageReader(entry, bitmap.JPEG); break;
-			case '.jpeg':	imageReader(entry, bitmap.JPEG); break;
-			case '.bmp':	imageReader(entry, bitmap.BMP); break;
-			default: {
-				const text = new TextDecoder().decode(entry.bytes);
-				const rows: number[][] = [];
-				let lowest = 1;
-				for (const raw of text.split(/\r?\n/)) {
-					const line = raw.trim();
-					if (!line || line.startsWith('#'))
-						continue;
-					const row: number[] = [];
-					for (const token of line.split(/[ \t]+/)) {
-						const v = Number(token);
-						if (!Number.isFinite(v)) {
-							ctx.warn(`surface(): '${written}' has a value that is not a number: '${token}'`);
-							return undefined;
-						}
-						row.push(v);
-						lowest = Math.min(lowest, v);
+	const value = ctx.openFile('surface', written, from, async bytes => {
+		let format: {load(a: Uint8Array): bitmap.Image | Promise<bitmap.Image>} | undefined;
+		switch (extension(written)) {
+			case '.png':	format = bitmap.PNG; break;
+			case '.jpg':	format = bitmap.JPEG; break;
+			case '.jpeg':	format = bitmap.JPEG; break;
+			case '.bmp':	format = bitmap.BMP; break;
+		}
+		let width: number, height: number;
+		let heights: Float64Array;
+		if (format) {
+			const image = await (await format.load(bytes)).getPixels({plane: 'Y', array: Float32Array, luma: 'rec709'});
+			width = image.width;
+			height =image.height;
+			heights = new Float64Array(image.pixels);
+		} else {
+			const text = new TextDecoder().decode(bytes);
+			const rows: number[][] = [];
+			for (const raw of text.split(/\r?\n/)) {
+				const line = raw.trim();
+				if (!line || line.startsWith('#'))
+					continue;
+				const row: number[] = [];
+				for (const token of line.split(/[ \t]+/)) {
+					const v = Number(token);
+					if (!Number.isFinite(v)) {
+						ctx.warn(`surface(): '${written}' has a value that is not a number: '${token}'`);
+						return undefined;
 					}
-					rows.push(row);
+					row.push(v);
 				}
-				const cols		= rows.reduce((n, r) => Math.max(n, r.length), 0);
-				const heights	= new Float64Array(cols * rows.length);
-				rows.forEach((r, j) => r.forEach((v, i) => heights[j * cols + i] = v));
-				return checkedHeightmap(cols, rows.length, heights, lowest - 1, tiled, written, ctx);
+				rows.push(row);
 			}
+			width	= rows.reduce((n, r) => Math.max(n, r.length), 0);
+			height	= rows.length;
+			heights	= new Float64Array(width * height);
+			rows.forEach((r, j) => r.forEach((v, i) => heights[j * width + i] = v));
 		}
-		ctx.unloaded.add(full);
-		return undefined;
-	}
+		let lowest = Infinity;
+		heights.forEach(v => lowest = Math.min(lowest, v));
+		return checkedHeightmap(width, height, heights, lowest - 1, tiled, written, ctx);
 
-	const {width, height, pixels: gray} = entry.image;
-	const heights = new Float64Array(width * height);
-	let lowest = Infinity;
-	for (let y = 0; y < height; y++) {
-		for (let x = 0; x < width; x++) {
-			const z = 100 * (invert ? -gray[y * width + x] : gray[y * width + x]);
-			heights[(height - 1 - y) * width + x] = z;
-			lowest = Math.min(lowest, z);
-		}
-	}
-	return checkedHeightmap(width, height, heights, lowest - 1, tiled, written, ctx);
+	});
+	return value;
 }
 
 // import()'s mesh formats, by extension as OpenSCAD decides; AMF and 3MF may be zipped, which only reads asynchronously,
 // so those are loaded between evaluations (see evaluateWithImages)
-const MESH_READERS: Record<string, (bytes: Uint8Array) => meshes.Model> = {
+const MESH_READERS: Record<string, (bytes: Uint8Array) => meshes.Model|Promise<meshes.Model>> = {
 	'.stl': meshes.STL.read,
 	'.off': meshes.OFF.read,
-	'.obj': meshes.OBJ.read,
 	'.dxf': meshes.DXF.read,
-};
-const ASYNC_MESH_READERS: Record<string, (bytes: Uint8Array) => Promise<meshes.Model>> = {
 	'.amf': meshes.AMF.read,
 	'.3mf': meshes.ThreeMF.read,
+	'.obj': meshes.OBJ.read,
 };
 
 
@@ -2298,12 +2266,10 @@ function loadDXF(module: string, args: argGetter) {
 		args.warn(`${module}() without a file name`);
 		return undefined;
 	}
-	const read = args.ctx.openFile(module, written, args.filename());
-	if (read) {
-		if (!read.entry.model)
-			read.entry.model = MESH_READERS.dxf(read.entry.bytes);
-		return read.entry.model.extras.document as dwg.DXF;
-	}
+	return args.ctx.openFile(module, written, args.filename(), bytes => {
+		const model = meshes.DXF.read(bytes);
+		return model.extras.document as dwg.DXF;
+	});
 }
 
 // dxf_dim(): the measurement of the DIMENSION of that name (the first, without one), worked out from its points as
@@ -2454,7 +2420,6 @@ export interface Evaluated {
 	sdf: Sdf;
 	flat?: (thickness: number) => Sdf;		// the 2-D shapes left outside any extrude, as sheets that tall (see flat2d); the viewer's to draw, not an export's
 	warnings: string[];
-	unloaded: string[];		// surface()'s PNGs and import()'s AMF and 3MF files that were not in the cache, and so were not drawn
 	// $vpt/$vpr/$vpd/$vpf, but only a field the file itself assigned at its own top level -- the one scope OpenSCAD
 	// honours these in -- so the viewer can take them as the file's own preferred view without a default value
 	// (there whether the file mentions them or not) looking exactly as deliberate as one it actually wrote.
@@ -2463,13 +2428,6 @@ export interface Evaluated {
 
 const vecOf = (v: Value): [number, number, number] | undefined => isList(v) && v.length >= 3 && typeof v[0] === 'number' && typeof v[1] === 'number' && typeof v[2] === 'number' ? [v[0], v[1], v[2]] : undefined;
 const numOf = (v: Value): number | undefined => typeof v === 'number' ? v : undefined;
-
-// Whether `name` was assigned by a statement in the file's own top-level scope -- not just readable there, which
-// env.has() would also say yes to for one of the defaults seeded below on `defaults`, but actually written into
-// `env`'s own `values` by evalScope() itself (see its handling of a $-prefixed assignment).
-function topLevel<T>(env: Env, name: string, ctx: Ctx, convert: (v: Value) => T | undefined): T | undefined {
-	return env.values.has(name) ? convert(env.get(name, ctx)) : undefined;
-}
 
 // `use <file>` makes a library's modules and functions available without drawing its geometry or importing its
 // variables, unlike `include <file>` -- which the parser already splices in as if typed in place, so it needs no
@@ -2519,50 +2477,247 @@ function rootDefaults(preview: boolean): Env {
 // `preview` is false only for a final export (see exportStl()): OpenSCAD's own $preview, which a file may use to
 // skip a preview-only simplification, since here that step -- unlike a re-evaluation on a moved camera -- is one
 // this viewer already always pays for.
-export function evaluate(code: string, filename: string, files: ScadFiles, cache: FileCache, preview = true) {
-	const file = parse(code, filename, files);
-	const env = new Env(rootDefaults(preview));
-	const ctx = new Ctx(files, filename, cache);
+export function evaluate(code: string, filename: string, files: ScadFiles, preview = true) {
+	const file	= parse(code, filename, files);
+	const env	= new Env(rootDefaults(preview));
+	const ctx	= new Ctx(files, filename);
 	loadUsedLibraries(file, files, env, ctx, new Set([filename]));
 
 	const raw = env.evalScope(file.scope, identityFrame, ctx);
 	const {sdf, stripped} = strip2d(raw);
 	if (stripped)
 		ctx.warn('a 2-D shape (circle, square or polygon) outside linear_extrude/rotate_extrude, which the viewer draws as a flat sheet and an export leaves out');
-
+/*
 	for (const key of cache.keys())
 		if (!ctx.used.has(key))
 			cache.delete(key);
-
-	for (const full of ctx.unloaded)
-		ctx.warn(ASYNC_MESH_READERS[path.extname(full).toLowerCase()]
-			? `import(): '${path.basename(full)}' is only drawn when it has been loaded first (see evaluateWithImages)`
-			: `surface(): '${path.basename(full)}' is a PNG, which is only drawn when it has been loaded first (see evaluateWithImages)`);
+*/
+	// Whether `name` was assigned by a statement in the file's own top-level scope -- not just readable there, which
+	// env.has() would also say yes to for one of the defaults seeded below on `defaults`, but actually written into
+	// `env`'s own `values` by evalScope() itself (see its handling of a $-prefixed assignment).
+	function topLevel<T>(name: string, convert: (v: Value) => T | undefined): T | undefined {
+		return env.values.has(name) ? convert(env.get(name, ctx)) : undefined;
+	}
 
 	const camera = {
-		vpt: topLevel(env, '$vpt', ctx, vecOf),
-		vpr: topLevel(env, '$vpr', ctx, vecOf),
-		vpd: topLevel(env, '$vpd', ctx, numOf),
-		vpf: topLevel(env, '$vpf', ctx, numOf),
+		vpt: topLevel('$vpt', vecOf),
+		vpr: topLevel('$vpr', vecOf),
+		vpd: topLevel('$vpd', numOf),
+		vpf: topLevel('$vpf', numOf),
 	};
-	return {sdf, flat: stripped ? (thickness: number) => flat2d(raw, thickness) : undefined, warnings: ctx.list, unloaded: [...ctx.unloaded], camera};
+	return {sdf, flat: stripped ? (thickness: number) => flat2d(raw, thickness) : undefined, warnings: ctx.list, camera};
 }
 
-// evaluate(), with the PNGs its surface() calls and the AMF and 3MF files its import() calls read loaded first: evaluated
-// once to find which they are (a file name can be computed, so there is no knowing sooner), then again with them.
-export async function evaluateWithFiles(code: string, filename: string, files: ScadFiles, cache: FileCache, preview = true) {
-	for (;;) {
-		const result = evaluate(code, filename, files, cache, preview);
-		if (result.unloaded.length === 0)
-			return result;
-		for (const full of result.unloaded) {
-			const entry = cache.get(full)!;
-			try {
-				if (entry.reader)
-					await entry.reader(entry);
-			} catch (e: any) {
-				entry.error = e.message;
+//-----------------------------------------------------------------------------
+// CSG export: the evaluated tree as text, in the form of OpenSCAD's own .csg -- modules expanded, for loops unrolled,
+// if/else resolved and every argument a value, with each built-in's arguments named
+//-----------------------------------------------------------------------------
+
+// the parameters of each built-in that takes them, in positional order; a primitive with defaults or aliases (cube,
+// sphere, cylinder, circle, square) is written out by csgInstance itself
+const CSG_PARAMS: Record<string, string[]> = {
+	polygon:			['points', 'paths', 'convexity'],
+	polyhedron:			['points', 'faces', 'convexity'],
+	translate:			['v'],
+	rotate:				['a', 'v'],
+	scale:				['v'],
+	mirror:				['v'],
+	multmatrix:			['m'],
+	resize:				['newsize', 'auto', 'convexity'],
+	color:				['c', 'alpha'],
+	offset:				['r', 'delta', 'chamfer'],
+	linear_extrude:		['height', 'center', 'convexity', 'twist', 'slices', 'scale'],
+	rotate_extrude:		['angle', 'convexity'],
+	projection:			['cut'],
+	import:				['file', 'layer', 'convexity'],
+	surface:			['file', 'center', 'invert', 'convexity'],
+	text:				['text', 'size', 'font', 'halign', 'valign', 'spacing', 'direction', 'language', 'script'],
+	wrap:				['kind', 'r', 'd', 'h'],
+	minkowski:			['convexity'],
+	render:				['convexity'],
+	hull:				[],
+	union:				[],
+	difference:			[],
+	intersection:		[],
+	group:				[],
+};
+// the ones that read $fn/$fa/$fs, which OpenSCAD writes out with their values
+const CSG_FRAGMENTS = new Set(['sphere', 'cylinder', 'circle', 'rotate_extrude', 'offset', 'text']);
+// the ones that stand alone, with no children to put braces round
+const CSG_LEAVES = new Set(['cube', 'sphere', 'cylinder', 'circle', 'square', 'polygon', 'polyhedron', 'text', 'import', 'surface']);
+
+function csgNumber(n: number) {
+	return Number.isNaN(n) ? 'nan' : !Number.isFinite(n) ? (n < 0 ? '-inf' : 'inf') : String(parseFloat(n.toPrecision(12)));
+}
+
+function csgValue(v: Value): string {
+	return typeof v === 'number'	? csgNumber(v)
+		: typeof v === 'string'		? JSON.stringify(v)
+		: typeof v === 'boolean'	? String(v)
+		: isList(v)					? '[' + v.map(csgValue).join(', ') + ']'
+		: 'undef';
+}
+
+function csgScope(scope: Scope, env: Env, ctx: Ctx, out: string[], depth: number) {
+	for (const s of env.declare(scope)) {
+		if (s.inst)
+			csgInstance(s.inst, env, ctx, out, depth);
+		else if (s.name!.startsWith('$'))
+			env.values.set(s.name!, env.evalExpr(s.expr, ctx));
+	}
+}
+
+function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: number) {
+	const pad		= '\t'.repeat(depth);
+	const block		= (head: string, body: (depth: number) => void) => {
+		out.push(`${pad}${head} {`);
+		body(depth + 1);
+		out.push(`${pad}}`);
+	};
+	const inner		= (scope: Scope, e: Env, d: number) => csgScope(scope, new Env(e), ctx, out, d);
+
+	if (inst instanceof IfElseModuleInstantiation) {
+		const taken = truthy(env.evalExpr(inst.expr, ctx)) ? inst.scope : inst.else_scope;
+		if (taken)
+			csgScope(taken, new Env(env), ctx, out, depth);
+		return;
+	}
+
+	const name		= inst.modname ?? '';
+	const scope		= inst.scope;
+	const rawargs	= inst.args ?? [];
+	const args		= argGetter(rawargs, env, ctx);
+
+	// a module the file defines itself: a group of what its body builds
+	const user = env.findModule(name);
+	if (user) {
+		const call	= new Env(env);
+		const p		= args.positional;
+		let pi = 0;
+		for (const param of user.parameters)
+			call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr, ctx) : param.expr ? call.evalExpr(param.expr, ctx) : undefined));
+		call.values.set('$children', scope.moduleInstantiations.length);
+		call.values.set('$parent_modules', ctx.moduleStack.length);
+		ctx.children.push({scope, env});
+		ctx.moduleStack.push(name);
+		block('group()', d => csgScope(user.body, call, ctx, out, d));
+		ctx.moduleStack.pop();
+		ctx.children.pop();
+		return;
+	}
+
+	switch (name) {
+		case 'for':
+			block('group()', d => forEachIteration(rawargs, env, ctx, it => csgScope(scope, it, ctx, out, d)));
+			return;
+
+		case 'intersection_for':
+			block('intersection()', d => forEachIteration(rawargs, env, ctx, it => block('group()', d2 => csgScope(scope, it, ctx, out, d2))));
+			return;
+
+		case 'let': {
+			const e = new Env(env);
+			for (const a of rawargs)
+				if (a.name)
+					e.values.set(a.name, env.evalExpr(a.expr, ctx));
+			csgScope(scope, e, ctx, out, depth);
+			return;
+		}
+
+		case 'children': {
+			const outer = ctx.children.at(-1);
+			if (!outer) {
+				ctx.warn('children() outside a module call');
+				return;
 			}
+			// the children were written where the module was called, so their own children() belong to that call's
+			ctx.children.pop();
+			if (args.positional.length === 0 && !named(rawargs, 'index'))
+				csgScope(outer.scope, new Env(outer.env), ctx, out, depth);
+			else {
+				const chosen = outer.scope.moduleInstantiations[args.num('index', 0) ?? 0];
+				if (chosen)
+					csgInstance(chosen, new Env(outer.env), ctx, out, depth);
+			}
+			ctx.children.push(outer);
+			return;
+		}
+
+		case 'echo': case 'assert':
+			console.log(name.toUpperCase() + ':', args.positional.map(a => env.evalExpr(a.expr, ctx)).map(show).join(' '));
+			inner(scope, env, depth);
+			return;
+	}
+
+	const given: [string, string][] = [];
+	const fragments = () => {
+		if (CSG_FRAGMENTS.has(name))
+			for (const [f, d] of [['$fn', 0], ['$fa', 12], ['$fs', 2]] as const)
+				given.push([f, csgValue(args.special(f) ?? d)]);
+	};
+
+	switch (name) {
+		case 'cube': {
+			const size = args.get('size', 0);
+			given.push(['size', csgValue(typeof size === 'number' ? [size, size, size] : size ?? [1, 1, 1])], ['center', csgValue(args.bool('center', 1) ?? false)]);
+			break;
+		}
+		case 'square': {
+			const size = args.get('size', 0);
+			given.push(['size', csgValue(typeof size === 'number' ? [size, size] : size ?? [1, 1])], ['center', csgValue(args.bool('center', 1) ?? false)]);
+			break;
+		}
+		case 'sphere': case 'circle': {
+			fragments();
+			const d = args.num('d', 2);
+			given.push(['r', csgValue(d !== undefined ? d / 2 : args.num('r', 0) ?? 1)]);
+			break;
+		}
+		case 'cylinder': {
+			fragments();
+			// primitives.cc's rules: d beats r, r/d set both ends, and r1/r2 (d1/d2) then override one end each
+			const r		= args.num('d') !== undefined ? args.num('d')! / 2 : args.num('r');
+			const r1	= args.num('d1') !== undefined ? args.num('d1')! / 2 : args.num('r1', 1) ?? r ?? 1;
+			const r2	= args.num('d2') !== undefined ? args.num('d2')! / 2 : args.num('r2', 2) ?? r ?? 1;
+			given.push(['h', csgValue(args.num('h', 0) ?? 1)], ['r1', csgValue(r1)], ['r2', csgValue(r2)], ['center', csgValue(args.bool('center', 3) ?? false)]);
+			break;
+		}
+		default: {
+			const known = CSG_PARAMS[name];
+			if (!known) {
+				ctx.warn(`${name}(): not a module this export knows, so it and its children are left out`);
+				return;
+			}
+			fragments();
+			const params = [...known];
+			for (const a of rawargs)
+				if (a.name && !a.name.startsWith('$') && !params.includes(a.name))
+					params.push(a.name);
+			params.forEach((p, i) => {
+				const v = args.get(p, i);
+				if (v !== undefined)
+					given.push([p, csgValue(v)]);
+			});
+			// positional arguments past the parameters are ignored by OpenSCAD too
 		}
 	}
+	given.sort(([a], [b]) => +!a.startsWith('$') - +!b.startsWith('$'));
+
+	const mark = inst.tag_root ? '!' : inst.tag_highlight ? '#' : inst.tag_background ? '%' : '';
+	const head = `${mark}${name}(${given.map(([k, v]) => `${k} = ${v}`).join(', ')})`;
+	if (CSG_LEAVES.has(name))
+		out.push(`${pad}${head};`);
+	else
+		block(head, d => inner(scope, env, d));
+}
+
+// The tree evaluate() would build, as .csg text: OpenSCAD's own export of the same file.
+export function evaluateCsg(code: string, filename: string, files: ScadFiles, preview = false) {
+	const file	= parse(code, filename, files);
+	const env	= new Env(rootDefaults(preview));
+	const ctx	= new Ctx(files, filename);
+	loadUsedLibraries(file, files, env, ctx, new Set([filename]));
+	const out: string[] = [];
+	csgScope(file.scope, env, ctx, out, 0);
+	return {csg: out.join('\n') + '\n', warnings: ctx.list};
 }

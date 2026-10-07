@@ -190,6 +190,11 @@
 				"icon": "$(package)"
 			},
 			{
+				"command": "scad.exportCsg",
+				"title": "Export CSG…",
+				"icon": "$(file-code)"
+			},
+			{
 				"command": "bitmap.fill",
 				"title": "Fill Selection with Foreground",
 				"category": "Bitmap"
@@ -271,6 +276,11 @@
 					"command": "scad.exportStl",
 					"when": "resourceExtname == .scad",
 					"group": "navigation@2"
+				},
+				{
+					"command": "scad.exportCsg",
+					"when": "resourceExtname == .scad",
+					"group": "navigation@3"
 				},
 				{
 					"command": "bitmap.fit",

@@ -145,6 +145,7 @@ const fan = new LayerFan({
 	view:		() => ({scale, offset}),
 	programs:	() => programLayer && {background: programBG, layer: programLayer},
 	layerTexture: layer => compositor?.layerTexture(layer),
+	maskTexture:  layer => compositor?.maskTexture(layer) ?? compositor?.dummyMask(),
 	render:		() => render(),
 	opened(open) {
 		// what is drawn over the picture is not part of the fan

@@ -5,11 +5,11 @@ import * as vscode from 'vscode';
 import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
 
-import { files, setActiveViewer, readShader } from './extension';
+import { files, setActiveViewer, readShader, digitAtlas } from './extension';
 import { webviewPage } from './BitmapViewer';
 import type { MessageOut, MessageIn } from '../webview/sdf';
-import { evaluateWithFiles, FileCacheEntry } from './scad/evaluate';
-import { buildIndex, digitAtlas } from './scad/fonts';
+import { evaluate, evaluateCsg } from './scad/evaluate';
+import { buildIndex } from './scad/fonts';
 import { bounds3, emitGlsl, countPrimitives, emptyReason, materials, union } from './scad/sdf';
 import { float3 } from '@isopodlabs/maths/vector';
 
@@ -25,7 +25,6 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 	// a render that waits on a surface()'s PNG can be overtaken by a later edit's, and only the latest is drawn
 	private renders		= 0;
 	// what the files this document reads amount to, so an edit does not rebuild an imported mesh that has not changed
-	private fileCache	= new Map<string, FileCacheEntry>();
 
 	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, public document: vscode.TextDocument) {
 		super(webviewPanel, assets);
@@ -66,7 +65,7 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 		const text = this.document.getText();
 		const name = this.document.uri.fsPath;
 		try {
-			const evaluated = await evaluateWithFiles(text, name, files, this.fileCache);
+			const evaluated = await files.with(() => evaluate(text, name, files));
 			const {warnings} = evaluated;
 			let sdf = evaluated.sdf;
 			if (evaluated.flat) {
@@ -184,7 +183,7 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 
 	try {
 		// a final export, not the live preview -- OpenSCAD's own $preview is false for this too
-		const result	= await evaluateWithFiles(document.getText(), target.fsPath, files, new Map<string, FileCacheEntry>, false);
+		const result	= await files.with(() => evaluate(document.getText(), target.fsPath, files, false));
 		const empty		= emptyReason(result.sdf, result.warnings);
 		if (empty)
 			throw empty;
@@ -253,5 +252,20 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 			vscode.window.showInformationMessage('Export STL cancelled.');
 		else
 			vscode.window.showErrorMessage(`Export STL: ${error?.message ?? error}`);
+	}
+}
+
+export async function exportCsg(target: vscode.Uri, destination: vscode.Uri) {
+	try {
+		const document	= await vscode.workspace.openTextDocument(target);
+		const result	= await files.with(() => evaluateCsg(document.getText(), target.fsPath, files));
+		await vscode.workspace.fs.writeFile(destination, Buffer.from(result.csg, 'utf8'));
+		await vscode.commands.executeCommand('vscode.open', destination, {viewColumn: vscode.ViewColumn.Beside, preview: false});
+		if (result.warnings.length)
+			vscode.window.showWarningMessage(`Exported ${path.basename(destination.fsPath)}, with: ${result.warnings.join('; ')}`);
+		else
+			vscode.window.showInformationMessage(`Exported ${path.basename(destination.fsPath)}`);
+	} catch (error: any) {
+		vscode.window.showErrorMessage(`Export CSG: ${error?.message ?? error}`);
 	}
 }

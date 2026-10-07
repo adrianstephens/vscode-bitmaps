@@ -6,10 +6,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
 import { Model, Mesh, Material, Attribute, placed, faceTriangles, formatOf } from '@isopodlabs/binary_meshes';
-import { buildIndex, digitAtlas } from './scad/fonts';
+import { buildIndex } from './scad/fonts';
 import type { MeshData, InstanceData, TextureData, MessageIn, MessageOut } from '../webview/mesh';
 
-import { setActiveViewer, readShader } from './extension';
+import { setActiveViewer, readShader, digitAtlas } from './extension';
 import { webviewPage } from './BitmapViewer';
 
 const DEFAULT_COLOR = [0.72, 0.76, 0.82, 1];
@@ -194,9 +194,12 @@ class MeshViewer extends webview.Panel<MessageOut, MessageIn> {
 			const bytes = await vscode.workspace.fs.readFile(uri);
 			// the files it names (an OBJ's .mtl, the images of its textures), beside it
 			const dir = path.dirname(uri.fsPath);
-			const model = await format.read(bytes, {file: name => {
-				const full = path.resolve(dir, name);
-				return fs.existsSync(full) ? new Uint8Array(fs.readFileSync(full)) : undefined;
+			const model = await format.read(bytes, {file: async name => {
+				try {
+					return await fs.promises.readFile(path.resolve(dir, name));
+				} catch {
+					return undefined;
+				}
 			}});
 			this.postMessage(await renderData(model, ext));
 		} catch (error: any) {

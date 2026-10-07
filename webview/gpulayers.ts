@@ -70,6 +70,11 @@ export class LayerCompositor {
 		return texture;
 	}
 
+	// something to bind where a layer has no mask
+	dummyMask() {
+		return this.noMask ??= this.canvas3d.createTexture(1, 1, new Uint8Array(1), {format: 'r8', min: 'nearest', mag: 'nearest'});
+	}
+
 	// some of a layer's pixels have changed (all of them, without a rect)
 	upload(layer: Layer, rect?: Rect) {
 		const entry = this.textures.get(layer);
@@ -117,7 +122,7 @@ export class LayerCompositor {
 				}
 			}
 		}
-		this.noMask ??= canvas3d.createTexture(1, 1, new Uint8Array(1), {format: 'r8', min: 'nearest', mag: 'nearest'});
+		this.dummyMask();
 
 		if (!this.result || this.size.width !== width || this.size.height !== height) {
 			this.deleteTargets();
