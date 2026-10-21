@@ -600,3 +600,37 @@ vec2 sdBatch(vec3 p, int nodes, int leaves) {
 	}
 	return best;
 }
+
+// sdBatch for a union of shapes of the plane with a grid (emitGrid in sdf.ts): the cell the point is in lists the shapes
+// that could be nearest to it, and only those are measured. Outside the grid, or in a cell whose list was too long even
+// when divided, the hierarchy answers instead.
+vec2 sdBatchGrid(vec3 p, int nodes, int leaves, int grid) {
+	vec4 a = batchTexel(grid), b = batchTexel(grid + 1);
+	vec2 c = (p.xy - a.xy) * a.zw;
+	if (c.x < 0.0 || c.y < 0.0 || c.x >= b.x || c.y >= b.y)
+		return sdBatch(p, nodes, leaves);
+	vec4 cell = batchTexel(int(b.z) + int(c.y) * int(b.x) + int(c.x));
+	// a crowded cell has a finer grid of 8 x 8 over it, and that may have another
+	for (int level = 0; level < 3; level++) {
+		if (cell.y > -1.5)
+			break;
+		c = fract(c) * 8.0;
+		cell = batchTexel(int(cell.x + 0.5) + int(c.y) * 8 + int(c.x));
+	}
+	if (cell.y < 0.0)
+		return sdBatch(p, nodes, leaves);
+	int at = int(cell.x + 0.5), n = int(cell.y + 0.5);
+	vec2 best = vec2(1e20, 0.0);
+	float bestOrder = 1e9;
+	for (int i = 0; i < 24; i++) {
+		if (i >= n)
+			break;
+		float material, order;
+		float d = batchLeaf(leaves + 5 * int(batchTexel(at + (i >> 2))[i & 3] + 0.5), p, material, order);
+		if (d < best.x || (d == best.x && order < bestOrder)) {
+			best = vec2(d, material);
+			bestOrder = order;
+		}
+	}
+	return best;
+}

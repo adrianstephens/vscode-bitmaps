@@ -1,16 +1,9 @@
 import { makeRule, Rules, MaybeList, terminal, Forward, TextPos, WithPrec, makeParser} from '@isopodlabs/tison';
 import { Binary, Unary, Conditional, Literal, Call, Identifier } from '@isopodlabs/tison/ast'
+import type { ScadFiles } from '../filereader';
 
-/** How `use`/`include` reach the file system, as OpenSCAD's lexer does for itself (`find_valid_path` then
- *  `fopen`). Injectable so this module needs no `fs`: with none, every `use`/`include` resolves to nothing,
- *  exactly as a file that isn't there does. */
-export interface FileAccess {
-	/** The path to read for `path` written in `fromDir`, or undefined if there is no such file. */
-	resolve(path: string, fromDir: string): string | undefined;
-	read(fullpath: string): string;
-}
-
-const ID		= terminal('id', /[a-zA-Z_$][a-zA-Z0-9_]*/);
+//const ID		= terminal('id', /[a-zA-Z0-9_$][a-zA-Z0-9_]*/);
+const ID		= terminal('id', /(?!\d+$)\$?[a-zA-Z0-9_]+/);
 const STRING	= /"(?:[^"\\]|\\.)*"/;
 // OpenSCAD's lexer.l accepts a leading-digit form (5, 5., 5.5) and a leading-dot form (.5) as separate rules; this
 // is both in one, since the two never overlap (the second alternative needs a digit right after the dot, so it
@@ -19,7 +12,7 @@ const NUMBER	= /(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?[fFlL]?/;
 
 // The text between the angle brackets of a `use`/`include`, and the directory part of a path.
 const pathOf	= (match: string) => match.slice(match.indexOf('<') + 1, -1);
-const dirOf	= (file: string) => file.replace(/[\\/][^\\/]*$/, '');
+const dirOf		= (file: string) => file.replace(/[\\/][^\\/]*$/, '');
 
 // OpenSCAD's escapes are C-like, not JSON (it also has \xNN and \u{...}), so the rule action decodes them itself.
 const unescape	= (s: string) => s.slice(1, -1).replace(/\\(.)/g, (_, c: string) => c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c);
@@ -61,19 +54,18 @@ export class UserModule {
 	}
 }
 
-export class UserFunction {
-	constructor(public name: string, public parameters: Assignment[], public expr: Expr) {}
-};
+export interface FunctionDefinition	{ expr: Expr; parameters: Assignment[]; }
 
 export class LocalScope {
 	assignments:			Assignment[] = [];
 	moduleInstantiations:	ModuleInstantiation[] = [];
-	functions	= new Map<string, UserFunction>;
+
+	functions	= new Map<string, FunctionDefinition>;
 	modules		= new Map<string, UserModule>;
 
 	addModuleInst(mod: ModuleInstantiation) { this.moduleInstantiations.push(mod); }
 	addModule(mod: UserModule)				{ this.modules.set(mod.name, mod); }
-	addFunction(func: UserFunction)			{ this.functions.set(func.name, func); }
+	addFunction(name: string, fn: FunctionDefinition)		{ this.functions.set(name, fn); }
 	addAssignment(ass: Assignment)			{ this.assignments.push(ass); }
 	hasChildren()							{ return this.moduleInstantiations.length > 0; }
 };
@@ -114,7 +106,6 @@ export class SourceFile {
 export type unaryOps	= '+' | '-' | '~' | '!';
 export type binaryOps	= ',' | '+' | '-' | '*' | '/' | '%' | '^' | '<<' | '>>' | '&&' | '||' | '&' | '|' | '<' | '>' | '<=' | '>=' | '==' | '!='
 
-export interface FunctionDefinition	{ type: 'funcdef';		expr: Expr; args: Assignment[]; }
 export interface ArrayLookup		{ type: 'arraylookup';	array: Expr; index: Expr; }
 export interface Range				{ type:'range';			begin: Expr; step?: Expr; end: Expr; }
 export interface MemberLookup		{ type: 'memberlookup';	expr: Expr; member: string; }
@@ -137,7 +128,7 @@ export type Expr =
 	| Conditional<Expr>
 	| Call<Expr, Assignment>
 	| Vector
-	| FunctionDefinition
+	| { type: 'funcdef'} & FunctionDefinition
 	| ArrayLookup
 	| Range
 	| MemberLookup
@@ -161,7 +152,7 @@ class Ctx {
 	get currfile()	{ return this.file_stack.at(-1)!; }
 	get rootfile()	{ return this.file_stack[0]; }
 
-	constructor(public mainFilePath: string, public files?: FileAccess) {
+	constructor(public mainFilePath: string, public files?: ScadFiles) {
 		this.file_stack = [new SourceFile(mainFilePath)];
 	}
 
@@ -192,7 +183,7 @@ class Ctx {
 					console.warn(`WARNING: Can't find include file '${written}'`);
 				return;
 			}
-			const text	= files.read(fullpath);
+			const text	= files.read(fullpath, 'text', bytes => new TextDecoder('utf-8').decode(bytes)) ?? '';
 			const file	= new SourceFile(fullpath);
 			this.file_stack.push(file);
 			this.scope_stack.push(file.scope);
@@ -274,7 +265,7 @@ const statement = Rules<void>(self => [
 		($, ctx) => ctx.scope_stack.pop()
 	),
 	Rule(['function', ID, '(', parameters, ')', '=', fwd_expr, ';'],
-		($, ctx) => ctx.top.addFunction(new UserFunction($[1], $[3], $[6]))),
+		($, ctx) => ctx.top.addFunction($[1], {parameters: $[3], expr: $[6]})),
 	Rule([INCLUDE],
 		($, ctx) => ctx.spliceInclude($[0], {...$.pos, filename: ctx.currfile.path})),
 ]);
@@ -369,7 +360,7 @@ const expr_or_empty = Rules(
 
 const expr = Rules<Expr>(self => [
 	fwd_logic_or,
-	WithPrec(Rule(['function', '(', parameters, ')', self],	$ => ({ type: 'funcdef', expr: $[4], args: $[2] })), PREC.noElse),
+	WithPrec(Rule(['function', '(', parameters, ')', self],	$ => ({ type: 'funcdef', expr: $[4], parameters: $[2] })), PREC.noElse),
 	Rule([fwd_logic_or, '?', self, ':', self],				$ => Conditional($[0], $[2], $[4])),
 	Rule(['let', '(', arguments_, ')', self],				$ => ({ type: 'let', expr: $[4], arguments: $[2] })),
 	Rule(['assert', '(', arguments_, ')', expr_or_empty],	$ => ({ type: 'assert', expr: $[4], arguments: $[2] })),
@@ -501,7 +492,7 @@ const lalr = makeParser({
  *  the root scope and pops it again), and an `include` is expanded where it is read, with no I/O to await. */
 export const parser = {
 	tables: lalr.tables,
-	parse(code: string, filename = 'main.scad', files?: FileAccess): SourceFile {
+	parse(code: string, filename = 'main.scad', files?: ScadFiles): SourceFile {
 		const ctx = new Ctx(filename, files);
 		ctx.scope_stack.push(ctx.rootfile.scope);
 		lalr.parse(code, ctx);
@@ -511,7 +502,7 @@ export const parser = {
 
 // Phase 2. `read` gives a file's text, or undefined if it isn't there -- so the grammar module never
 // imports `fs`, and a caller can pass a Map (tests) or readFileSync (node).
-export function parse(code: string, filename = 'main.scad', files?: FileAccess): SourceFile {
+export function parse(code: string, filename = 'main.scad', files?: ScadFiles): SourceFile {
 	const ctx = new Ctx(filename, files);
 	const parseOne = (text: string, file: SourceFile) => {
 		ctx.file_stack.push(file);
@@ -523,8 +514,8 @@ export function parse(code: string, filename = 'main.scad', files?: FileAccess):
 	parseOne(code, ctx.rootfile);
 	if (files)
 		for (const [, full] of ctx.rootfile.includes) {
-			const text = files.read(full);
-			if (!text)
+			const text = files.read(full, 'text', bytes => new TextDecoder('utf-8').decode(bytes));
+			if (text === undefined)
 				throw new Error(`Missing included file: ${full}`);
 			parseOne(text, new SourceFile(full));
 		}

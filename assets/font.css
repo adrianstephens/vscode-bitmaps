@@ -74,12 +74,14 @@ body.tensors { display: flex; flex-direction: column; }
 
 /* the tables: a tree of the font's parsed data, opened a level at a time */
 #font-tables { margin-top: 12px; border-top: 1px solid var(--vscode-editorWidget-border); padding-top: 6px; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
-#font-tables ul { list-style: none; margin: 0; padding-left: 16px; }
-#font-tables ul.tree { padding-left: 0; }
-.tree-row { display: flex; gap: 6px; padding: 1px 2px; white-space: nowrap; }
-.tree-row.openable { cursor: pointer; }
-.tree-row:hover { background: var(--vscode-list-hoverBackground); }
-.twisty { width: 12px; flex: none; opacity: 0.8; }
+#font-tables .tree { line-height: 20px; white-space: nowrap; outline: none; }
+#font-tables .children { margin-left: 12px; }
+#font-tables .children > .select, #font-tables .tree > .select { padding-left: 22px; }
+#font-tables .select { display: inline-flex; gap: 6px; padding-right: 2px; }
+#font-tables div.select { display: flex; }
+#font-tables .select:hover { background: var(--vscode-list-hoverBackground); }
+#font-tables .select.cursor { background: var(--vscode-list-inactiveSelectionBackground); }
+#font-tables .tree:focus .select.cursor { color: var(--vscode-list-activeSelectionForeground); background: var(--vscode-list-activeSelectionBackground); }
 .tree-key { color: var(--vscode-symbolIcon-propertyForeground, var(--vscode-editor-foreground)); }
 .tree-key:not(:empty)::after { content: ':'; }
 .tree-value.string { color: var(--vscode-debugTokenExpression-string); }
@@ -101,21 +103,10 @@ body.tensors { display: flex; flex-direction: column; }
   border-bottom: 1px solid var(--vscode-editorWidget-border);
   font-size: 12px;
 }
-#insp-bar button {
-  padding: 1px 8px;
-  color: var(--vscode-button-secondaryForeground);
-  background: var(--vscode-button-secondaryBackground);
-  border: none;
-  border-radius: 3px;
-  cursor: pointer;
-}
-#insp-bar button:hover { background: var(--vscode-button-secondaryHoverBackground); }
-#insp-bar label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
-.insp-sep { width: 1px; height: 14px; background: var(--vscode-editorWidget-border); }
 #insp-title, #insp-zoom { min-width: 3.5em; text-align: center; }
 #insp-view { flex: 1; min-height: 0; position: relative; overflow: hidden; }
-#insp-view svg { position: absolute; inset: 0; display: block; cursor: grab; touch-action: none; user-select: none; }
-#insp-view svg:active { cursor: grabbing; }
+#insp-view > svg { position: absolute; inset: 0; display: block; cursor: grab; touch-action: none; user-select: none; }
+#insp-view > svg:active { cursor: grabbing; }
 
 .insp-minor { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.12; fill: none; }
 .insp-major { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.3; fill: none; }
@@ -129,7 +120,7 @@ body.tensors { display: flex; flex-direction: column; }
 .insp-polygon { fill: none; stroke: var(--vscode-charts-orange); stroke-width: 1; stroke-opacity: 0.7; stroke-dasharray: 3 2; }
 .insp-pt { stroke: var(--vscode-editor-background); stroke-width: 1; }
 .insp-pt.k0, .insp-pt.k1 { fill: var(--vscode-charts-green); }
-.insp-pt.k0 { fill: var(--vscode-charts-red); }
+.insp-pt.k0, .insp-pt.k4 { fill: var(--vscode-charts-red); }
 .insp-pt.k2, .insp-pt.k3 { fill: var(--vscode-charts-orange); }
 .insp-pt.hover, .insp-pt.picked { stroke: var(--vscode-editor-foreground); stroke-width: 1.5; }
 .insp-num { font-size: 9px; fill: var(--vscode-editor-foreground); opacity: 0.8; pointer-events: none; }
@@ -137,26 +128,11 @@ body.tensors { display: flex; flex-direction: column; }
 #insp-edit { display: flex; align-items: center; gap: 8px; }
 #insp-edit.hidden { display: none; }
 
-#insp-menu {
-  position: fixed;
-  z-index: 50;
-  min-width: 220px;
-  padding: 4px 0;
-  font-size: 12px;
-  color: var(--vscode-menu-foreground, var(--vscode-foreground));
-  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
-  border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border));
-  border-radius: 5px;
-  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
-}
-.menu-item { display: flex; justify-content: space-between; gap: 24px; padding: 3px 16px; cursor: pointer; }
-.menu-item:hover { color: var(--vscode-menu-selectionForeground); background: var(--vscode-menu-selectionBackground); }
-.menu-item.disabled { opacity: 0.4; cursor: default; }
-.menu-item.disabled:hover { color: inherit; background: none; }
-.menu-keys { opacity: 0.7; }
-.menu-sep { height: 1px; margin: 4px 0; background: var(--vscode-menu-separatorBackground, var(--vscode-editorWidget-border)); }
-
-.insp-hit { fill: none; stroke: transparent; stroke-width: 10; pointer-events: stroke; cursor: move; }
+.insp-hit { fill: none; stroke: transparent; stroke-width: 10; pointer-events: stroke; cursor: inherit; }
+.insp-pt { cursor: inherit; }
+.insp-xf-box { fill: var(--vscode-focusBorder); fill-opacity: 0.05; stroke: var(--vscode-focusBorder); stroke-width: 1; pointer-events: none; }
+.insp-xf-grid { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 1; stroke-opacity: 0.4; pointer-events: none; }
+.insp-xf-handle { fill: var(--vscode-editor-background); stroke: var(--vscode-focusBorder); stroke-width: 1.5; pointer-events: none; }
 .insp-selected { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 3; opacity: 0.8; pointer-events: none; }
 .insp-pt.in-contour { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
 

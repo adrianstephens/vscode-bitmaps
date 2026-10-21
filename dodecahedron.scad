@@ -15,7 +15,7 @@ letterSets = [
 	["A", "C", "E", "G", "L", "N", "O", "Qu", "R", "T", "U", "W"],
 	["A", "C", "D", "E", "G", "I", "L", "N", "O", "P", "T", "W"],
 ];
-set = -3;
+set = -2;
 
 edge = 20;						// edge length
 inradius = edge / 2 * sqrt(5 / 2 + 11 / (2 * sqrt(5)));	// centre to a face
@@ -88,24 +88,35 @@ tray_h         = tray_floor + tray_wall_h;
 // one centre die, six in a ring around it
 tray_centres = [[0, 0], for (a = [0 : 60 : 300]) [tray_spacing * cos(a), tray_spacing * sin(a)]];
 
-module tray_footprint(r)
+module tray_holes(r)
 	for (c = tray_centres)
 		translate(c) circle(r = r);
 
 module tray_area(r, off)
-	offset(r = off) hull() tray_footprint(r);
+	offset(r = off) hull() tray_holes(r);
 
 module tray() {
+/*	color([1,1,1], $metallic=1) union() {
 	difference() {
-		linear_extrude(tray_h) tray_area(cell_r, tray_wall);
+		linear_extrude(tray_h) tray_area(cell_r, tray_wall * 2);
 		translate([0, 0, tray_floor])
 			linear_extrude(tray_wall_h + 1)
-				tray_footprint(cell_r);	// each die's own circle, not hulled together: a wall runs between every pair too
+				tray_holes(cell_r);
+	}
+
+	difference() {
+		linear_extrude(tray_h) tray_area(cell_r, tray_wall * 2 + 3);
+		translate([0,0,4]) linear_extrude(tray_h) tray_area(cell_r, tray_wall * 2 + 1.5);
+	}
+	}
+*/	difference() {
+		linear_extrude(tray_h) tray_area(cell_r, tray_wall * 3);
+		translate([0,0,1]) linear_extrude(tray_h) tray_area(cell_r, tray_wall * 3 - 1);
 	}
 }
 
 module lid() {
-//	color([0,1,0]) tray();
+	color([0,1,0]) tray();
 	fit     = 0.4;								// total clearance so the lid slips over the tray's wall rather than jamming
 	cavity  = 2 * die_r + 30;	// together with the tray's own wall height, enough for a die to tumble
 
@@ -114,7 +125,8 @@ module lid() {
 	//	sphere(r = 20);
 	//}
 
-	color([1,0,0,1])
+//	color(function(x, y, z) [x, y, z] / 100)
+	color([0.5,0.5,0.5,0])
 	translate([0,0,14])
 	rotate([0,0,0]) {
 	difference() {

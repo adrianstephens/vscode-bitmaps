@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
 import { Model, Mesh, Material, Attribute, placed, faceTriangles, formatOf } from '@isopodlabs/binary_meshes';
-import { buildIndex } from './scad/fonts';
+import { buildIndex } from './fonts';
 import type { MeshData, InstanceData, TextureData, MessageIn, MessageOut } from '../webview/mesh';
 
 import { setActiveViewer, readShader, digitAtlas } from './extension';
@@ -49,7 +49,14 @@ function meshData(mesh: Mesh, materials: Material[], textures: (TextureData | un
 		return mesh.uvs && t !== undefined && textures[t] ? t : -1;
 	};
 	const order = mesh.faces.map((_, f) => f).sort((a, b) => textureOf(a) - textureOf(b));
-	const corners = order.flatMap(f => faceTriangles(mesh, mesh.faces[f]).flat().map(k => ({f, k})));
+	// a triangle's sides that are sides of the file's face too, not cuts across it, as bits 0, 1, 2 for v0-v1, v1-v2, v2-v0
+	const corners = order.flatMap(f => {
+		const n = mesh.faces[f].length, side = (a: number, b: number) => (b - a + n) % n === 1 || (a - b + n) % n === 1;
+		return faceTriangles(mesh, mesh.faces[f]).flatMap(([a, b, c]) => {
+			const edges = (side(a, b) ? 1 : 0) | (side(b, c) ? 2 : 0) | (side(c, a) ? 4 : 0);
+			return [a, b, c].map(k => ({f, k, edges}));
+		});
+	});
 
 	const n			= corners.length;
 	const positions	= new Float32Array(n * 3);
@@ -60,7 +67,9 @@ function meshData(mesh: Mesh, materials: Material[], textures: (TextureData | un
 	const textured	= order.some(f => textureOf(f) >= 0);
 	const uvs		= textured ? new Float32Array(n * 2) : undefined;
 	const faces		= new Float32Array(n);
-	corners.forEach(({f, k}, i) => {
+	const edges		= new Float32Array(n);
+	corners.forEach(({f, k, edges: e}, i) => {
+		edges[i] = e;
 		const v = mesh.faces[f][k], p = mesh.points[v];
 		positions.set([p.x, p.y, p.z], i * 3);
 		const normal = valueAt(smooth, f, k, v);
@@ -86,7 +95,7 @@ function meshData(mesh: Mesh, materials: Material[], textures: (TextureData | un
 	});
 
 	const lines = new Float32Array((mesh.lines ?? []).flatMap(l => l.slice(1).flatMap((v, j) => [l[j], v])).flatMap(v => [mesh.points[v].x, mesh.points[v].y, mesh.points[v].z]));
-	return {positions, normals, colors, uvs, faces, runs, lines, ...faceLabels(mesh, materials)};
+	return {positions, normals, colors, uvs, faces, edges, runs, lines, ...faceLabels(mesh, materials)};
 }
 
 // a texture's pixels, by what its bytes say it is
@@ -97,7 +106,7 @@ async function decode(data: Uint8Array): Promise<TextureData> {
 		: data[0] === 0x47 && data[1] === 0x49 ? bitmap.GIF.load(data)
 		: bitmap.TGA.load(data);
 	const {width, height, pixels} = await image.getPixels({plane: 'RGBA'});
-	return {width, height, pixels: new Uint8Array(pixels)};
+	return {width, height, data: new Uint8ClampedArray(pixels)};
 }
 
 // the model as the page takes it; y up for the formats whose files are usually drawn so

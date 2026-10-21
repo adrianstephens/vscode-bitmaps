@@ -9,9 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as bin from '@isopodlabs/binary';
-import { load, loadAsync, Font, bezier2Curve, curvepathDistance2, mapCurve } from '@isopodlabs/binary_fonts';
+import { load, loadAsync, Font, bezier2Curve, mapCurve } from '@isopodlabs/binary_fonts';
 import { float2 } from '@isopodlabs/maths/vector';
-import type { ScadFiles } from './evaluate';
+import type { ScadFiles } from './filereader';
 
 //-----------------------------------------------------------------------------
 // finding a font by name
@@ -131,7 +131,7 @@ export function findFont(family: string, style: string | undefined, files: ScadF
 	let font = fontCache.get(key);
 
 	if (!font) {
-		const result = files?.readBinary(entry.filePath, bytes => load(bytes));
+		const result = files?.read(entry.filePath, 'font', bytes => load(bytes));
 		if (result) {
 			font = result instanceof Font ? result : result.fonts[entry.ttcIndex ?? 0];
 			fontCache.set(key, font);

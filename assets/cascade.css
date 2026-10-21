@@ -1,0 +1,173 @@
+/* the menu of icons brought up at the pointer (webview/cascade.ts) */
+.cascade {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.cascade-strip {
+  position: absolute;
+  display: flex;
+}
+
+.cascade-strip.shown {
+  pointer-events: auto;
+}
+
+.cascade-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-widget-border, transparent));
+  border-radius: 6px;
+  box-shadow: 0 1px 5px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+  cursor: pointer;
+  user-select: none;
+  /* in from the icon it came out of, one after another */
+  opacity: 0;
+  transform: translate(var(--dx, 0), var(--dy, 0)) scale(0.4);
+  transition: transform 110ms ease-out, opacity 90ms ease-out;
+  transition-delay: calc(var(--i, 0) * 12ms);
+}
+
+.cascade-strip.shown .cascade-button {
+  opacity: 1;
+  transform: none;
+}
+
+.cascade-strip.closing .cascade-button {
+  transition-duration: 80ms;
+  transition-delay: 0ms;
+}
+
+.cascade-button.open {
+  background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+}
+
+.cascade-button.active {
+  color: var(--vscode-inputOption-activeForeground, inherit);
+  background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-activeBackground));
+  border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));
+}
+
+/* an icon the wheel changes: a mark in the corner */
+.cascade-button.wheel {
+  background-image: linear-gradient(135deg, transparent 80%, var(--vscode-focusBorder) 80%);
+}
+
+.cascade-value {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.cascade-value small {
+  font-size: 8px;
+  font-weight: normal;
+  opacity: 0.8;
+}
+
+.cascade-swatch {
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--vscode-editorWidget-border, #888);
+  border-radius: 3px;
+}
+
+.cascade-swatch2 {
+  position: relative;
+  width: 20px;
+  height: 20px;
+}
+
+.cascade-swatch2 span {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  border: 1px solid var(--vscode-editorWidget-border, #888);
+  border-radius: 2px;
+}
+
+.cascade-swatch2 span:first-child {
+  right: 0;
+  bottom: 0;
+}
+
+.cascade-swatch2 span:last-child {
+  left: 0;
+  top: 0;
+}
+
+/* a bar through a strip of presets, filled to where the value is: along the bottom of a strip across, the right of one down */
+.cascade-gauge {
+  position: absolute;
+  bottom: 4px;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vscode-foreground, #888) 10%, transparent);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.cascade-gauge.vertical {
+  bottom: auto;
+  right: 4px;
+  width: 3px;
+  height: auto;
+}
+
+.cascade-strip.shown .cascade-gauge {
+  opacity: 1;
+  transition-delay: calc(var(--n, 0) * 12ms + 90ms);
+}
+
+.cascade-gauge div {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--vscode-focusBorder, #0078d4);
+}
+
+/* what the icon under the pointer is, beside it */
+.cascade-caption {
+  position: absolute;
+  padding: 2px 6px;
+  font-size: 0.85em;
+  white-space: nowrap;
+  color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+  background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-widget-border, transparent));
+  border-radius: 3px;
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.cascade-caption.shown {
+  opacity: 1;
+}
+
+/* a layer or slice, small, in a strip of them */
+.cascade-thumb {
+  max-width: 26px;
+  max-height: 26px;
+  image-rendering: pixelated;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* an icon being dragged to another place in its strip */
+.cascade-button.dragging {
+  cursor: grabbing;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+}

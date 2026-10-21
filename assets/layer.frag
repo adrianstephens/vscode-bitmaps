@@ -13,10 +13,17 @@ uniform float		u_opacity;		// how much of the layer shows (0..1): its opacity, w
 uniform float		u_floor;		// the least of it that shows of what its mask and clipping take away, and its opacity
 uniform float		u_veil;			// how much of a veil is over the layer
 uniform vec4		u_outline;		// premultiplied
+uniform vec2		u_clipSize;		// what lies outside this, from the corner at 0, is not drawn (nothing is clipped if it is 0)
 in vec2				v_uv;
+in vec3				v_clip;
 out vec4			fragColor;
 
 void main() {
+	if (u_clipSize.x > 0.0) {
+		vec2 q = v_clip.xy / v_clip.z;
+		if (v_clip.z <= 0.0 || any(lessThan(q, vec2(0.0))) || any(greaterThan(q, u_clipSize)))
+			discard;
+	}
 	vec4 colour	= texture(u_texture, v_uv);
 	colour		= vec4(colour.rgb * colour.a, colour.a);
 

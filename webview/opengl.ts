@@ -1,11 +1,11 @@
+import { float2, float3, normalise, float4x4 } from '@isopodlabs/maths/vector';
+
 // anything with pixels: an ImageData, or a bare {data, width, height}
-export interface PixelData {
-	data: Uint8Array | Uint8ClampedArray;
-	width: number;
+export interface Pixels {
+	data:	Uint8ClampedArray<ArrayBuffer> | Float32Array<ArrayBuffer>;
+	width:	number;
 	height: number;
 }
-
-import { float2, float3, normalise } from '@isopodlabs/maths/vector';
 
 //-----------------------------------------------------------------------------
 // shaders
@@ -32,11 +32,11 @@ function uniformSetter(gl: WebGL2RenderingContext, type: number, loc: WebGLUnifo
     	case gl.FLOAT_MAT4x3:	return value => gl.uniformMatrix4x3fv(loc, false, value);
 
 		case gl.BOOL_VEC2:
-		case gl.INT_VEC2:  	return value => gl.uniform2i(loc, value[0], value[1]);
+		case gl.INT_VEC2:  		return value => gl.uniform2i(loc, value[0], value[1]);
 		case gl.BOOL_VEC3:
-		case gl.INT_VEC3:  	return value => gl.uniform3i(loc, value[0], value[1], value[2]);
+		case gl.INT_VEC3:  		return value => gl.uniform3i(loc, value[0], value[1], value[2]);
 		case gl.BOOL_VEC4:
-		case gl.INT_VEC4:  	return value => gl.uniform4i(loc, value[0], value[1], value[2], value[3]);
+		case gl.INT_VEC4:  		return value => gl.uniform4i(loc, value[0], value[1], value[2], value[3]);
 
 		default:
 		case gl.BOOL:
@@ -223,6 +223,7 @@ function textureFormat(gl: WebGL2RenderingContext, format: TextureFormat) {
 function newTexture(gl: WebGL2RenderingContext, target: number, options: TextureOptions = {}) {
 	const filter = (f: Filter) => f === 'nearest' ? gl.NEAREST : gl.LINEAR;
 	const texture = gl.createTexture();
+	gl.activeTexture(gl.TEXTURE0);
 	gl.bindTexture(target, texture);
 	gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 	gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, filter(options.min ?? 'linear'));
@@ -254,7 +255,7 @@ export async function getImageData(image: ImageData, type: string) {
 	return offscreen.convertToBlob({type});
 }
 
-export function getPixel(image: ImageData, x: number, y: number) {
+export function getPixel(image: Pixels, x: number, y: number) {
 	if (x < 0 || y < 0 || x >= image.width || y >= image.height)
 		return;
 	const offset = (y * image.width + x) * 4;
@@ -267,7 +268,7 @@ export function getPixel(image: ImageData, x: number, y: number) {
 }
 
 
-function setPixel(image: ImageData, x: number, y: number, colour: {r: number, g: number, b: number}) {
+export function setPixel(image: Pixels, x: number, y: number, colour: {r: number, g: number, b: number}) {
 	const index = (y * image.width + x) * 4;
 	image.data[index + 0] = Math.max(Math.min(colour.r, 255), 0);
 	image.data[index + 1] = Math.max(Math.min(colour.g, 255), 0);
@@ -296,7 +297,7 @@ function getScreenRayDirection(rect: DOMRect, x: number, y: number, fovy: number
 	return normalise(float3(ndcX * aspect / fovy, ndcY / fovy, -1));
 }
 
-function pointerToCanvas(rect: DOMRect, x: number, y: number): float2 {
+export function pointerToCanvas(rect: DOMRect, x: number, y: number): float2 {
 	const pixelRatio  = window.devicePixelRatio || 1;
 	return float2((x - rect.left) * pixelRatio, (y - rect.top) * pixelRatio);
 }
@@ -311,7 +312,8 @@ export interface Offscreen {
 	framebuffer:	WebGLFramebuffer;
 	begin(layer?: number): void;						// layer: the slice of a 3D texture the passes draw into
 	end(): void;
-	readPixels(out: Float32Array | Uint8Array, layer?: number): void;	// the colour attachment, in the format the offscreen was made with
+	readPixels(rect?: float2.extent, layer?: number): Float32Array | Uint8ClampedArray;	// the colour attachment, in the format the offscreen was made with
+	readPixelsTo(out: Float32Array | Uint8ClampedArray, rect?: float2.extent, layer?: number): void;	// the colour attachment, in the format the offscreen was made with
 	delete(keepTexture?: boolean): void;				// keepTexture: the texture is the caller's now (it is the display texture)
 }
 
@@ -327,6 +329,13 @@ function makeOffscreen(gl: WebGL2RenderingContext, texture: WebGLTexture, frameb
 	}
 	gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
+	function readPixels(out: Float32Array | Uint8ClampedArray, x: number, y: number, w: number, h: number, layer: number) {
+		gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+		attach?.(layer);
+		gl.readPixels(x, y, w, h, f.format, f.type, out);
+		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+	};
+
 	return {
 		texture,
 		framebuffer,
@@ -338,11 +347,15 @@ function makeOffscreen(gl: WebGL2RenderingContext, texture: WebGLTexture, frameb
 		end() {
 			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 		},
-		readPixels(out, layer = 0) {
-			// rows come back from y=0 up, so a texture whose row 0 is the first row of the data needs no reversal
-			gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-			attach?.(layer);
-			gl.readPixels(0, 0, width, height, f.format, f.type, out);
+		readPixelsTo(out, rect, layer = 0) {
+			const {x, y}	= rect?.min ?? {x: 0, y: 0}, {x: w, y: h} = rect?.extent() ?? {x: width, y: height};
+			readPixels(out, x, y, w, h, layer);
+		},
+		readPixels(rect, layer = 0) {
+			const {x, y}	= rect?.min ?? {x: 0, y: 0}, {x: w, y: h} = rect?.extent() ?? {x: width, y: height};
+			const out 		= new (f.type === gl.FLOAT ? Float32Array : Uint8ClampedArray)(w * h * 4);
+			readPixels(out, x, y, w, h, layer);
+			return out;
 		},
 		delete(keepTexture = false) {
 			gl.deleteFramebuffer(framebuffer);
@@ -400,7 +413,7 @@ export class Canvas3D {
 	createVao(program: WebGLProgram, attrib: string, componentCount: number, data: Float32Array) {
 		return createVao(this.gl, program, attrib, componentCount, data);
 	}
-	createTextureFromImage(image: PixelData, options?: TextureOptions) {
+	createTextureFromImage(image: Pixels, options?: TextureOptions) {
 		const gl = this.gl;
 		const texture = newTexture(gl, gl.TEXTURE_2D, options);
 		const f = textureFormat(gl, options?.format ?? 'rgba8');
@@ -409,14 +422,34 @@ export class Canvas3D {
 		return texture;
 	}
 	// bring a texture up to date with the pixels of a rectangle of the image it was made from (all of it, without a rect)
-	updateTexture(texture: WebGLTexture, image: PixelData, rect?: {x: number, y: number, w: number, h: number}) {
+	updateTexture(texture: WebGLTexture, image: Pixels, rect?: float2.extent) {
 		const gl = this.gl;
-		const r = rect ?? {x: 0, y: 0, w: image.width, h: image.height};
+		const {x, y} = rect?.min ?? float2(0, 0), {x: w, y: h} = rect?.extent() ?? float2(image.width, image.height);
 		gl.bindTexture(gl.TEXTURE_2D, texture);
 		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, image.width);
-		gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x, r.y, r.w, r.h, gl.RGBA, gl.UNSIGNED_BYTE, image.data, (r.y * image.width + r.x) * 4);
+		gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, image.data, (y * image.width + x) * 4);
 		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
 		gl.bindTexture(gl.TEXTURE_2D, null);
+	}
+	// one face of a cube texture, or a part of it
+	updateCubeFace(texture: WebGLTexture, face: number, image: Pixels, rect?: float2.extent) {
+		const gl = this.gl;
+		const {x, y} = rect?.min ?? float2(0, 0), {x: w, y: h} = rect?.extent() ?? float2(image.width, image.height);
+		gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, image.width);
+		gl.texSubImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, image.data, (y * image.width + x) * 4);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+		gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+	}
+	// one slice of an array texture, or a part of it
+	updateTextureLayer(texture: WebGLTexture, layer: number, image: Pixels, rect?: float2.extent) {
+		const gl = this.gl;
+		const {x, y} = rect?.min ?? float2(0, 0), {x: w, y: h} = rect?.extent() ?? float2(image.width, image.height);
+		gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, image.width);
+		gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, x, y, layer, w, h, 1, gl.RGBA, gl.UNSIGNED_BYTE, image.data, (y * image.width + x) * 4);
+		gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+		gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
 	}
 	// a texture of raw bytes (no pixels), which null data leaves empty for texSubImage2D to fill; integer formats need
 	// nearest filtering, which the caller's options must give
@@ -428,7 +461,7 @@ export class Canvas3D {
 		gl.bindTexture(gl.TEXTURE_2D, null);
 		return texture;
 	}
-	createCubeTextureFromImage(image: PixelData, options?: TextureOptions) {
+	createCubeTextureFromImage(image: Pixels, options?: TextureOptions) {
 		const gl = this.gl;
 		const texture = newTexture(gl, gl.TEXTURE_CUBE_MAP, options);
 		const f = textureFormat(gl, options?.format ?? 'rgba8');
@@ -449,7 +482,7 @@ export class Canvas3D {
 		gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
 		return texture;
 	}
-	create2DArrayTexture(image: PixelData, layers: number, options?: TextureOptions) {
+	create2DArrayTexture(image: Pixels, layers: number, options?: TextureOptions) {
 		const gl = this.gl;
 		const texture = newTexture(gl, gl.TEXTURE_2D_ARRAY, options);
 		const f = textureFormat(gl, options?.format ?? 'rgba8');
@@ -465,7 +498,7 @@ export class Canvas3D {
 		gl.bindTexture(gl.TEXTURE_3D, null);
 		return texture;
 	}
-	create3DTextureFromImage(image: PixelData, depth: number, options?: TextureOptions) {
+	create3DTextureFromImage(image: Pixels, depth: number, options?: TextureOptions) {
 		return this.create3DTexture([image.width, image.height / depth, depth], image.data, options);
 	}
 

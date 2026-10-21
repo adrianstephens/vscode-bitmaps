@@ -148,6 +148,16 @@
 				]
 			},
 			{
+				"viewType": "svg.viewer",
+				"displayName": "SVG Editor",
+				"priority": "default",
+				"selector": [
+					{
+						"filenamePattern": "*.svg"
+					}
+				]
+			},
+			{
 				"viewType": "scad.viewer",
 				"displayName": "OpenSCAD SDF Viewer",
 				"priority": "option",
@@ -163,11 +173,6 @@
 				"command": "bitmap.fit",
 				"title": "Fit to Window",
 				"icon": "$(screen-normal)"
-			},
-			{
-				"command": "bitmap.reset",
-				"title": "Reset Zoom",
-				"icon": "$(refresh)"
 			},
 			{
 				"command": "gguf.previousSlice",
@@ -193,6 +198,11 @@
 				"command": "scad.exportCsg",
 				"title": "Export CSG…",
 				"icon": "$(file-code)"
+			},
+			{
+				"command": "bitmap.toCubemap",
+				"title": "Make Cubemap from Image",
+				"category": "Bitmap"
 			},
 			{
 				"command": "bitmap.fill",
@@ -284,12 +294,7 @@
 				},
 				{
 					"command": "bitmap.fit",
-					"when": "activeCustomEditorId == bitmap.viewer || activeCustomEditorId == gguf.viewer || activeCustomEditorId == scad.viewer || activeCustomEditorId == mesh.viewer",
-					"group": "navigation"
-				},
-				{
-					"command": "bitmap.reset",
-					"when": "activeCustomEditorId == bitmap.viewer || activeCustomEditorId == gguf.viewer || activeCustomEditorId == scad.viewer || activeCustomEditorId == mesh.viewer",
+					"when": "activeCustomEditorId == bitmap.viewer || activeCustomEditorId == gguf.viewer || activeCustomEditorId == scad.viewer || activeCustomEditorId == mesh.viewer || activeCustomEditorId == svg.viewer",
 					"group": "navigation"
 				},
 				{
@@ -301,6 +306,11 @@
 					"command": "gguf.nextSlice",
 					"when": "activeCustomEditorId == gguf.viewer",
 					"group": "navigation@3"
+				},
+				{
+					"command": "bitmap.toCubemap",
+					"when": "activeCustomEditorId == bitmap.viewer",
+					"group": "3_convert@0"
 				},
 				{
 					"command": "bitmap.fill",
@@ -412,6 +422,7 @@
 		"@isopodlabs/maths": "^1.0.0",
 		"@isopodlabs/tison": "^0.1.0",
 		"@isopodlabs/utilities": "^1.10.0",
-		"@isopodlabs/vscode_utils": "^0.7.0"
+		"@isopodlabs/vscode_utils": "^0.7.0",
+		"@isopodlabs/xml": "^1.2.0"
 	}
 }

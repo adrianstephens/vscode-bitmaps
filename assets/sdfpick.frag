@@ -14,6 +14,7 @@ uniform float	u_pickMode;	// which of the three answers this pass reads back: 0 
 							// pixel at a time and never more than a few of these a second.
 out vec4		fragColor;
 
+vec3			g_hit = vec3(0.0);
 int				g_steps = 0;	// trace() keeps a count for the main shader's heatmap; unused here, but it still writes to it
 
 //@lib
@@ -102,8 +103,10 @@ void main() {
 			fragColor = vec4(hit, 1.0);
 		else if (u_pickMode < 1.5)
 			fragColor = vec4(normalAt(hit, scale * 5e-4), mat);
-		else
+		else {
+			g_hit = hit;
 			fragColor = vec4(matColor(mat), matOpacity(mat));
+		}
 		return;
 	}
 	if (u_floorOn > 0.5) {

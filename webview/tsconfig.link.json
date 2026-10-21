@@ -1,6 +1,6 @@
 {
 	"extends": "./tsconfig.json",
 	"references": [
-		{ "path": "../../../packages/maths" }
+		{ "path": "../../../packages/maths/tsconfig.esm.json" }
 	]
 }

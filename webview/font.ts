@@ -1,6 +1,11 @@
 // The font viewer's page: a grid of the font's glyphs, drawn from outlines the extension sends as they scroll into
 // view, a line of sample text set in the font, and the metrics of the glyph that is selected.
-import { vscode, RPC, handleResult, Splitter } from '@isopodlabs/vscode_utils/webview/shared.js';
+import { vscode, createElement, createSVGElement, RPC, handleResult, Splitter } from '@isopodlabs/vscode_utils/webview/shared.js';
+import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
+import { PathEditor, ViewOptions, svgPath } from './pathedit.js';
+import { svgFace, toggleItem, type CascadeItem } from './cascade.js';
+import { createSession } from './svgsession.js';
+import type { curveVertex } from '@isopodlabs/binary_fonts';
 
 export interface FontInfo {
 	file:		string;
@@ -31,11 +36,13 @@ export interface TableNode {
 // what the inspector draws of a glyph
 export interface GlyphDetail {
 	path:		string;			// its outline, y down
-	points:		number[];		// x, y (down), flags of each point as the font stores them; flags 0 begins a contour
+	points:		curveVertex[];	// each point as the font stores it, y down; flags 0 begins a contour
 	markup:		string;			// its drawing, in colour where it has one
 	colored?:	boolean;		// whether that drawing has colours of its own
 	components:	number[];		// the glyphs a composite is made of
 	error?:		string;			// why its outline could not be read
+	svg?:		{text: string, editable: boolean};	// its drawing in colour, as a document of its own: edited in place of its outline
+	bitmap?:	{ppem: number, editable: boolean};	// the picture it has at the largest size, which the bitmap editor can open
 }
 
 export type MessageOut =
@@ -47,14 +54,18 @@ export type MessageOut =
 	| {command: 'getGlyphDetail', id: number}
 	| {command: 'status', text: string}
 	| {command: 'convertFont'}
-	| {command: 'editGlyph', id: number, points: number[], label: string};
+	| {command: 'editGlyph', id: number, points: curveVertex[], label: string}
+	| {command: 'editGlyphSvg', id: number, text: string, label: string}
+	| {command: 'editGlyphBitmap', id: number}
+	| {command: 'shapePoints', name: string, attributes: Record<string, string>}
+	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean}
+	| {command: 'fitStroke', stroke: number[], tol: number};
 
 export type MessageIn =
 	| {command: 'font', info: FontInfo}
-	| {command: 'glyphChanged', id: number}
+	| {command: 'glyphChanged', id: number, own?: boolean}
 	| {command: 'error', message: string}
-	| {command: 'fitToWindow'}
-	| {command: 'resetZoom'};
+	| {command: 'fitToWindow'};
 
 const $		= <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const post	= (message: MessageOut) => vscode.postMessage(message);
@@ -70,7 +81,7 @@ const mappedIn	= $<HTMLInputElement>('font-unicode');
 const faceSel	= $<HTMLSelectElement>('font-face');
 const errorBox	= $('scad-error');
 
-const SVG = 'http://www.w3.org/2000/svg';
+const num = (n: number) => +n.toFixed(2);
 
 let info:		FontInfo | undefined;
 let shown:		number[] = [];						// the glyph ids in the grid
@@ -85,8 +96,7 @@ const char = (cp: number) => cp < 0x20 || (cp >= 0x7F && cp < 0xA0) ? '' : Strin
 function glyphSvg(id: number, guides = false) {
 	const f = info!;
 	const adv = f.advances[id] ?? f.unitsPerEm, pad = f.unitsPerEm * 0.1;
-	const svg = document.createElementNS(SVG, 'svg');
-	svg.setAttribute('viewBox', `${-pad} ${-f.ascent - pad} ${adv + pad * 2} ${f.ascent - f.descent + pad * 2}`);
+	const svg = createSVGElement('svg', {viewBox: `${-pad} ${-f.ascent - pad} ${adv + pad * 2} ${f.ascent - f.descent + pad * 2}`});
 	svg.dataset.glyph = String(id);
 	if (guides) {
 		const w = f.unitsPerEm / 200;
@@ -102,16 +112,21 @@ function glyphSvg(id: number, guides = false) {
 	return svg;
 }
 
+// a glyph's drawing with its ids its own, since the ids of different glyphs' gradients and parts would otherwise meet in one page
+function scopeIds(markup: string, id: number) {
+	if (!markup.includes('id="'))
+		return markup;
+	const prefix = `g${id}-`;
+	return markup.replace(/\bid="([^"]*)"/g, `id="${prefix}$1"`).replace(/url\(#([^)]+)\)/g, `url(#${prefix}$1)`).replace(/href="#/g, `href="#${prefix}`);
+}
+
 // draws the glyph's outlines into an <svg> if they are here, and asks for them if not
 const waiting = new Map<number, Set<SVGElement>>();
 function fill(svg: SVGElement, id: number) {
 	const m = markup.get(id);
 	if (m !== undefined) {
 		svg.querySelector('.outline')?.remove();
-		const g = document.createElementNS(SVG, 'g');
-		g.setAttribute('class', 'outline');
-		g.innerHTML = m;
-		svg.appendChild(g);
+		svg.appendChild(createSVGElement('g', {class: 'outline'}, {innerHTML: scopeIds(m, id)}));
 		return;
 	}
 	if (!waiting.has(id))
@@ -172,13 +187,9 @@ function buildGrid() {
 			shown.push(id);
 	const frag = document.createDocumentFragment();
 	for (const id of shown) {
-		const cell = document.createElement('div');
-		cell.className = 'glyph-cell';
-		cell.dataset.id = String(id);
-		const label = document.createElement('span');
+		const cell = createElement('div', {className: 'glyph-cell', dataset: {id: String(id)}});
 		const cp = f.unicodes[id]?.[0];
-		label.textContent = cp !== undefined ? hex(cp) : `#${id}`;
-		cell.appendChild(label);
+		cell.appendChild(createElement('span', {textContent: cp !== undefined ? hex(cp) : `#${id}`}));
 		frag.appendChild(cell);
 	}
 	grid.appendChild(frag);
@@ -223,7 +234,7 @@ function select(id: number) {
 }
 
 function table(rows: [string, string][]) {
-	const t = document.createElement('table');
+	const t = createElement('table');
 	for (const [k, v] of rows) {
 		const tr = t.insertRow();
 		tr.insertCell().textContent = k;
@@ -244,57 +255,211 @@ const inspStatus = {
 			post({command: 'status', text: lastStatus = text});
 	}
 };
-const inspOption	= (name: string) => $<HTMLInputElement>('insp-' + name).checked;
-const inspSvg		= document.createElementNS(SVG, 'svg');
-inspView.appendChild(inspSvg);
-
-const KIND = ['begin', 'on-curve', 'quadratic control', 'cubic control'];
 
 let inspecting	= -1;
 let glyph:		GlyphDetail | undefined;
-let view		= {x: 0, y: 0, s: 1};		// screen = world * s + (x, y), the world being the font's, y down
-let hover		= -1;
-let gridStep	= 1;				// the grid's spacing as last drawn, which points snap to
-let picked		= -1;
-let pickedContour = -1;			// where the selected contour begins, when a whole contour is selected, or -1
+let colourMode	= false;		// whether the glyph's drawing in colour is what is edited, and not its outline
+
+// the glyph's outline, drawn over its metrics in the view the SVG editor shares, and edited as points
+class GlyphEditor extends PathEditor {
+	protected extraViews = ['metrics', 'fill'];
+	protected yUp = true;
+	
+	points()				{ return glyph?.points; }
+	simplifyPoints(points: curveVertex[], tol: number) { return RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: false}); }
+	// a glyph is edited when the font can be written and the glyph is a plain outline (not made of other glyphs)
+	canEdit()				{ return !!(info?.editable && glyph && !glyph.components.length && !glyph.error); }
+	active()				{ return !!info && inspecting >= 0 && !colourMode; }
+	status(text: string)	{ inspStatus.textContent = text; }
+
+	commit(label: string) {
+		if (inspecting >= 0 && glyph)
+			post({command: 'editGlyph', id: inspecting, points: glyph.points, label});
+	}
+
+	draw() {
+		super.draw();
+	}
+
+	// the extent of what the glyph occupies: its advance and the font's vertical metrics, and any ink outside them
+	bounds() {
+		const f = info!;
+		let x0 = 0, x1 = f.advances[inspecting] || f.unitsPerEm, y0 = -f.ascent, y1 = -f.descent;
+		const p = glyph?.points ?? [];
+		for (const v of p) {
+			x0 = Math.min(x0, v.x);
+			x1 = Math.max(x1, v.x);
+			y0 = Math.min(y0, v.y);
+			y1 = Math.max(y1, v.y);
+		}
+		return {x0, y0, x1, y1};
+	}
+
+	metricGuides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) {
+		return this.guides(X, Y, w, h);
+	}
+
+	protected guides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) {
+		const f = info!, adv = f.advances[inspecting] ?? 0;
+		const line = (cls: string, x1: number, y1: number, x2: number, y2: number, label: string, lx: number, ly: number) =>
+			`<line class="${cls}" x1="${num(x1)}" y1="${num(y1)}" x2="${num(x2)}" y2="${num(y2)}"/><text class="insp-metric" x="${num(lx)}" y="${num(ly)}">${label}</text>`;
+		return [
+			line('insp-base', 0, Y(0), w, Y(0), 'baseline', 4, Y(0) - 3),
+			line('insp-metric-line', 0, Y(-f.ascent), w, Y(-f.ascent), `ascent ${f.ascent}`, 4, Y(-f.ascent) - 3),
+			line('insp-metric-line', 0, Y(-f.descent), w, Y(-f.descent), `descent ${f.descent}`, 4, Y(-f.descent) - 3),
+			line('insp-metric-line', X(0), 0, X(0), h, 'origin', X(0) + 3, h - 4),
+			line('insp-metric-line', X(adv), 0, X(adv), h, `advance ${adv}`, X(adv) + 3, h - 4),
+		].join('');
+	}
+
+	// an outline that can be edited is drawn from the points being edited, a colour glyph in colours that come from other
+	// glyphs and not from the outline being edited
+	//protected outline() {
+	//	return glyph ? this.canEdit() ? svgPath(glyph.points) : glyph.path : '';
+	//}
+
+	protected updateContent(g: SVGGElement) {
+		const painted = !!glyph && (glyph.colored || !this.canEdit());
+		const markup = !glyph ? '' : painted ? glyph.markup : `<path fill="currentColor" fill-rule="evenodd" d="${this.canEdit() ? svgPath(glyph.points) : glyph.path}"/>`;
+		g.innerHTML = this.option('fill') && markup ? `<g class="insp-fill${glyph?.colored ? ' colored' : ''}">${markup}</g>` : '';
+	}
+
+	describe() {
+		if (!glyph)
+			return 'loading…';
+		const f = info!, n = glyph.points.length, contours = glyph.points.filter(v => v.flags === 0).length;
+		const u = f.unicodes[inspecting];
+		return [
+			`glyph ${inspecting}`,
+			u?.length ? u.map(hex).join(' ') : 'unmapped',
+			`advance ${f.advances[inspecting] ?? 0}`,
+			`${n} points, ${contours} contour${contours === 1 ? '' : 's'}`,
+			glyph.components.length ? `composite of ${glyph.components.join(', ')}` : '',
+			glyph.error ?? (glyph.markup && !n ? 'drawn as a bitmap or in colour' : ''),
+			this.canEdit() ? 'drag a point to edit; right-click for more' : f.editable ? 'a composite: right-click to decompose it' : f.convertible ? 'read only: right-click to convert to TrueType and edit' : 'read only',
+		].filter(Boolean).join(' · ');
+	}
+
+	protected formatPoint(x: number, y: number) {
+		return `(${x}, ${-y})`;
+	}
+	protected defaultSize() {
+		return info!.unitsPerEm / 5;
+	}
+	protected readOnlyReason() {
+		return info?.convertible ? 'read only: right-click and choose Convert to TrueType outlines to edit this font'
+			: info?.editable && glyph?.components.length ? 'a composite: right-click and choose Decompose to edit it'
+			: 'this font cannot be edited';
+	}
+
+	protected pageItems(): CascadeItem[] {
+		const op = (id: string, icon: string, caption: string, run: () => void): CascadeItem => ({id, face: () => svgFace(icon), caption: () => caption, select: () => { run(); }});
+		const items = glyphItems();
+		if (!this.canEdit() && info?.editable && glyph?.components.length)
+			items.push(op('decompose', '<rect x="2" y="2" width="12" height="12"/><path d="M8 2V14M2 8H14"/>', 'Decompose the composite into plain outlines', () => this.commit('Decompose glyph')));
+		else if (!this.canEdit() && info?.convertible)
+			items.push(op('convert', '<path d="M3 13C3 4 8 2 13 3"/><path d="M3 3L13 13" stroke-dasharray="2 2"/>', 'Convert to TrueType outlines to edit', () => post({command: 'convertFont'})));
+		return items;
+	}
+}
+
+// what the glyph inspector's menu offers over the glyph: leaving it, stepping through the glyphs, the colour drawing
+function glyphItems(): CascadeItem[] {
+	const op = (id: string, icon: string, caption: string, run: () => void): CascadeItem => ({id, face: () => svgFace(icon), caption: () => caption, select: () => { run(); }});
+	const items = [
+		op('back', '<path d="M10 3L5 8L10 13"/>', 'Back to the glyphs (Esc)', closeInspector),
+		op('previous', '<path d="M3 8H13M7 4L3 8L7 12"/>', 'Previous glyph (←)', () => stepInspector(-1)),
+		op('next', '<path d="M3 8H13M9 4L13 8L9 12"/>', 'Next glyph (→)', () => stepInspector(1)),
+	];
+	if (glyph?.bitmap)
+		items.push(op('bitmap', '<rect x="2" y="3" width="12" height="10"/><circle cx="6" cy="7" r="1.3"/><path d="M3 12L7 8L10 11L12 9L14 12"/>', glyph.bitmap.editable ? 'Edit the bitmap in the bitmap editor' : 'Open the bitmap in the bitmap editor (it cannot be saved back to this font)', () => post({command: 'editGlyphBitmap', id: inspecting})));
+	if (glyph?.svg)
+		items.push({...toggleItem('Edit the colour drawing', svgFace('<circle cx="8" cy="8" r="6"/><circle cx="5.5" cy="6.5" r="1" fill="currentColor"/><circle cx="9" cy="5" r="1" fill="currentColor"/><circle cx="10.5" cy="9" r="1" fill="currentColor"/>'), () => colourMode, setColourMode), id: 'colour'});
+	return items;
+}
+
+const viewOptions = new ViewOptions({snap: true});
+const editor = new GlyphEditor(inspView, viewOptions);
+
+// a glyph drawn in colour is edited as the SVG it is, by the editor the SVG viewer is: its elements as layers, each with a
+// fill and a stroke, and the points of the one selected
+const colour = createSession({
+	view:			inspView,
+	options:		viewOptions,
+	views:			['metrics'],
+	pageItems: 	() => glyphItems(),
+	tree:			$('font-layer-tree'),
+	props:			$('font-layer-props'),
+	active:			() => colourMode && inspecting >= 0,
+	home:			() => `glyph${inspecting}`,
+	guides:			(X, Y, w, h) => editor.metricGuides(X, Y, w, h),
+}, {
+	save:			(text, label)		=> post({command: 'editGlyphSvg', id: inspecting, text, label}),
+	shapePoints:	(name, attributes)	=> RPC<curveVertex[]>({command: 'shapePoints', name, attributes}),
+	simplifyPoints:	(points, tol)		=> RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}),
+	fitStroke:		(stroke, tol)		=> RPC<curveVertex[]>({command: 'fitStroke', stroke, tol}),
+	status:			text				=> { inspStatus.textContent = text; },
+	error:			message				=> message ? showError(message) : errorBox.classList.add('hidden'),
+});
+
+// the drawing in colour is what is edited, or the outline
+function setColourMode(on: boolean) {
+	colourMode = on && !!glyph?.svg;
+	$('font-layers').classList.toggle('hidden', !colourMode);
+	if (colourMode) {
+		colour.load(glyph!.svg!.text, `glyph ${inspecting}`, !glyph!.svg!.editable);
+		colour.editor.fit();
+	}
+	editor.draw();
+	colour.editor.draw();
+}
 
 function inspect(id: number) {
-	notice = '';
+	editor.reset();
 	inspecting = id;
 	glyph = undefined;
-	hover = picked = pickedContour = -1;
+	colourMode = false;
+	$('font-layers').classList.add('hidden');
 	grid.classList.add('hidden');
 	inspector.classList.remove('hidden');
 	if (id !== selected)
 		select(id);
 	$('insp-title').textContent = `Glyph ${id}`;
-	drawInspector();
+	editor.draw();
 	RPC<GlyphDetail>({command: 'getGlyphDetail', id})
 		.then(g => {
 			if (inspecting !== id)
 				return;
 			glyph = g;
-			fitInspector();
-			drawInspector();
+			setColourMode(true);
+			editor.fit();
 		})
 		.catch(error => showError(String(error?.message ?? error)));
 }
 
 // a glyph was changed, here or by an undo or redo: whatever shows it is drawn again from the font
-function glyphChanged(id: number) {
+function glyphChanged(id: number, own = false) {
 	markup.delete(id);
+	// a drawing of the SVG table may share what it draws with others
+	if (colourMode) {
+		markup.clear();
+		grid.querySelectorAll<SVGElement>('svg[data-glyph]').forEach(svg => fill(svg, +svg.dataset.glyph!));
+	}
 	grid.querySelectorAll<SVGElement>(`[data-id="${id}"] svg`).forEach(svg => fill(svg, id));
 	if (selected === id)
 		select(id);
 	setSample();
-	if (inspecting === id && !drag) {
+	if (inspecting === id && !editor.dragging) {
 		RPC<GlyphDetail>({command: 'getGlyphDetail', id})
 			.then(g => {
-				if (inspecting === id && !drag) {
+				if (inspecting === id && !editor.dragging) {
 					glyph = g;
-					if (picked >= g.points.length / 3)
-						picked = -1;
-					drawInspector();
+					if (editor.picked >= g.points.length)
+						editor.picked = -1;
+					// what the colour editor has is what was just made, unless this is an undo or a redo
+					if (colourMode && (!own || !g.svg))
+						setColourMode(true);
+					editor.draw();
 				}
 			})
 			.catch(error => showError(String(error?.message ?? error)));
@@ -317,555 +482,17 @@ function stepInspector(by: number) {
 		inspect(shown[i]);
 }
 
-// the extent of what the glyph occupies: its advance and the font's vertical metrics, and any ink outside them
-function fitInspector() {
-	const f = info!, w = inspView.clientWidth, h = inspView.clientHeight;
-	let x0 = 0, x1 = f.advances[inspecting] || f.unitsPerEm, y0 = -f.ascent, y1 = -f.descent;
-	const p = glyph?.points ?? [];
-	for (let i = 0; i < p.length; i += 3) {
-		x0 = Math.min(x0, p[i]);
-		x1 = Math.max(x1, p[i]);
-		y0 = Math.min(y0, p[i + 1]);
-		y1 = Math.max(y1, p[i + 1]);
-	}
-	const s = Math.max(0.001, Math.min((w - 80) / (x1 - x0), (h - 80) / (y1 - y0)));
-	view = {s, x: (w - (x1 - x0) * s) / 2 - x0 * s, y: (h - (y1 - y0) * s) / 2 - y0 * s};
-}
-
-// zoom about a point of the view, which stays where it is
-function zoomInspector(factor: number, cx = inspView.clientWidth / 2, cy = inspView.clientHeight / 2) {
-	const s = Math.max(0.005, Math.min(view.s * factor, 400));
-	factor = s / view.s;
-	view = {s, x: cx - (cx - view.x) * factor, y: cy - (cy - view.y) * factor};
-	drawInspector();
-}
-
-const num = (n: number) => +n.toFixed(2);
-
-function drawInspector() {
-	const f = info;
-	if (!f || inspecting < 0)
-		return;
-	$('insp-snap-label').classList.toggle('hidden', !canEdit());
-	const w = inspView.clientWidth, h = inspView.clientHeight, {s} = view;
-	const X = (x: number) => x * s + view.x, Y = (y: number) => y * s + view.y;
-	inspSvg.setAttribute('width', String(w));
-	inspSvg.setAttribute('height', String(h));
-	const out: string[] = [];
-
-	// a grid of round numbers of font units, as fine as keeps its lines apart on the screen
-	if (inspOption('grid')) {
-		const raw = 12 / s, pow = 10 ** Math.floor(Math.log10(raw));
-		const step = gridStep = [1, 2, 5, 10].map(k => k * pow).find(v => v >= raw)!;
-		const every = Math.round(step / pow) === 5 ? 2 : 5;
-		let minor = '', major = '', labels = '';
-		const lines = (from: number, to: number, vertical: boolean, flip: number) => {
-			for (let k = Math.ceil(from / step); k <= Math.floor(to / step); k++) {
-				const v = k * step, at = vertical ? X(v) : Y(v * flip);
-				const d = vertical ? `M${num(at)},0V${h}` : `M0,${num(at)}H${w}`;
-				if (k % every === 0) {
-					major += d;
-					labels += vertical ? `<text x="${num(at) + 3}" y="11">${num(v)}</text>` : `<text class="right" x="${w - 3}" y="${num(at) - 3}">${num(v)}</text>`;
-				} else
-					minor += d;
-			}
-		};
-		lines(-view.x / s, (w - view.x) / s, true, 1);
-		lines(-(h - view.y) / s, view.y / s, false, -1);
-		out.push(`<path class="insp-minor" d="${minor}"/><path class="insp-major" d="${major}"/><g class="insp-labels">${labels}</g>`);
-	}
-
-	if (inspOption('metrics')) {
-		const adv = f.advances[inspecting] ?? 0;
-		const line = (cls: string, x1: number, y1: number, x2: number, y2: number, label: string, lx: number, ly: number) =>
-			`<line class="${cls}" x1="${num(x1)}" y1="${num(y1)}" x2="${num(x2)}" y2="${num(y2)}"/><text class="insp-metric" x="${num(lx)}" y="${num(ly)}">${label}</text>`;
-		out.push(
-			line('insp-base', 0, Y(0), w, Y(0), 'baseline', 4, Y(0) - 3),
-			line('insp-metric-line', 0, Y(-f.ascent), w, Y(-f.ascent), `ascent ${f.ascent}`, 4, Y(-f.ascent) - 3),
-			line('insp-metric-line', 0, Y(-f.descent), w, Y(-f.descent), `descent ${f.descent}`, 4, Y(-f.descent) - 3),
-			line('insp-metric-line', X(0), 0, X(0), h, 'origin', X(0) + 3, h - 4),
-			line('insp-metric-line', X(adv), 0, X(adv), h, `advance ${adv}`, X(adv) + 3, h - 4),
-		);
-	}
-
-	if (glyph) {
-		const g = `<g transform="translate(${num(view.x)} ${num(view.y)}) scale(${s})">`;
-		// an outline that can be edited is drawn from the points being edited
-		const path = canEdit() ? pathOf(glyph.points) : glyph.path;
-		// a colour glyph is drawn in its colours, which come from other glyphs and not from the outline being edited
-		const painted = glyph.colored || !canEdit();
-		if (inspOption('fill') && (painted ? glyph.markup : path))
-			out.push(`${g}<g class="insp-fill${glyph.colored ? ' colored' : ''}">${painted ? glyph.markup : `<path fill="currentColor" d="${path}"/>`}</g></g>`);
-		if (inspOption('outline') && path)
-			out.push(`${g}<path class="insp-outline" vector-effect="non-scaling-stroke" d="${path}"/></g>`);
-		// each contour has a wide invisible stroke to be picked by, and the selected one is drawn over the rest
-		if (canEdit()) {
-			if (pickedContour >= 0 && glyph.points[pickedContour * 3 + 2] !== 0)
-				pickedContour = -1;
-			const q = glyph.points, count = q.length / 3;
-			let hits = '';
-			for (let c = 0; c < count;) {
-				let e = c + 1;
-				while (e < count && q[e * 3 + 2] !== 0)
-					e++;
-				const d = pathOf(q.slice(c * 3, e * 3));
-				hits += `<path class="insp-hit" data-contour="${c}" vector-effect="non-scaling-stroke" d="${d}"/>`;
-				if (c === pickedContour)
-					hits += `<path class="insp-selected" vector-effect="non-scaling-stroke" d="${d}"/>`;
-				c = e;
-			}
-			out.push(`${g}${hits}</g>`);
-		}
-
-		const p = glyph.points, n = p.length / 3;
-		if (inspOption('polygon')) {
-			let d = '';
-			for (let i = 0; i < n; i++)
-				d += `${p[i * 3 + 2] === 0 ? (i ? 'Z' : '') + 'M' : 'L'}${num(X(p[i * 3]))},${num(Y(p[i * 3 + 1]))}`;
-			out.push(`<path class="insp-polygon" d="${d}${n ? 'Z' : ''}"/>`);
-		}
-		if (inspOption('points') || inspOption('numbers')) {
-			for (let i = 0; i < n; i++) {
-				const x = num(X(p[i * 3])), y = num(Y(p[i * 3 + 1])), flags = p[i * 3 + 2];
-				const cls = `insp-pt k${flags}${i === picked ? ' picked' : i === hover ? ' hover' : ''}${pickedContour >= 0 && i >= pickedContour && i < contourOf(pickedContour).e ? ' in-contour' : ''}`;
-				const r = i === hover || i === picked ? 5 : 3.5;
-				if (inspOption('points'))
-					out.push(flags >= 2
-						? `<circle class="${cls}" cx="${x}" cy="${y}" r="${r}"/>`
-						: `<rect class="${cls}" x="${x - r}" y="${y - r}" width="${r * 2}" height="${r * 2}"/>`);
-				if (inspOption('numbers'))
-					out.push(`<text class="insp-num" x="${x + 6}" y="${y - 6}">${i}</text>`);
-			}
-		}
-	}
-	inspSvg.innerHTML = out.join('');
-
-	if (notice) {
-		inspStatus.textContent = notice;
-		return;
-	}
-	if (glyph && pickedContour >= 0 && hover < 0) {
-		const {s: a, e: b} = contourOf(pickedContour);
-		inspStatus.textContent = `contour of ${b - a} points selected · drag to move, Del to delete`;
-		return;
-	}
-	const shownPoint = hover >= 0 ? hover : picked;
-	if (glyph && shownPoint >= 0) {
-		const p = glyph.points, k = p[shownPoint * 3 + 2];
-		inspStatus.textContent = `point ${shownPoint} · ${KIND[k] ?? 'flags ' + k} · (${p[shownPoint * 3]}, ${-p[shownPoint * 3 + 1]})`;
-	} else if (glyph) {
-		const n = glyph.points.length / 3, contours = glyph.points.filter((v, i) => i % 3 === 2 && v === 0).length;
-		const u = info!.unicodes[inspecting];
-		inspStatus.textContent = [
-			`glyph ${inspecting}`,
-			u?.length ? u.map(hex).join(' ') : 'unmapped',
-			`advance ${f.advances[inspecting] ?? 0}`,
-			`${n} points, ${contours} contour${contours === 1 ? '' : 's'}`,
-			glyph.components.length ? `composite of ${glyph.components.join(', ')}` : '',
-			glyph.error ?? (glyph.markup && !n ? 'drawn as a bitmap or in colour' : ''),
-			canEdit() ? 'drag a point to edit; right-click for more' : info!.editable ? 'a composite: right-click to decompose it' : info!.convertible ? 'read only: right-click to convert to TrueType and edit' : 'read only',
-		].filter(Boolean).join(' · ');
-	} else
-		inspStatus.textContent = 'loading…';
-}
-
-// the point of the glyph nearest a place on the screen, if one is near enough to be meant
-function pointAt(x: number, y: number) {
-	const p = glyph?.points ?? [];
-	let best = -1, bestD = 10 * 10;
-	for (let i = 0; i < p.length / 3; i++) {
-		const dx = p[i * 3] * view.s + view.x - x, dy = p[i * 3 + 1] * view.s + view.y - y;
-		if (dx * dx + dy * dy < bestD) {
-			bestD = dx * dx + dy * dy;
-			best = i;
-		}
-	}
-	return best;
-}
-
-//--- editing -----------------------------------------------------------------
-
-// a glyph is edited when the font can be written and the glyph is a plain outline (not made of other glyphs)
-const canEdit = () => !!(info?.editable && glyph && !glyph.components.length && !glyph.error);
-
-// the outline of points as the extension reads them: contours that begin at a 0, of on-curve points (1) and quadratic
-// controls (2), a control after a control standing for the on-curve point halfway between
-function pathOf(p: number[]) {
-	let d = '';
-	const n = p.length / 3;
-	for (let s = 0; s < n;) {
-		let e = s + 1;
-		while (e < n && p[e * 3 + 2] !== 0)
-			e++;
-		const at = (i: number) => `${p[i * 3]},${p[i * 3 + 1]}`;
-		d += `M${at(s)}`;
-		for (let i = s + 1; i < e;) {
-			if (p[i * 3 + 2] === 1) {
-				d += `L${at(i)}`;
-				i++;
-			} else {
-				const next = i + 1 < e ? i + 1 : s;
-				if (p[next * 3 + 2] !== 2 || next === s) {
-					d += `Q${at(i)},${at(next)}`;
-					i += 2;
-				} else {
-					d += `Q${at(i)},${(p[i * 3] + p[next * 3]) / 2},${(p[i * 3 + 1] + p[next * 3 + 1]) / 2}`;
-					i++;
-				}
-			}
-		}
-		d += 'Z';
-		s = e;
-	}
-	return d;
-}
-
-// where the contour of point i begins and ends (exclusive)
-function contourOf(i: number) {
-	const p = glyph!.points, n = p.length / 3;
-	let s = i, e = i + 1;
-	while (s > 0 && p[s * 3 + 2] !== 0)
-		s--;
-	while (e < n && p[e * 3 + 2] !== 0)
-		e++;
-	return {s, e};
-}
-
-function commit(label: string) {
-	if (inspecting >= 0 && glyph)
-		post({command: 'editGlyph', id: inspecting, points: glyph.points, label});
-}
-
-// what the status line says for a few seconds in place of what is under the pointer: why something was not done
-let notice = '', noticeTimer = 0;
-function refuse(message: string) {
-	notice = message;
-	drawInspector();
-	clearTimeout(noticeTimer);
-	noticeTimer = window.setTimeout(() => { notice = ''; drawInspector(); }, 4000);
-}
-
-// a square, wound as TrueType outer contours are, centred on a place of the view (the middle if none)
-function newContour(at?: {x: number, y: number}) {
-	if (!canEdit())
-		return;
-	const size = Math.max(gridStep, Math.round(info!.unitsPerEm / 5 / gridStep) * gridStep);
-	const x = at?.x ?? inspView.clientWidth / 2, y = at?.y ?? inspView.clientHeight / 2;
-	const cx = Math.round(((x - view.x) / view.s - size / 2) / gridStep) * gridStep;
-	const cy = Math.round(((y - view.y) / view.s + size / 2) / gridStep) * gridStep;
-	const first = glyph!.points.length / 3;
-	glyph!.points.push(cx, cy, 0, cx, cy - size, 1, cx + size, cy - size, 1, cx + size, cy, 1);
-	picked = -1;
-	pickedContour = first;
-	commit('Add contour');
-	drawInspector();
-}
-
-function nudge(dx: number, dy: number) {
-	if (!canEdit() || (picked < 0 && pickedContour < 0))
-		return;
-	const p = glyph!.points;
-	const [from, to] = picked >= 0 ? [picked, picked + 1] : [pickedContour, contourOf(pickedContour).e];
-	for (let i = from; i < to; i++) {
-		p[i * 3] += dx;
-		p[i * 3 + 1] += dy;
-	}
-	drawInspector();
-	commit(picked >= 0 ? 'Move point' : 'Move contour');
-}
-
-function selectContour(of: number) {
-	pickedContour = contourOf(of).s;
-	picked = -1;
-	drawInspector();
-}
-
-function deleteContour() {
-	if (!canEdit() || pickedContour < 0)
-		return;
-	const {s, e} = contourOf(pickedContour);
-	glyph!.points.splice(s * 3, (e - s) * 3);
-	pickedContour = hover = -1;
-	commit('Delete contour');
-	drawInspector();
-}
-
-function deletePoint() {
-	if (pickedContour >= 0 && picked < 0)
-		return deleteContour();
-	if (!canEdit() || picked < 0)
-		return;
-	const p = glyph!.points, {s, e} = contourOf(picked);
-	if (e - s <= 3)
-		return refuse('a contour needs at least 3 points');
-	if (picked === s) {
-		if (p[(s + 1) * 3 + 2] !== 1)
-			return refuse('the next point must be on-curve to begin the contour');
-		p[(s + 1) * 3 + 2] = 0;
-	}
-	p.splice(picked * 3, 3);
-	picked = -1;
-	hover = -1;
-	pickedContour = -1;
-	commit('Delete point');
-	drawInspector();
-}
-
-function togglePoint() {
-	if (!canEdit() || picked < 0)
-		return;
-	const p = glyph!.points;
-	if (p[picked * 3 + 2] === 0)
-		return refuse('a contour begins on-curve');
-	p[picked * 3 + 2] = p[picked * 3 + 2] === 1 ? 2 : 1;
-	commit('Change point type');
-	drawInspector();
-}
-
-// a point halfway between this and the next: it leaves the shape as it was between two on-curve points, or two controls
-function insertPoint() {
-	if (!canEdit() || picked < 0)
-		return;
-	const p = glyph!.points, {s, e} = contourOf(picked);
-	const j = picked + 1 < e ? picked + 1 : s;
-	const on = (i: number) => p[i * 3 + 2] !== 2;
-	if (on(picked) !== on(j))
-		return refuse('insert between two on-curve points, or two controls');
-	p.splice((picked + 1) * 3, 0, Math.round((p[picked * 3] + p[j * 3]) / 2), Math.round((p[picked * 3 + 1] + p[j * 3 + 1]) / 2), 1);
-	picked++;
-	pickedContour = -1;
-	commit('Insert point');
-	drawInspector();
-}
-
-let drag: {x: number, y: number, moved: boolean, point?: number, contour?: {s: number, e: number, orig: number[], wx: number, wy: number}} | undefined;
-inspSvg.addEventListener('pointerdown', e => {
-	// the right button (or Ctrl with the left, which a Mac takes for it) is for the context menu, not for dragging
-	if (e.button === 2 || (e.button === 0 && e.ctrlKey))
-		return;
-	inspSvg.setPointerCapture(e.pointerId);
-	const rect = inspSvg.getBoundingClientRect();
-	const point = canEdit() ? pointAt(e.clientX - rect.left, e.clientY - rect.top) : -1;
-	// a point of a glyph that cannot be edited says why, instead of nothing happening
-	if (!canEdit() && glyph && pointAt(e.clientX - rect.left, e.clientY - rect.top) >= 0)
-		refuse(info?.convertible ? 'read only: right-click and choose Convert to TrueType outlines to edit this font'
-			: info?.editable && glyph.components.length ? 'a composite: right-click and choose Decompose to edit it'
-			: 'this font cannot be edited');
-	drag = {x: e.clientX, y: e.clientY, moved: false, point: point >= 0 ? point : undefined};
-	if (point >= 0) {
-		picked = point;
-		pickedContour = -1;
-		drawInspector();
-		return;
-	}
-	// a contour is picked by its outline, and is then dragged as a whole
-	const hit = canEdit() ? (e.target as Element).closest<SVGElement>('[data-contour]') : null;
-	if (hit) {
-		const {s: a, e: b} = contourOf(+hit.dataset.contour!);
-		picked = -1;
-		pickedContour = a;
-		drag.contour = {s: a, e: b, orig: glyph!.points.slice(a * 3, b * 3), wx: (e.clientX - rect.left - view.x) / view.s, wy: (e.clientY - rect.top - view.y) / view.s};
-		drawInspector();
-	}
-});
-inspSvg.addEventListener('pointermove', e => {
-	const rect = inspSvg.getBoundingClientRect();
-	if (drag?.point !== undefined) {
-		if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 2)
-			drag.moved = true;
-		if (drag.moved) {
-			let x = (e.clientX - rect.left - view.x) / view.s, y = (e.clientY - rect.top - view.y) / view.s;
-			const step = inspOption('snap') ? gridStep : 1;
-			x = Math.round(x / step) * step;
-			y = Math.round(y / step) * step;
-			glyph!.points[drag.point * 3] = x;
-			glyph!.points[drag.point * 3 + 1] = y;
-			drawInspector();
-		}
-		return;
-	}
-	if (drag?.contour) {
-		if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 2)
-			drag.moved = true;
-		if (drag.moved) {
-			const step = inspOption('snap') ? gridStep : 1;
-			const dx = Math.round(((e.clientX - rect.left - view.x) / view.s - drag.contour.wx) / step) * step;
-			const dy = Math.round(((e.clientY - rect.top - view.y) / view.s - drag.contour.wy) / step) * step;
-			const {s: a, orig} = drag.contour;
-			for (let i = 0; i < orig.length; i += 3) {
-				glyph!.points[a * 3 + i] = orig[i] + dx;
-				glyph!.points[a * 3 + i + 1] = orig[i + 1] + dy;
-			}
-			drawInspector();
-		}
-		return;
-	}
-	if (drag) {
-		if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3)
-			drag.moved = true;
-		if (drag.moved) {
-			view.x += e.clientX - drag.x;
-			view.y += e.clientY - drag.y;
-			drag.x = e.clientX;
-			drag.y = e.clientY;
-			drawInspector();
-		}
-		return;
-	}
-	const at = pointAt(e.clientX - rect.left, e.clientY - rect.top);
-	if (at !== hover) {
-		hover = at;
-		drawInspector();
-	}
-});
-inspSvg.addEventListener('pointerleave', () => {
-	if (!drag && hover >= 0) {
-		hover = -1;
-		drawInspector();
-	}
-});
-inspSvg.addEventListener('pointerup', e => {
-	if (inspSvg.hasPointerCapture(e.pointerId))
-		inspSvg.releasePointerCapture(e.pointerId);
-	if (drag?.point !== undefined && drag.moved)
-		commit('Move point');
-	else if (drag?.contour) {
-		if (drag.moved)
-			commit('Move contour');
-	} else if (drag && !drag.moved) {
-		const rect = inspSvg.getBoundingClientRect();
-		picked = pointAt(e.clientX - rect.left, e.clientY - rect.top);
-		if (picked >= 0 || drag.point === undefined)
-			pickedContour = -1;
-		drawInspector();
-	}
-	drag = undefined;
-});
-//--- the context menu --------------------------------------------------------
-
-const menu = $('insp-menu');
-interface MenuItem { label: string; keys?: string; run: () => void; enabled?: boolean }
-
-function closeMenu() {
-	menu.classList.add('hidden');
-}
-
-function showMenu(items: (MenuItem | '-')[], x: number, y: number) {
-	menu.textContent = '';
-	for (const item of items) {
-		const row = document.createElement('div');
-		if (item === '-') {
-			row.className = 'menu-sep';
-		} else {
-			row.className = 'menu-item' + (item.enabled === false ? ' disabled' : '');
-			const label = document.createElement('span');
-			label.textContent = item.label;
-			const keys = document.createElement('span');
-			keys.className = 'menu-keys';
-			keys.textContent = item.keys ?? '';
-			row.append(label, keys);
-			if (item.enabled !== false)
-				row.addEventListener('click', () => { closeMenu(); item.run(); });
-		}
-		menu.appendChild(row);
-	}
-	menu.classList.remove('hidden');
-	// kept inside the window
-	menu.style.left = `${Math.max(0, Math.min(x, window.innerWidth - menu.offsetWidth - 4))}px`;
-	menu.style.top = `${Math.max(0, Math.min(y, window.innerHeight - menu.offsetHeight - 4))}px`;
-}
-
-inspSvg.addEventListener('contextmenu', e => {
-	e.preventDefault();
-	const rect = inspSvg.getBoundingClientRect();
-	const here = {x: e.clientX - rect.left, y: e.clientY - rect.top};
-	if (canEdit()) {
-		const at = pointAt(here.x, here.y);
-		const hit = (e.target as Element).closest<SVGElement>('[data-contour]');
-		if (at >= 0) {
-			picked = at;
-			pickedContour = -1;
-		} else if (hit) {
-			picked = -1;
-			pickedContour = contourOf(+hit.dataset.contour!).s;
-		}
-		drawInspector();
-	}
-	const items: (MenuItem | '-')[] = [];
-	if (canEdit()) {
-		const point = picked >= 0, contour = pickedContour >= 0;
-		items.push(
-			{label: 'Delete point', keys: point ? 'Del' : '', run: deletePoint, enabled: point},
-			{label: 'Delete contour', keys: contour ? 'Del' : '', run: () => { if (picked >= 0) selectContour(picked); deleteContour(); }, enabled: contour || point},
-			{label: 'Select contour', run: () => selectContour(picked), enabled: point},
-			'-',
-			{label: 'Toggle on-curve / control', keys: 'T', run: togglePoint, enabled: point},
-			{label: 'Insert point after', keys: 'I', run: insertPoint, enabled: point},
-			'-',
-			{label: 'New contour here', run: () => newContour(here)},
-			'-',
-		);
-	} else if (info?.editable && glyph?.components.length) {
-		items.push({label: 'Decompose', run: () => commit('Decompose glyph')}, '-');
-	} else if (info?.convertible) {
-		items.push({label: 'Convert to TrueType outlines…', run: () => post({command: 'convertFont'})}, '-');
-	}
-	items.push(
-		{label: 'Fit glyph', keys: '0', run: () => { fitInspector(); drawInspector(); }},
-		{label: 'Zoom in', keys: '+', run: () => zoomInspector(1.5)},
-		{label: 'Zoom out', keys: '-', run: () => zoomInspector(1 / 1.5)},
-		'-',
-		{label: 'Back to the glyphs', keys: 'Esc', run: closeInspector},
-	);
-	showMenu(items, e.clientX, e.clientY);
-});
-document.addEventListener('pointerdown', e => {
-	if (!menu.contains(e.target as Node))
-		closeMenu();
-}, true);
-window.addEventListener('blur', closeMenu);
-
-inspSvg.addEventListener('wheel', e => {
-	e.preventDefault();
-	const rect = inspSvg.getBoundingClientRect();
-	zoomInspector(Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002)), e.clientX - rect.left, e.clientY - rect.top);
-}, {passive: false});
-
-$('insp-back').addEventListener('click', closeInspector);
-$('insp-prev').addEventListener('click', () => stepInspector(-1));
-$('insp-next').addEventListener('click', () => stepInspector(1));
-$('insp-fit').addEventListener('click', () => { fitInspector(); drawInspector(); });
-for (const name of ['grid', 'metrics', 'fill', 'outline', 'polygon', 'points', 'numbers'])
-	$('insp-' + name).addEventListener('change', drawInspector);
-new ResizeObserver(drawInspector).observe(inspView);
-
 document.addEventListener('keydown', e => {
-	if (inspecting < 0 || (e.target as HTMLElement).tagName === 'INPUT' && (e.target as HTMLInputElement).type === 'text')
+	const target = e.target as HTMLInputElement;
+	if (inspecting < 0 || target.tagName === 'SELECT' || (target.tagName === 'INPUT' && target.type !== 'checkbox'))
 		return;
-	if (canEdit() && (picked >= 0 || pickedContour >= 0)) {
-		const d = e.shiftKey ? 10 : 1;
+	if (!(colourMode ? colour.key(e) : editor.key(e))) {
 		switch (e.key) {
-			case 'ArrowLeft':	nudge(-d, 0); break;
-			case 'ArrowRight':	nudge(d, 0); break;
-			case 'ArrowUp':		nudge(0, -d); break;
-			case 'ArrowDown':	nudge(0, d); break;
-			case 'Delete': case 'Backspace': deletePoint(); break;
-			case 't':			togglePoint(); break;
-			case 'i':			insertPoint(); break;
+			case 'Escape':		closeInspector(); break;
+			case 'ArrowLeft':	stepInspector(-1); break;
+			case 'ArrowRight':	stepInspector(1); break;
+			default:			return;
 		}
-		if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Delete', 'Backspace', 't', 'i'].includes(e.key)) {
-			e.preventDefault();
-			return;
-		}
-	}
-	switch (e.key) {
-		case 'Escape':		if (!menu.classList.contains('hidden')) closeMenu(); else closeInspector(); break;
-		case 'ArrowLeft':	stepInspector(-1); break;
-		case 'ArrowRight':	stepInspector(1); break;
-		case '+': case '=':	zoomInspector(1.5); break;
-		case '-':			zoomInspector(1 / 1.5); break;
-		case '0':			fitInspector(); drawInspector(); break;
-		default:			return;
 	}
 	e.preventDefault();
 });
@@ -895,10 +522,9 @@ function setSample() {
 	// the position of the text's start in font units of each character, as the caret is placed by them
 	const starts: number[] = [];
 	let x = 0;
-	const svg = document.createElementNS(SVG, 'svg');
+	const svg = createSVGElement('svg');
 	for (const id of ids) {
-		const g = document.createElementNS(SVG, 'g');
-		g.setAttribute('transform', `translate(${x} 0)`);
+		const g = createSVGElement('g', {transform: `translate(${x} 0)`});
 		svg.appendChild(g);
 		fill(g as unknown as SVGElement, id);
 		starts.push(x);
@@ -970,59 +596,64 @@ sampleBox.addEventListener('wheel', e => {
 
 //--- the tables -----------------------------------------------------------
 
+// the shared tree: a table entry with entries of its own is a caret, whose children are asked for the first time it opens
 const tablesView	= $('font-tables');
+const tablesRoot	= createElement('div', {className: 'tree', tabIndex: 0});
+tablesView.append(createElement('div', {className: 'tree-heading', textContent: 'Tables'}), tablesRoot);
+
+const tablePaths	= new WeakMap<HTMLElement, string[]>();	// the path of each caret whose children are still to be read
+
+const tablesTree	= new Tree(tablesRoot, (caret, down) => {
+	const path = tablePaths.get(caret);
+	if (!down || !path)
+		return;
+	tablePaths.delete(caret);
+	RPC<TableNode[]>({command: 'getTable', path})
+		.then(nodes => fillList(caret.querySelector<HTMLElement>(':scope > .children')!, path, nodes))
+		.catch(error => {
+			tablePaths.set(caret, path);	// so opening it again tries again
+			tablesTree.close(caret);
+			showError(String(error?.message ?? error));
+		});
+});
+tablesTree.enableKeyboardNavigation(() => {});
+
+// a click on a row puts the cursor there, and opens or closes it; the tree itself handles a click on the caret's arrow
+tablesRoot.addEventListener('click', event => {
+	const line = (event.target as HTMLElement).closest<HTMLElement>('.select');
+	if (line) {
+		tablesTree.setCursor(line);
+		if (line.parentElement?.classList.contains('caret'))
+			tablesTree.toggle(line.parentElement);
+	}
+});
 
 function row(node: TableNode, path: string[]) {
-	const li = document.createElement('li');
-	const line = document.createElement('div');
-	line.className = 'tree-row';
-	const twisty = document.createElement('span');
-	twisty.className = 'twisty';
-	const openable = !!node.count;
-	twisty.textContent = openable ? '▸' : '';
-	const key = document.createElement('span');
-	key.className = 'tree-key';
-	key.textContent = node.key ?? '';
-	const value = document.createElement('span');
-	value.className = 'tree-value ' + node.type;
-	value.textContent = node.value;
-	line.append(twisty, key, value);
-	li.appendChild(line);
+	const line	= createElement(node.count ? 'span' : 'div', {className: 'select'});
+	line.append(
+		createElement('span', {className: 'tree-key', textContent: node.key ?? ''}),
+		createElement('span', {className: 'tree-value ' + node.type, textContent: node.value})
+	);
+	if (!node.count)
+		return line;
 
-	if (openable) {
-		let list: HTMLElement | undefined;
-		line.classList.add('openable');
-		line.addEventListener('click', async () => {
-			if (list) {
-				const hide = !list.classList.toggle('hidden');
-				twisty.textContent = hide ? '▾' : '▸';
-				return;
-			}
-			list = document.createElement('ul');
-			li.appendChild(list);
-			twisty.textContent = '▾';
-			fillList(list, path, await RPC<TableNode[]>({command: 'getTable', path}));
-		});
-	}
-	return li;
+	const caret		= createElement('div', {className: 'caret'});
+	caret.append(line, createElement('div', {className: 'children'}));
+	tablePaths.set(caret, path);
+	return caret;
 }
 
 function fillList(list: HTMLElement, path: string[], nodes: TableNode[]) {
 	for (const node of nodes)
 		list.appendChild(row(node, [...path, node.key!]));
+	tablesTree.fixup(list);
 }
 
 async function buildTables() {
-	tablesView.textContent = '';
-	const heading = document.createElement('div');
-	heading.className = 'tree-heading';
-	heading.textContent = 'Tables';
-	tablesView.appendChild(heading);
-	const list = document.createElement('ul');
-	list.className = 'tree';
-	tablesView.appendChild(list);
+	tablesTree.setCursor(null, false);
+	tablesRoot.textContent = '';
 	try {
-		fillList(list, [], await RPC<TableNode[]>({command: 'getTable', path: []}));
+		fillList(tablesRoot, [], await RPC<TableNode[]>({command: 'getTable', path: []}));
 	} catch (error: any) {
 		showError(String(error?.message ?? error));
 	}
@@ -1057,15 +688,15 @@ function setFont(next: FontInfo) {
 	grid.classList.remove('hidden');
 	meta.textContent = '';
 	meta.appendChild(table([
-		['File', info.file],
-		['Family', info.family],
-		['Style', info.style],
-		['Glyphs', info.numGlyphs.toLocaleString()],
-		['Mapped', Object.keys(info.unicodes).length.toLocaleString()],
-		['Units/em', String(info.unitsPerEm)],
-		['Ascent', String(info.ascent)],
-		['Descent', String(info.descent)],
-		['Line gap', String(info.lineGap)],
+		['File',		info.file],
+		['Family',		info.family],
+		['Style',		info.style],
+		['Glyphs',		info.numGlyphs.toLocaleString()],
+		['Mapped',		Object.keys(info.unicodes).length.toLocaleString()],
+		['Units/em',	String(info.unitsPerEm)],
+		['Ascent',		String(info.ascent)],
+		['Descent',		String(info.descent)],
+		['Line gap',	String(info.lineGap)],
 		...info.names.filter(([k]) => !['Family', 'Style'].includes(k)),
 	]));
 	buildGrid();
@@ -1095,7 +726,7 @@ window.addEventListener('message', event => {
 			setFont(message.info);
 			break;
 		case 'glyphChanged':
-			glyphChanged(message.id);
+			glyphChanged(message.id, message.own);
 			break;
 		case 'error':
 			showError(message.message);

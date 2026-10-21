@@ -5,17 +5,18 @@ import * as webview from "@isopodlabs/vscode_utils/webview";
 import { JSX, CSP, CSPdefault, ImportMap, Nonce } from '@isopodlabs/vscode_utils/jsx-runtime';
 import type { MessageIn, MessageOut, MessageRpc, RawImage, LayerData, shaderType } from "../webview/bitmap"
 import { setActiveViewer, readShader } from './extension';
+import { SCHEME, embedded } from './embedded';
 
 
 class RawImage2 extends bitmap.LayerImage {
 	private layers: RawImage2[] | undefined;
 
 	constructor(raw: RawImage) {
-		super('2d', raw.width, raw.height, {
+		super(raw.type ?? '2d', raw.width, raw.height, {
 			RGBA: {
 				width:	raw.width,
 				height: raw.height,
-				getPixels: async (options) => new Uint8Array(raw.pixels),
+				getPixels: async (options) => new Uint8Array(raw.data),
 			}
 		});
 		this.layers = raw.layers?.map(l => {
@@ -28,11 +29,13 @@ class RawImage2 extends bitmap.LayerImage {
 			layer.blendMode	= l.blend;
 			layer.clipped	= l.clipped;
 			if (l.mask) {
-				const {pixels, ...mask} = l.mask;
-				layer.mask = {...mask, getPixels: async () => new Uint8Array(pixels)};
+				const {data, ...mask} = l.mask;
+				layer.mask = {...mask, getPixels: async () => new Uint8Array(data)};
 			}
 			return layer;
 		});
+		if (!this.depth && raw.layers)
+			this.depth = raw.layers.length;
 	}
 
 	getLayer(layer: string | number) {
@@ -55,7 +58,7 @@ const saveFormats: Record<string, SaveFormat> = {
 	'.jpeg':	{type: 'image/jpeg'},
 	'.bmp':		savefromRaw(bitmap.BMP),
 	'.gif':		savefromRaw(bitmap.GIF),
-//	'.dds':		savefromRaw(bitmap.DDS),
+	'.dds':		savefromRaw(bitmap.DDS),
 	'.psd':		savefromRaw(bitmap.PSD),
 	'.tga':		savefromRaw(bitmap.TGA),
 	'.tif':		savefromRaw(bitmap.TIFF),
@@ -63,7 +66,7 @@ const saveFormats: Record<string, SaveFormat> = {
 };
 
 class BitmapDocument implements vscode.CustomDocument {
-	public fileWatcher: vscode.FileSystemWatcher | undefined;
+	public fileWatcher: vscode.Disposable | undefined;
 	// a PSD whose layers can't be edited (they are not 8-bit RGB) is shown flat, and must not be saved over as if it were
 	public layersNotEditable = false;
 	constructor(public readonly uri: vscode.Uri, public data: Uint8Array) {}
@@ -86,6 +89,8 @@ const shaders: Record<shaderType, ShaderSource> = {
 	'3d2d':		{ vert: 'bitmap.vert',	frag: 'volume2d.frag'	},
 	'layer':	{ vert: 'layer.vert',	frag: 'layer.frag'		},
 	'composite':{ vert: 'bitmap.vert',	frag: 'composite.frag'	},
+	'planes':	{ vert: 'planes.vert',	frag: 'planes.frag'		},
+	'warp':		{ vert: 'bitmap.vert',	frag: 'warp.frag'		},
 };
 
 // the page of a webview: the shared styles, an import map for the utilities, the body and the script which runs it
@@ -105,10 +110,13 @@ export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.A
 					"@isopodlabs/vscode_utils/webview/": assets.uri('node_modules/@isopodlabs/vscode_utils/dist/webview/'),
 					"@isopodlabs/maths/vector": assets.uri('node_modules/@isopodlabs/maths/esm/vector.js'),
 					"@isopodlabs/maths/quaternion": assets.uri('node_modules/@isopodlabs/maths/esm/quaternion.js'),
+					"@isopodlabs/maths/geometry": assets.uri('node_modules/@isopodlabs/maths/esm/geometry.js'),
+					"@isopodlabs/binary_fonts": assets.uri('node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'),
 				}} />
 				<link rel="stylesheet" type="text/css" href={uri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
 				{stylesheets.map(name => <link rel="stylesheet" type="text/css" href={uri(name)}/>)}
 				<link rel="stylesheet" type="text/css" href={uri('assets/bitmap.css')}/>
+				<link rel="stylesheet" type="text/css" href={uri('assets/cascade.css')}/>
 
 				<title>{title}</title>
 			</head>
@@ -134,14 +142,9 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 		webviewPanel.webview.html = webviewPage(webviewPanel, assets, name => this.webviewUri(name), 'out/webview/bitmap.js', 'Bitmap Viewer', [
 			<div id="bitmap-root">
 				<div id="bitmap-main">
-					<div id="paint-options" class="hidden" />
 					<div id="bitmap-stage">
 						<canvas id="viewport" />
 						<canvas id="overlay" class="hidden" />
-						<div id="layer-control" class="hidden">
-							<input id="layer-slider" type="range" min="0" max="0" value="0" />
-							<span id="layer-label">0 / 0</span>
-						</div>
 					</div>
 				</div>
 			</div>,
@@ -189,6 +192,9 @@ class BitmapViewer extends ViewerPanel {
 	}
 
 	async loadImage() {
+		const toImage = (result: bitmap.Result) => ({width: result.width, height: result.height, data: result.pixels as Uint8ClampedArray<ArrayBuffer>});
+		const toBuffer = (data: bitmap.Result['pixels']) => new Uint8Array(data).buffer;
+
 		try {
 			const data		= this.document.data;
 			let image: bitmap.Image;
@@ -231,8 +237,8 @@ class BitmapViewer extends ViewerPanel {
 							layers.push({
 								name: name!, left: left!, top: top!, opacity: opacity!, visible: visible!, blend: blendMode!, clipped,
 								width: layer.width, height: layer.height,
-								pixels: (await layer.getPixels({plane: 'RGBA'})).pixels,
-								mask: layer.mask && {...layer.mask, pixels: await layer.mask.getPixels()},
+								data: toBuffer((await layer.getPixels({plane: 'RGBA'})).pixels),
+								mask: layer.mask && {...layer.mask, data: toBuffer(await layer.mask.getPixels())},
 							});
 						}
 					}
@@ -258,7 +264,7 @@ class BitmapViewer extends ViewerPanel {
 					const result = await image.getPixels({ plane: 'RGBA' });
 					this.postMessage({
 						command: 'loadCube',
-						image: result
+						image: toImage(result)
 					});
 					break;
 				}
@@ -267,7 +273,7 @@ class BitmapViewer extends ViewerPanel {
 //					const result = await image.getPixels({ plane: 'R' });
 					this.postMessage({
 						command: 'load2d',
-						image: result,
+						image: toImage(result),
 						layers,
 					});
 					break;
@@ -277,7 +283,7 @@ class BitmapViewer extends ViewerPanel {
 					const depth = image.depth!;
 					this.postMessage({
 						command: 'load3d',
-						image: result,
+						image: toImage(result),
 						depth,
 					});
 					break;
@@ -286,7 +292,7 @@ class BitmapViewer extends ViewerPanel {
 					const result = await image.getPixels({ plane: 'RGBA' });
 					this.postMessage({
 						command: 'load2dArray',
-						image: result,
+						image: toImage(result),
 						layers: image.depth!,
 					});
 					break;
@@ -344,7 +350,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 		const result = ed && await ed.RPC({ command: 'getTexture', type: format.type });
 		if (!result)
 			throw new Error('The image could not be read back from the editor.');
-		if ('pixels' in result)
+		if ('data' in result)
 			return format.encode!(result);
 		return new Uint8Array(result);
 	}
@@ -374,9 +380,17 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 
 	async backupCustomDocument(document: BitmapDocument, context: vscode.CustomDocumentBackupContext, cancellation: vscode.CancellationToken) {
 		// a PNG whatever the file's own format is, so that the format need not be one that can be written; but not for
-		// layers, which a PNG would flatten
-		const layered = extension(document.uri) === '.psd' && !document.layersNotEditable;
-		await vscode.workspace.fs.writeFile(context.destination, await this.encode(document, saveFormats[layered ? '.psd' : '.png']));
+		// layers, which a PNG would flatten, nor for a cubemap, which a PNG would turn into a tall picture of its faces
+		const ext = extension(document.uri);
+		const own = saveFormats[ext];
+		let format = saveFormats['.png'];
+		if (own?.encode) {
+			const raw = this.getEditor(document) && await this.getEditor(document)!.RPC({ command: 'getTexture', type: own.type });
+			const structured = raw && 'data' in raw && (raw.type === 'cube' || (raw.layers && ext !== '.psd'));
+			if (ext === '.psd' ? !document.layersNotEditable : structured)
+				format = own;
+		}
+		await vscode.workspace.fs.writeFile(context.destination, await this.encode(document, format));
 		return {
 			id: context.destination.toString(),
 			delete: async () => {
@@ -417,13 +431,19 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 		});
 
 		if (!document.fileWatcher) {
-			const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(document.uri.fsPath), path.basename(document.uri.fsPath)));
-			watcher.onDidChange(() => this.reloadDocument(document));
-			watcher.onDidCreate(() => this.reloadDocument(document));
-			watcher.onDidDelete(() => {
-				// If the file is deleted externally, keep the current view until reload or close.
-			});
-			document.fileWatcher = watcher;
+			// an image inside another document is changed by that document, which says so itself
+			if (document.uri.scheme === SCHEME) {
+				document.fileWatcher = embedded.onChange(document.uri, () => this.reloadDocument(document));
+			} else {
+				const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(document.uri.fsPath), path.basename(document.uri.fsPath)));
+				watcher.onDidChange(() => this.reloadDocument(document));
+				watcher.onDidCreate(() => this.reloadDocument(document));
+				watcher.onDidDelete(() => {
+					// If the file is deleted externally, keep the current view until reload or close.
+				});
+				document.fileWatcher = watcher;
+			}
 		}
 	}
 }
+// x

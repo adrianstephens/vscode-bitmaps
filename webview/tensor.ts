@@ -2,6 +2,7 @@ import { Tooltip, Splitter, vscode, RPC, handleResult } from '@isopodlabs/vscode
 import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
 import { Canvas3D, ShaderProgram, rectGeometry } from './opengl.ts';
 import { float3, float3x3, orthonormalise } from '@isopodlabs/maths/vector';
+import { Gizmo } from './gizmo.ts';
 
 // The tensor viewer of a GGUF file: the tensor list, and the values of the tensor in one float volume texture (a matrix is a stack of
 // one slice) which is coloured by the shaders. A stack of slices (a tensor with more than two dimensions) is shown as a grid of the slices
@@ -37,7 +38,6 @@ export type TensorIn =
 	| {command: 'tensorReduce', token: number, dims: V3, extent: V3, info: string, bandRows: number, quant?: Quant}	// a matrix or stack whose reduction the viewer does; bandRows is the most source rows of a slice one band holds; quant is the band's format when the viewer expands it on the GPU, else the bands are f32
 	| {command: 'stepSlice', delta: number}
 	| {command: 'fitToWindow'}
-	| {command: 'resetZoom'}
 	| {command: 'scaleTensor'};
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -87,6 +87,13 @@ let layer		= 0;	// the slice shown, when stackView is 'slice'
 let volumeTex:	WebGLTexture | null = null;
 let basis		= float3x3.identity();	// camera right, up and back axes in the volume's space
 let distance	= 3;
+const gizmo		= new Gizmo(canvas, {
+	rotation:		() => basis.transpose(),
+	setRotation:	rotation => {
+		basis = rotation.transpose();
+		render();
+	},
+});
 
 let frame = 0;
 function render() {
@@ -102,6 +109,7 @@ function draw() {
 	const gl = canvas3d.gl;
 	gl.bindFramebuffer(gl.FRAMEBUFFER, null);	// a reduction in progress has its own framebuffer bound
 
+	gizmo.show(false);
 	if (mode === 'stack' && volume) {
 		canvas3d.bindTexture(gl.TEXTURE_3D, volumeTex);
 		const common = {u_volume: 0, u_dims: volume.dims, u_range: volume.scale};
@@ -116,6 +124,7 @@ function draw() {
 			programs.tensorgrid!.draw({...flatUniforms, u_size: [g.width, g.height], u_gap: g.gap, u_vertical: g.vertical ? 1 : 0});
 
 		} else {
+			gizmo.show(true);
 			programs.bg!.draw({u_viewport: viewport});
 			programs.tensor3d!.draw({
 				...common,
@@ -490,7 +499,7 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 				}
 				oy0 = oy1;
 			}
-			offscreen.readPixels(values.subarray(z * outW * outH, (z + 1) * outW * outH), z);
+			offscreen.readPixelsTo(values.subarray(z * outW * outH, (z + 1) * outW * outH), undefined, z);
 		}
 		keep = true;
 	} finally {
@@ -839,7 +848,7 @@ window.addEventListener('message', event => {
 				homeView();
 			render();
 			break;
-
+/*
 		case 'resetZoom':
 			if (flat()) {
 				scale = clampScale(1);
@@ -849,7 +858,7 @@ window.addEventListener('message', event => {
 			}
 			render();
 			break;
-
+*/
 		case 'scaleTensor':
 			break;
 	}

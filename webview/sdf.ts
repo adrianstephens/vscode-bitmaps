@@ -5,21 +5,24 @@ import { vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shar
 import { Canvas3D, ShaderProgram, Offscreen, rectGeometry } from './opengl.js';
 import { vec, E3, float3, float3x3 } from '@isopodlabs/maths/vector';
 import { Orbit, DEFAULT_FOVY } from './orbit.js';
+import { Gizmo } from './gizmo.js';
+import { Cascade, CascadeItem, svgFace, toggleItem } from './cascade.js';
 
 export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'getShaders'}
-	| {command: 'getGlyphs'};
+	| {command: 'getGlyphs'}
+	| {command: 'run', name: string | undefined};
 
 // $vpt/$vpr/$vpd/$vpf, present only where the file assigned them itself at its own top level -- see Evaluated.camera
-export interface ScriptCamera { vpt?: [number, number, number], vpr?: [number, number, number], vpd?: number, vpf?: number }
+export interface ScriptCamera { vpt?: float3, vpr?: float3, vpd?: number, vpf?: number }
 
 export type MessageIn =
 	| {command: 'sdf', code: string, data: Float32Array, center: vec<number, E3>, half: vec<number, E3>, info: string, warnings: string[], camera: ScriptCamera}
 	| {command: 'error', message: string}
-	| {command: 'fitToWindow'}
-	| {command: 'resetZoom'};
+	| {command: 'modules', names: string[], running: string | undefined}
+	| {command: 'fitToWindow'};
 
 export interface GlyphAtlas {
 	chars: string, width: number, height: number, cellW: number, data: Uint8Array,
@@ -48,6 +51,8 @@ let program:	ShaderProgram | undefined;
 let pickProgram: ShaderProgram | undefined;			// answers what is under a point instead of drawing the picture
 let pickTarget:	Offscreen | undefined;					// a single pixel, read back after each of the picker's passes
 let source:		{vert: string, frag: string, lib: string, pick: string} | undefined;
+let modules:	string[] = [];		// the file's own modules, when it draws nothing itself: a menu item runs one
+let running:	string | undefined;
 let floorOn		= 1;
 let debug		= 0;		// h: 0 the picture, 1 the marching steps taken per pixel
 let center		= float3(0, 0, 0);
@@ -59,6 +64,9 @@ let frame		= 0;
 const MOVING_SCALE	= 0.5;
 const SETTLE_MS		= 180;
 let renderScale		= 1;
+// how long one draw call of a band of rows is allowed to take, and how many rows the first one has (see draw)
+const BAND_MS		= 30;
+const FIRST_BAND	= 8;
 let settle:		ReturnType<typeof setTimeout> | undefined;
 
 // what the info line says: the model, then what the page knows about how it is drawing it
@@ -122,30 +130,6 @@ function glyphUniforms() {
 	};
 }
 
-function setBatch(data: Float32Array) {
-	const gl = canvas3d.gl;
-	if (data.length === 0) {
-		if (batchTexture)
-			gl.deleteTexture(batchTexture);
-		batchTexture = null;
-		return;
-	}
-	const rows		= Math.ceil(data.length / 4 / 1024);
-	const padded	= new Float32Array(rows * 1024 * 4);
-	padded.set(data);
-
-//	batchTexture ??= canvas3d.createTexture(1024, rows, padded, {format: 'rgba32f', min: 'nearest', mag: 'nearest'});
-	batchTexture ??= gl.createTexture();
-	gl.activeTexture(gl.TEXTURE0 + BATCH_UNIT);
-	gl.bindTexture(gl.TEXTURE_2D, batchTexture);
-	gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1024, rows, 0, gl.RGBA, gl.FLOAT, padded);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-	gl.activeTexture(gl.TEXTURE0);
-}
-
 function batchUniforms() {
 	if (!batchTexture)
 		return {};
@@ -154,6 +138,7 @@ function batchUniforms() {
 }
 
 function draw() {
+	gizmo.show(true);
 	sizeCanvas();
 	canvas3d.initViewport();
 	const gl = canvas3d.gl;
@@ -162,7 +147,7 @@ function draw() {
 	gl.clear(gl.COLOR_BUFFER_BIT);
 	if (!program)
 		return;
-	program.draw({
+	const uniforms = {
 		u_floorOn:		floorOn,
 		// the world size of a pixel one unit away: orbit.fovy is the cotangent of half the vertical field of view
 		u_pixel:		2 / (orbit.fovy * canvas.height),
@@ -178,7 +163,27 @@ function draw() {
 		u_aspect:		canvas.width / canvas.height,
 		...glyphUniforms(),
 		...batchUniforms(),
-	});
+	};
+
+	// A model can cost seconds a frame (a big union of polygons whose boxes all overlap prunes nothing), and one draw
+	// call that long is what the system's GPU watchdog kills the whole GPU process for. So the picture is drawn in
+	// bands of rows, each followed by a one-pixel read-back, which waits for it: the first band is small, and a band
+	// is only made larger as long as the ones so far were quick, so the cost of any one call stays near BAND_MS.
+	const width = canvas.width, rows = canvas.height;
+	const pixel = new Uint8Array(4);
+	let band = FIRST_BAND, worst = 0;
+	gl.enable(gl.SCISSOR_TEST);
+	for (let y = 0; y < rows;) {
+		const h = Math.min(band, rows - y);
+		gl.scissor(0, y, width, h);
+		const t0 = performance.now();
+		program.draw(uniforms);
+		gl.readPixels(0, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+		worst = Math.max(worst, (performance.now() - t0) / h);
+		y += h;
+		band = Math.max(1, Math.min(band * 2, Math.floor(BAND_MS / Math.max(worst, 1e-3))));
+	}
+	gl.disable(gl.SCISSOR_TEST);
 }
 
 // where the camera is: the point the shader's own u_origin uniform carries, which the picker needs in JS too
@@ -189,10 +194,10 @@ const rad 			= (deg: number) => deg * Math.PI / 180;
 
 function homeView() {
 	const cam		= scriptCamera;
-	const target	= cam.vpt ? float3(cam.vpt[0], cam.vpt[1], cam.vpt[2]) : center;
+	const target	= cam.vpt ? float3(cam.vpt.x, cam.vpt.y, cam.vpt.z) : center;
 	orbit.look(target,
 		cam.vpd ?? size() / Math.sin(Math.atan(1 / orbit.fovy)) * 1.1,
-		cam.vpr ? float3.rotateZ(rad(cam.vpr[2])).matmul(float3.rotateY(rad(cam.vpr[1]))).matmul(float3.rotateX(rad(cam.vpr[0]))) : float3x3.identity()
+		cam.vpr ? float3.rotateZ(rad(cam.vpr.z)).matmul(float3.rotateY(rad(cam.vpr.y))).matmul(float3.rotateX(rad(cam.vpr.x))) : float3x3.identity()
 	);
 }
 
@@ -207,13 +212,15 @@ const orbit: Orbit = new Orbit(canvas, {
 		return hit && hit.kind > -0.5 ? hit.pos : orbit.along(x, y, center, size());
 	},
 	size,
-	changed:	() => {
+	redraw:	() => {
 		moving();
 		render();
 	},
 	dragStart:	() => hideTooltip(),
 	zoomed:		(x, y) => schedulePick(x, y),
+	contextMenu:(x, y) => { hideTooltip(); menu.open(x, y); }
 });
+const gizmo = new Gizmo(canvas, orbit.gizmoHooks());
 
 //--- the tooltip ---------------------------------------------------------
 
@@ -258,14 +265,16 @@ function pickAt(clientX: number, clientY: number, full = false) {
 	const read = (mode: number) => {
 		pickTarget!.begin();
 		pickProgram!.draw({...common, u_pickMode: mode});
-		pickTarget!.readPixels(pickPixel);
+		const pixel = pickTarget!.readPixels();
 		pickTarget!.end();
-		return float3(pickPixel[0], pickPixel[1], pickPixel[2]);
+		return pixel;
 	};
 
-	const pos = read(0), kind = pickPixel[3];
-	const normal = full && kind > -0.5 ? read(1) : float3(0, 0, 0), mat = pickPixel[3];
-	const colour = full && kind > 0.5 ? read(2) : undefined;
+	const pixel = read(0);
+	const pos = float3(pixel[0], pixel[1], pixel[2]);
+	const kind = pixel[3];
+	const normal = full && kind > -0.5 ? float3.load(read(1)) : float3(0, 0, 0), mat = pickPixel[3];
+	const colour = full && kind > 0.5 ? float3.load(read(2)) : undefined;
 	const opacity = pickPixel[3];
 	gl.enable(gl.BLEND);
 	return {pos, kind, normal, mat, colour, opacity};
@@ -273,8 +282,7 @@ function pickAt(clientX: number, clientY: number, full = false) {
 
 function pick(clientX: number, clientY: number) {
 	const rect = canvas.getBoundingClientRect();
-	const hit = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom
-		? pickAt(clientX, clientY, true) : undefined;
+	const hit = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom ? pickAt(clientX, clientY, true) : undefined;
 	if (!hit || hit.kind < -0.5) {
 		hideTooltip();
 		return;
@@ -321,6 +329,42 @@ canvas.addEventListener('pointerleave', () => {
 	hideTooltip();
 });
 
+//--- the menu ----------------------------------------------------------------
+
+const icons = {
+	floor:	'<path d="M2 11l3-5h6l3 5zM6 6l-1 5M10 6l1 5M3.5 8.500h9"/>',
+	steps:	'<path d="M2 13h3V9h3V5h3V2h3"/>',
+	fit:	'<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>',
+	run:	'<path d="M4 2.500v11l9-5.500z"/>',
+	timer:	'<circle cx="8" cy="9" r="5"/><path d="M8 9V6M6.500 2h3"/>',
+};
+
+const menu = new Cascade($('main'), (): CascadeItem[] => [
+	toggleItem('Floor', svgFace(icons.floor), () => !!floorOn, v => { floorOn = v ? 1 : 0; render(); }),
+	toggleItem('Marching steps per pixel', svgFace(icons.steps), () => !!debug, v => { debug = v ? 1 : 0; showInfo(); render(); }),
+	{
+		face:		() => svgFace(icons.fit),
+		caption:	() => 'Fit to window',
+		select:		() => { homeView(); render(); },
+	},
+	...(modules.length ? [{
+		face:		() => svgFace(icons.run),
+		caption:	() => running ? `Running ${running}()` : 'Run a module',
+		children:	() => modules.map(name => ({
+			face:		() => `<span class="cascade-value">${name}</span>`,
+			caption:	() => `${name}()`,
+			active:		() => name === running,
+			// choosing the one running again goes back to the file as it was
+			select:		() => { post({command: 'run', name: name === running ? undefined : name}); },
+		})),
+	}] : []),
+	{
+		face:		() => svgFace(icons.timer),
+		caption:	() => 'Time a frame',
+		select:		() => { benchmark(); },
+	},
+]);
+
 // g toggles the floor, which is the one thing here that is not the model
 window.addEventListener('keydown', event => {
 	switch (event.key.toLowerCase()) {
@@ -337,6 +381,7 @@ window.addEventListener('keydown', event => {
 		default:
 			return;
 	}
+	menu.refresh();
 	render();
 });
 
@@ -367,68 +412,69 @@ function benchmark() {
 
 //--- the generated model -----------------------------------------------------
 
-// A shader that will not compile is the one failure this page cannot draw around, so the log is put where the model would be rather than only reported.
-function compile(code: string) {
+async function setModel(code: string, data: Float32Array) {
 	if (!source)
-		return false;
-	try {
-		program = canvas3d.createProgram({vert: source.vert, frag: source.frag.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
-		errorBox.classList.add('hidden');
-	} catch (error: any) {
-		program = undefined;
-		errorBox.textContent = String(error?.message ?? error);
-		errorBox.classList.remove('hidden');
-		return false;
-	}
-	// The picker shares the model's own generated code, but nothing depends on it compiling: if it does not, the
-	// tooltip just stays off, which is worth trying quietly rather than turning into a page error of its own.
-	try {
-		pickProgram = canvas3d.createProgram({vert: source.vert, frag: source.pick.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
-		pickTarget ??= canvas3d.createOffscreen(1, 1, 'rgba32f');
-	} catch (error) {
-		pickProgram = undefined;
-		console.warn('the pick shader did not compile; the tooltip is disabled', error);
-	}
-	return true;
-}
+		source = await RPC<{vert: string, frag: string, lib: string, pick: string}>({command: 'getShaders'});
 
-function setModel(message: Extract<MessageIn, {command: 'sdf'}>) {
-	const hadProgram = !!program;
-	// the camera is kept across an edit, so a change to the file does not move the view
-	const untouched = !hadProgram;// || message.center.some((v, i) => v !== center[i]) || message.half.some((v, i) => v !== half[i]);
-	center			= float3(message.center.x, message.center.y, message.center.z);
-	half			= float3(message.half.x, message.half.y, message.half.z);
-	scriptCamera	= message.camera;
-	orbit.fovy		= message.camera.vpf !== undefined ? 1 / Math.tan(message.camera.vpf * Math.PI / 360) : DEFAULT_FOVY;
-	program			= undefined;
-	setBatch(message.data);
-	if (!compile(message.code) || untouched)
-		homeView();
-	infoText 		= `${message.info}${message.warnings.length ? ` — ${message.warnings.join('; ')}` : ''}`;
-	perfNote		= '';
-	showInfo();
-	draw();
+	program			= canvas3d.createProgram({vert: source.vert, frag: source.frag.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
+	pickProgram		= canvas3d.createProgram({vert: source.vert, frag: source.pick.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
+	pickTarget 		??= canvas3d.createOffscreen(1, 1, 'rgba32f');
+
+	if (data.length === 0) {
+		if (batchTexture)
+			canvas3d.deleteTexture(batchTexture);
+		batchTexture = null;
+		return;
+	}
+	const rows		= Math.ceil(data.length / 4 / 1024);
+	const padded	= new Float32Array(rows * 1024 * 4);
+	padded.set(data);
+
+	batchTexture ??= canvas3d.createTexture(1024, rows, padded, {format: 'rgba32f', min: 'nearest', mag: 'nearest'});
 }
 
 //--- messages ----------------------------------------------------------------
 
-window.addEventListener('message', event => {
+window.addEventListener('message', async event => {
 	if (handleResult(event.data))
 		return;
 	const message = event.data as MessageIn;
 	switch (message.command) {
 		case 'sdf':
-			setModel(message);
+			try {
+				const untouched = !program;// || message.center.some((v, i) => v !== center[i]) || message.half.some((v, i) => v !== half[i]);
+				await setModel(message.code, message.data);
+				center			= float3(message.center.x, message.center.y, message.center.z);
+				half			= float3(message.half.x, message.half.y, message.half.z);
+				scriptCamera	= message.camera;
+				orbit.fovy		= message.camera.vpf !== undefined ? 1 / Math.tan(message.camera.vpf * Math.PI / 360) : DEFAULT_FOVY;
+
+				infoText 		= `${message.info}${message.warnings.length ? ` — ${message.warnings.join('; ')}` : ''}`;
+				perfNote		= '';
+				showInfo();
+				draw();
+				errorBox.classList.add('hidden');
+				//if (untouched)
+					homeView();
+				render();
+
+			} catch(error: any) {
+				program = undefined;
+				errorBox.textContent = String(error?.message ?? error);
+				errorBox.classList.remove('hidden');
+			}
 			break;
+
 		case 'error':
 			errorBox.textContent = message.message;
 			errorBox.classList.remove('hidden');
 			break;
-		case 'fitToWindow':
-			homeView();
-			render();
+		case 'modules':
+			modules	= message.names;
+			running	= message.running;
+			menu.refresh();
 			break;
-		case 'resetZoom':
+		case 'fitToWindow':
 			homeView();
 			render();
 			break;
@@ -439,12 +485,6 @@ RPC<GlyphAtlas | undefined>({command: 'getGlyphs'}).then(atlas => {
 	if (atlas) {
 		glyphs			= atlas;
 		glyphTexture	??= canvas3d.createTexture(atlas.width, atlas.height, atlas.data, {format: 'r8', min: 'linear', mag: 'linear'});
-		render();
+		post({command: 'ready'});
 	}
 }).catch(() => {});		// no numbers on the floor is not worth an error
-
-RPC<{vert: string, frag: string, lib: string, pick: string}>({command: 'getShaders'}).then(shaders => {
-	source = shaders;
-	homeView();
-	post({command: 'ready'});
-}).catch(error => post({command: 'error', message: String(error?.message ?? error)}));

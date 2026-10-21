@@ -2,28 +2,20 @@
 // that was under the cursor when the button went down: a pan keeps that point under the cursor wherever it goes, and a
 // turn orbits about it, so it stays where it was clicked. The wheel moves toward or away from the point under the cursor.
 import { float3, float3x3, float3x4, float4x4, orthonormalise } from '@isopodlabs/maths/vector';
+import type { GizmoHooks } from './gizmo.js';
+import { Navigate, NavigateHooks } from './navigate.js';
 
-export interface OrbitHooks {
+export interface OrbitHooks extends NavigateHooks {
 	anchor(clientX: number, clientY: number): float3;	// the point under the cursor a drag or zoom holds on to
 	size():			number;								// how big the model is, which bounds a zoom
-	changed():		void;								// the view has moved
-	dragStart?():	void;
-	zoomed?(clientX: number, clientY: number): void;
 }
 
 export const DEFAULT_FOVY = 1 / Math.tan(Math.PI / 6);
 
-export class Orbit {
+export class Orbit extends Navigate<float3, OrbitHooks> {
 	basis		= float3x3.identity();		// camera right, up and back
 	eye			= float3(0, 0, 6);			// where the camera is
 	fovy		= DEFAULT_FOVY;				// the cotangent of half the vertical field of view
-	dragging	= false;
-
-	constructor(private canvas: HTMLCanvasElement, private hooks: OrbitHooks) {
-		canvas.addEventListener('contextmenu', event => event.preventDefault());
-		canvas.addEventListener('pointerdown', event => this.pointerDown(event));
-		canvas.addEventListener('wheel', event => this.wheel(event), {passive: false});
-	}
 
 	// The ray through a point of the canvas, in the camera's frame and unnormalised, so that a point d in front of the
 	// camera and on that ray is at eye + basis * (ray * d).
@@ -46,6 +38,24 @@ export class Orbit {
 		this.eye	= basis.z.scale(distance).add(target);
 	}
 
+	// the gizmo's view of this camera (see gizmo.ts): a turn is about the anchor at the middle of the canvas, as a drag's is
+	// about the one under the cursor, and keeps the camera's distance from it
+	gizmoHooks(): GizmoHooks {
+		let pivot = float3(0, 0, 0);
+		return {
+			begin: () => {
+				const rect	= this.canvas.getBoundingClientRect();
+				pivot		= this.hooks.anchor(rect.left + rect.width / 2, rect.top + rect.height / 2);
+			},
+			rotation:		() => this.basis.transpose(),
+			setRotation:	rotation => {
+				this.basis	= rotation.transpose();
+				this.eye	= pivot.add(this.basis.z.scale(this.eye.sub(pivot).len()));
+				this.hooks.redraw();
+			},
+		};
+	}
+
 	toview(): float3x4 {
 		return float3x4(
 			this.basis.x, this.basis.y, this.basis.z, this.eye
@@ -58,19 +68,17 @@ export class Orbit {
 		return float4x4.perspective(f, aspect, near, far);
 	}
 
-	private pointerDown(event: PointerEvent) {
-		if (event.button !== 0 && event.button !== 2)
-			return;
-		const canvas	= this.canvas;
+	protected anchorAt(clientX: number, clientY: number) {
+		return this.hooks.anchor(clientX, clientY);
+	}
+
+	// a drag pans (left) or turns about the anchor (right)
+	protected grab(anchor: float3, event: PointerEvent) {
 		const rotating	= event.button === 2;
-		this.dragging	= true;
-		this.hooks.dragStart?.();
-		canvas.setPointerCapture(event.pointerId);
-		const anchor	= this.hooks.anchor(event.clientX, event.clientY);
 		// how far in front of the camera the anchor is, which a pan keeps
 		const depth		= anchor.sub(this.eye).dot(this.basis.z.neg());
 		let last		= {x: event.clientX, y: event.clientY};
-		const onMove = (e: PointerEvent) => {
+		return (e: PointerEvent) => {
 			if (rotating) {
 				// in css pixels, so how far a drag turns the model does not depend on the size the frame is drawn at
 				const dx = e.clientX - last.x, dy = e.clientY - last.y;
@@ -83,24 +91,12 @@ export class Orbit {
 				this.eye = anchor.sub(this.basis.mul(this.ray(e.clientX, e.clientY)).scale(depth));
 			}
 			last = {x: e.clientX, y: e.clientY};
-			this.hooks.changed();
+			this.hooks.redraw();
 		};
-		const onUp = () => {
-			this.dragging = false;
-			canvas.removeEventListener('pointermove', onMove);
-			canvas.removeEventListener('pointerup', onUp);
-			canvas.removeEventListener('pointercancel', onUp);
-		};
-		canvas.addEventListener('pointermove', onMove);
-		canvas.addEventListener('pointerup', onUp);
-		canvas.addEventListener('pointercancel', onUp);
 	}
 
-	private wheel(event: WheelEvent) {
-		event.preventDefault();
-		const anchor	= this.hooks.anchor(event.clientX, event.clientY);
+	protected zoom(anchor: float3, factor: number, event: WheelEvent) {
 		const scale		= this.hooks.size();
-		const factor	= 1.01 ** -event.deltaY;
 		const offset	= this.eye.sub(anchor), dist = offset.len();
 		// Close to a surface, zooming in stops closing on it by a fraction of the distance -- which never arrives -- and
 		// steps along the cursor's ray instead, so it goes through the wall and into whatever is hollow behind it.
@@ -111,7 +107,5 @@ export class Orbit {
 		} else {
 			this.eye = anchor.add(offset.scale(Math.min(scale * 20, dist * factor) / dist));
 		}
-		this.hooks.changed();
-		this.hooks.zoomed?.(event.clientX, event.clientY);
 	}
 }

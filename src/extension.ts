@@ -7,145 +7,17 @@ import { GgufViewerProvider } from './GgufViewer';
 import { ScadViewerProvider, exportStl, exportCsg } from './ScadViewer';
 import { MeshViewerProvider } from './MeshViewer';
 import { FontViewerProvider } from './FontViewer';
+import { SvgViewerProvider } from './SvgViewer';
+import { SCHEME, embedded } from './embedded';
 import type { MessageIn, EditOp, LayerOp } from '../webview/bitmap';
 import type { GlyphAtlas } from '../webview/sdf';
-import { findFont, glyphContours } from './scad/fonts';
-import { load, Font, curvepathDistance2 } from '@isopodlabs/binary_fonts';
+import { findFont, glyphContours } from './fonts';
+import { FileReader } from './filereader';
+import { load, Font, curveDistance } from '@isopodlabs/binary_fonts';
 import { float2 } from '@isopodlabs/maths/vector';
 
-// `use`/`include`/surface()/import() read files from inside the synchronous parser and evaluator, and a blocking
-// readFileSync/existsSync there stalls the extension host (keystrokes are dropped). So they read from a cache that
-// is filled asynchronously instead: a path not in the cache is recorded as a miss and answered with a placeholder,
-// the run's result is thrown away, and withFiles() loads what was missed (concurrently, off the main thread) and
-// runs again. Only the files a document actually touches are loaded, and a run that misses nothing is the real one.
-//
-// Resolution order: a path that is not there relative to the including file falls back to each directory in
-// scad.libraryPath, the way OpenSCAD's own OPENSCADPATH lets a library like MCAD resolve without every project
-// vendoring its own copy. A path found in neither resolves to nothing, which is what OpenSCAD does with a missing
-// library. The setting is read fresh on every call, so a change takes effect on the next edit.
-//
-// Between runs an entry is kept only while its mtime and size still match (one async stat each, at the start of
-// withFiles), and a missing file is looked for again.
-interface FileEntry {
-	mtimeMs: number,
-	size: number,
-	value?: any
-}
-
-type Reader<T = any> = (bytes: Uint8Array) => T | Promise<T>;
-
-class FileReader {
-
-	fileEntries		= new Map<string, FileEntry | null>();	// null: looked for and not there
-	missingStats	= new Set<string>();
-	missingBytes	= new Map<string, Reader|undefined>();
-	filesQueue		= Promise.resolve(null as unknown);
-
-	private contents(full: string, reader?: Reader) {
-		const entry = this.fileEntries.get(full);
-		if (entry === null)
-			throw new Error(`ENOENT: ${full}`);
-		if (entry?.value)
-			return entry;
-		this.missingBytes.set(full, reader);
-		return undefined;
-	}
-
-
-	exists(full: string): boolean | undefined {
-		const entry = this.fileEntries.get(full);
-		if (entry === undefined)
-			this.missingStats.add(full);
-		else
-			return !!entry;
-	}
-
-	resolve(written: string, fromDir: string) {
-		const candidates = path.isAbsolute(written) ? [written] : [
-			path.join(fromDir, written),
-			...(vscode.workspace.getConfiguration('scad').get<string[]>('libraryPath') ?? []).map(dir => path.join(dir, written)),
-		];
-		let found: string | undefined, complete = true;
-		for (const full of candidates) {
-			const x = this.exists(full);
-			if (x === undefined) {
-				complete = false;
-			} else if (x && complete && !found) {
-				found = full;
-			}
-		}
-		return found;
-	}
-	read(full: string): string {
-		return this.contents(full, bytes => new TextDecoder('utf-8').decode(bytes))?.value ?? '';
-	}
-
-	readBinary<T>(full: string, reader: (bytes: Uint8Array) => T | Promise<T>) {
-		return this.contents(full, reader)?.value;
-	}
-
-	/** Run `run` -- which reads through `files` -- and give its result, loading whatever it asked for that was not
-	 *  cached yet and running it again until nothing is missing. Runs are queued, since they share the cache. */
-	with<T>(run: () => T | Promise<T>): Promise<T> {
-		const loadFile = async (full: string) => {
-			try {
-				const stat = await fs.promises.stat(full);
-				const entry: FileEntry = {mtimeMs: stat.mtimeMs, size: stat.size};
-				this.fileEntries.set(full, entry);
-				if (stat.isFile())
-					return entry;
-			} catch {
-				this.fileEntries.set(full, null);
-			}
-		}
-
-		const result = this.filesQueue.then(async () => {
-			// drop what changed on disk since the last run, and retry what was missing
-			await Promise.all([...this.fileEntries].map(async ([full, entry]) => {
-				if (entry) {
-					try {
-						const stat = await fs.promises.stat(full);
-						if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size)
-							return;
-					} catch {}
-				}
-				this.fileEntries.delete(full);
-			}));
-			for (;;) {
-				let value: T | undefined, error: unknown, failed = false;
-				try {
-					value = await run();
-				} catch (e) {
-					error = e;
-					failed = true;
-				}
-				if (!this.missingStats.size && !this.missingBytes.size) {
-					if (failed)
-						throw error;
-					return value as T;
-				}
-				// a miss means this run saw placeholders, so whatever it made or threw is not to be believed
-				const bytes = [...this.missingBytes], stats = [...this.missingStats].filter(full => !this.missingBytes.has(full));
-				this.missingBytes.clear();
-				this.missingStats.clear();
-				await Promise.all([
-					...bytes.map(async ([full, reader]) =>  {
-						const entry = await loadFile(full);
-						if (entry) {
-							const bytes = await fs.promises.readFile(full);
-							entry.value = reader ? await reader(bytes) : bytes;
-						}
-					}),
-					...stats.map(loadFile)
-				]);
-			}
-		});
-		this.filesQueue = result.catch(() => {});
-		return result;
-
-	}
-}
-export const files = new FileReader;
+// What `use`/`include`/surface()/import() read through, without blocking the extension host (see FileReader)
+export const files = new FileReader(() => vscode.workspace.getConfiguration('scad').get<string[]>('libraryPath') ?? []);
 
 //-----------------------------------------------------------------------------
 // the digits for the floor's axis labels
@@ -230,7 +102,7 @@ function bakeCharacters(font: Font, chars: string): GlyphAtlas | undefined {
 			const y = cellY0 + (j + 0.5) / height * cellHEm;
 			for (let i = 0; i < cellW; i++) {
 				const x = cellX0 + (i + 0.5) / cellW * cellWEm;
-				const d = curvepathDistance2(float2(x, y), g.curves);
+				const d = curveDistance(float2(x, y), g.curves);
 				data[j * width + cell * cellW + i] = Math.max(0, Math.min(255, Math.round(255 * (0.5 - 0.5 * d / spread))));
 			}
 		}
@@ -242,7 +114,7 @@ function bakeCharacters(font: Font, chars: string): GlyphAtlas | undefined {
 
 // what the fit and reset commands need of the viewer they apply to: the bitmap viewer and the tensor viewer both have it
 export interface Zoomable {
-	postMessage(message: {command: 'fitToWindow'} | {command: 'resetZoom'}): unknown;
+	postMessage(message: {command: 'fitToWindow'}): unknown;
 }
 let activeViewer: Zoomable | undefined;
 export function setActiveViewer(viewer: Zoomable) {
@@ -259,10 +131,12 @@ const editOps: (EditOp | LayerOp)[]	= ['fill', 'clear', 'invert', 'flipHorizonta
 
 export function activate(context: vscode.ExtensionContext) {
 	new BitmapViewerProvider(context);
+	context.subscriptions.push(vscode.workspace.registerFileSystemProvider(SCHEME, embedded, {isCaseSensitive: true}));
 	new GgufViewerProvider(context);
 	new ScadViewerProvider(context);
 	new MeshViewerProvider(context);
 	new FontViewerProvider(context);
+	new SvgViewerProvider(context);
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('scad.exportStl', (uri?: vscode.Uri) => {
@@ -296,8 +170,8 @@ export function activate(context: vscode.ExtensionContext) {
 		// the bitmap editor's whole-image operations (from the title menu), done by the viewer; only its menu offers them,
 		// so the active viewer is one that takes them
 		...editOps.map(op => vscode.commands.registerCommand(`bitmap.${op}`, () => editViewer()?.postMessage({command: 'imageOp', op}))),
+		vscode.commands.registerCommand('bitmap.toCubemap', () => editViewer()?.postMessage({command: 'imageOp', op: 'toCubemap'})),
 		vscode.commands.registerCommand('bitmap.fit', () => activeViewer?.postMessage({command: 'fitToWindow'})),
-		vscode.commands.registerCommand('bitmap.reset', () => activeViewer?.postMessage({command: 'resetZoom'})),
 	);
 
 }

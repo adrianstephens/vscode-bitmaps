@@ -3,11 +3,37 @@
 import * as vscode from 'vscode';
 import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
-import { load, Font, WOFF, WOFF2, TTF_OTF, parseCurve, curveVertex } from '@isopodlabs/binary_fonts';
+import { load, Font, WOFF, WOFF2, TTF_OTF, parseCurve, curveVertex, parseSVGshape, makeSVGPath, makeCurve, bezier3Curve, curveSimplify, ON_BEGIN, ON_CURVE, ON_END } from '@isopodlabs/binary_fonts';
 import type { FontInfo, GlyphDetail, TableNode, MessageIn, MessageOut } from '../webview/font';
 
+import { float2 } from '@isopodlabs/maths/vector';
 import { setActiveViewer } from './extension';
+import { embedded, type EmbeddedImage } from './embedded';
 import { webviewPage } from './BitmapViewer';
+
+// a path or basic shape as the points the SVG editor takes, left open where a contour's last point is ON_END
+export function shapePoints(name: string, attributes: Record<string, string>) {
+	return bezier3Curve(makeCurve(parseSVGshape({name, attributes}, true) ?? {run() {}}), 1e-6);
+}
+
+// points as the editor has them with fewer of them, the outline kept within tol; quadratics only unless cubic curves are allowed
+export function simplifyPoints(points: curveVertex[], tol: number, cubic: boolean) {
+	return curveSimplify(points, tol, {quadratic: !cubic});
+}
+
+// a stroke (x, y in pairs) as the points of an open path of cubics that follows it to within tol
+export function fitStroke(stroke: number[], tol: number) {
+	// samples closer together than tol are only noise
+	const kept: float2[] = [];
+	for (let i = 0; i < stroke.length; i += 2) {
+		const p = float2(stroke[i], stroke[i + 1]);
+		if (!kept.length || p.sub(kept[kept.length - 1]).len() >= tol)
+			kept.push(p);
+		else if (i === stroke.length - 2)
+			kept[kept.length - 1] = p;
+	}
+	return kept.length < 2 ? [] : curveSimplify(kept.map((p, i) => curveVertex(p.x, p.y, i ? i === kept.length - 1 ? ON_END : ON_CURVE : ON_BEGIN)), tol, {corner: Math.PI / 3, noisy: true});
+}
 
 // names in a font file are UTF-16 that the reader leaves as bytes, so a NUL sits before each Latin character
 const clean = (s?: string) => s?.replace(/\0/g, '').trim() ?? '';
@@ -58,50 +84,44 @@ export function fontInfo(font: Font, file: string, face: number, faces: string[]
 	};
 }
 
-// the size of the largest bitmap strike, in pixels per em, or 0 where the font has none
-function bitmapPpem(font: Font): number {
-	try {
-		const sizes = font.sbix?.strikes.map(s => s.ppem) ?? font.CBLC?.bitmapSizes.map(s => s.ppemX) ?? font.EBLC?.bitmapSizes.map(s => s.ppemX) ?? [];
-		return Math.max(0, ...sizes);
-	} catch {
-		return 0;
-	}
-}
-
-// a bitmap glyph (emoji and the like) as an <image> in font units, placed by the strike's origin offset
-function bitmapMarkup(font: Font, id: number): string {
-	try {
-		const ppem = bitmapPpem(font);
-		const image = ppem && font.getGlyphImage(id, ppem);
-		// a PNG's size is in its header: width and height, big-endian, after the signature and chunk name
-		if (!image || !image.type.startsWith('png') || image.data.length < 24)
-			return '';
-		const view = new DataView(image.data.buffer, image.data.byteOffset, image.data.byteLength);
-		const w = view.getUint32(16), h = view.getUint32(20);
-		const k = (font.head?.units_per_em || 1000) / ppem;
-		const x = image.originOffset.x * k, y = image.originOffset.y * k;
-		return `<image href="data:image/png;base64,${Buffer.from(image.data).toString('base64')}" x="${x}" y="${-(y + h * k)}" width="${w * k}" height="${h * k}"/>`;
-	} catch {
-		return '';
-	}
-}
+const compact = {indent: '', newline: ''};
 
 // a glyph's drawing as the markup inside an <svg> in font units (y down, baseline at 0), or '' where it has none
+// (a glyph of the SVG table is drawn as the editor has it, so that what it is edited as is what is shown)
 export function glyphMarkup(font: Font, id: number): string {
 	try {
-		const svg = font.getGlyphSVG(id, true);
-		const markup = svg ? String(svg).replace(/^[\s\S]*?<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '').replace(/fill="black"/g, 'fill="currentColor"') : '';
-		// outlines with no path to them are a glyph drawn some other way
-		if (markup.replace(/<path[^>]* d=""[^>]*\/>/g, '').includes('<'))
-			return markup;
+		const svg = font.getGlyphSVG(id, 7);
+		if (svg)
+			return svg.toString(compact).replace(/^[\s\S]*?<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '');
 	} catch {}
-	return bitmapMarkup(font, id);
+	return '';
 }
 
 // everything the inspector draws of a glyph: its outline as a path and as the points it is made of (y down, as the
 // page draws), and what is drawn of it in colour
-export function glyphDetail(font: Font, id: number): GlyphDetail {
-	let curves: ReturnType<Font['getGlyphCurves']> = [];
+// the em box of a glyph, which a drawing of it is shown in: from the top of the ascent to the bottom of the descent, y down
+function emBox(font: Font, id: number) {
+	const upm		= font.head?.units_per_em || 1000, m = font.hmtx?.metrics;
+	const advance	= m ? (m[Math.min(id, m.length - 1)]?.advance ?? upm) : upm;
+	const ascent	= font.hhea?.ascent ?? upm * 0.8, descent = font.hhea?.descent ?? -upm * 0.2;
+	return `0 ${-ascent} ${advance} ${ascent - descent}`;
+}
+
+// a glyph that is drawn in colour as a document of its own: from the SVG table (which can be edited), or from the colour
+// layers or a bitmap (which cannot)
+export function glyphSvg(font: Font, id: number, editable: boolean): GlyphDetail['svg'] {
+	const viewBox = emBox(font, id);
+	try {
+		const table = font.getGlyphSVG(id, 0), svg = table ?? font.getGlyphSVG(id, 5);
+		if (svg) {
+			Object.assign(svg.attributes, {viewBox, width: undefined, height: undefined});
+			return {text: svg.toString(compact), editable: !!table && editable};
+		}
+	} catch {}
+}
+
+export function glyphDetail(font: Font, id: number, svgEditable = false, bitmapEditable = false): GlyphDetail {
+	let curves: curveVertex[] = [];
 	let error: string | undefined;
 	try {
 		curves = font.getGlyphCurves(id);
@@ -109,26 +129,18 @@ export function glyphDetail(font: Font, id: number): GlyphDetail {
 		error = `outline could not be read: ${e?.message ?? e}`;
 	}
 
-	let path = '';
-	parseCurve(curves).run({
-		Begin:		a => { path += `M${a.x},${-a.y}`; },
-		End:		() => { path += 'Z'; },
-		Line:		(_a, b) => { path += `L${b.x},${-b.y}`; },
-		Bezier2:	(_a, b, c) => { path += `Q${b.x},${-b.y},${c.x},${-c.y}`; },
-		Bezier3:	(_a, b, c, d) => { path += `C${b.x},${-b.y},${c.x},${-c.y},${d.x},${-d.y}`; },
-		Arc:		(_a, _b, _c, d) => { path += `L${d.x},${-d.y}`; },
-		Arc3:		(_a, _b, c) => { path += `L${c.x},${-c.y}`; },
-	});
-
-	const points = curves.flatMap(v => [v.x, -v.y, v.flags]);
+	const path		= makeSVGPath(parseCurve(curves));
+	const points	= curves.map(v => curveVertex(v.x, -v.y, v.flags));
 	let components: number[] = [];
 	try {
 		components = font.getGlyph(id)?.refs?.map(r => r.glyph) ?? [];
 	} catch {}
-	const markup = glyphMarkup(font, id);
+	const markup	= glyphMarkup(font, id);
 	// drawn in colours of its own (a colour font's), which the outline being edited is not what makes
 	const colored = /url\(#|fill="#|fill="rgb/.test(markup);
-	return {path, points, markup, colored, components, error};
+	const ppem		= font.bitmapPpem();
+	const bitmap	= ppem && font.getGlyphImage(id, ppem)?.type === 'png ' ? {ppem, editable: bitmapEditable && !!font.sbix} : undefined;
+	return {path, points, markup, colored, components, error, svg: glyphSvg(font, id, svgEditable), bitmap};
 }
 
 const MAX_CHILDREN = 1000;
@@ -196,15 +208,11 @@ export function children(font: Font, keys: string[]): TableNode[] {
 	return result;
 }
 
-// the points the page edits, as the outline Font.setGlyph takes: x, y (down), flags in threes, a contour from each 0
-export function curveOf(points: number[]) {
-	const curve = [];
-	for (let i = 0; i < points.length; i += 3) {
-		if (i === 0 && points[2] !== 0)
-			throw new Error('an outline begins with a begin point');
-		curve.push(curveVertex(points[i], -points[i + 1], points[i + 2]));
-	}
-	return curve;
+// the points the page edits (y down), as the outline Font.setGlyph takes them
+export function curveOf(points: curveVertex[]) {
+	if (points.length && points[0].flags !== ON_BEGIN)
+		throw new Error('an outline begins with a begin point');
+	return points.map(v => curveVertex(v.x, -v.y, v.flags));
 }
 
 // a font file open for editing: the font as read, the edits made to it (which VS Code undoes and redoes through the
@@ -214,19 +222,26 @@ export class FontDocument implements vscode.CustomDocument {
 	fonts:		Font[] = [];
 	editable	= false;
 	convertible	= false;
+	svgEditable	= false;		// whether the SVG drawings of its glyphs can be edited
+	bitmapEditable = false;		// whether the bitmaps of its glyphs can be edited (sbix ones, which can be written)
+	// the bitmaps being edited in the bitmap editor, by glyph
+	private readonly bitmaps = new Map<number, {image: EmbeddedImage, ppem: number}>();
 	private data?:	Uint8Array;
 	error?:		string;
 	private saved?:	Uint8Array;		// what the file held when last read or written
 	// whether there are edits that are not in the file: from an edit until the save or revert, and from the start for a document
 	// restored from a backup. A file that changes on disk meanwhile is not read over them.
 	dirty = false;
-	private readonly changed = new vscode.EventEmitter<{kind: 'glyph', id: number} | {kind: 'reload'}>();
+	private readonly changed = new vscode.EventEmitter<{kind: 'glyph', id: number, own?: boolean} | {kind: 'reload'}>();
 	readonly onDidChange = this.changed.event;
 	readonly edited = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<FontDocument>>();
 
-	constructor(public readonly uri: vscode.Uri, private readonly backup?: vscode.Uri) {}
+	constructor(public readonly uri: vscode.Uri, private readonly backup?: vscode.Uri) {
+		this.onDidChange(() => this.syncBitmaps());
+	}
 
 	dispose() {
+		this.bitmaps.forEach(({image}) => image.dispose());
 		this.changed.dispose();
 		this.edited.dispose();
 	}
@@ -242,6 +257,8 @@ export class FontDocument implements vscode.CustomDocument {
 		this.data = data;
 		this.editable = result instanceof Font && !!result.glyphdata && /\.(ttf|woff2?)$/i.test(this.uri.fsPath);
 		this.convertible = result instanceof Font && !result.glyphdata && !!result.rawTables.get('CFF ') && /\.otf$/i.test(this.uri.fsPath);
+		this.svgEditable = result instanceof Font && /\.(ttf|otf|woff2?)$/i.test(this.uri.fsPath);
+		this.bitmapEditable = result instanceof Font && !!result.sbix && /\.(ttf|otf|woff2?)$/i.test(this.uri.fsPath);
 		this.saved = bytes ? undefined : data;
 		this.dirty = !!bytes;
 	}
@@ -281,20 +298,76 @@ export class FontDocument implements vscode.CustomDocument {
 	}
 
 	// replaces a glyph's outline, and says how to undo that
-	edit(id: number, points: number[], label: string) {
+	edit(id: number, points: curveVertex[], label: string) {
 		const font = this.fonts[0];
 		if (!this.editable || !font.glyphdata || !(id >= 0 && id < font.glyphdata.length))
 			throw new Error('this font cannot be edited');
 		this.dirty = true;
-		const before = font.snapshotGlyph(id);
-		font.setGlyph(id, {curve: curveOf(points)});
-		const after = font.snapshotGlyph(id);
-		const apply = (snap: typeof before) => {
-			font.restoreGlyph(id, snap);
+
+		const {undo, redo} = font.setGlyph(id, {curve: curveOf(points)})!;
+		const apply = (f: ()=>void) => {
+			f();
 			this.changed.fire({kind: 'glyph', id});
 		};
-		this.edited.fire({document: this, label, undo: () => apply(before), redo: () => apply(after)});
+		this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(redo)});
 		this.changed.fire({kind: 'glyph', id});
+	}
+
+	// a glyph's SVG drawing replaced by an edited one, which goes into the document of the SVG table that has it
+	editSvg(id: number, text: string, label: string) {
+		const font = this.fonts[0];
+		try {
+			const {undo, redo} = font.setGlyphSVG(id, text);
+			this.dirty = true;
+			const apply = (f: ()=>void) => {
+				f();
+				this.changed.fire({kind: 'glyph', id});
+			};
+			this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(redo)});
+			this.changed.fire({kind: 'glyph', id, own: true});
+		} catch (e) {
+			throw new Error('the SVG drawing of this glyph cannot be edited');
+		}
+	}
+
+	// a glyph's bitmap replaced by an edited one (a PNG), in the strike of the size it was taken from
+	editBitmap(id: number, ppem: number, data: Uint8Array, label: string) {
+		const font = this.fonts[0];
+		const was = font.getGlyphImage(id, ppem);
+		const {undo, redo} = font.setGlyphImage(id, ppem, {type: 'png ', originOffset: was?.originOffset ?? float2(0, 0), data});
+		this.dirty = true;
+		const apply = (f: ()=>void) => {
+			f();
+			this.changed.fire({kind: 'glyph', id});
+		};
+		this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(redo)});
+		this.changed.fire({kind: 'glyph', id});
+	}
+
+	// a glyph's bitmap at the largest size shown in the bitmap editor: saved back to the font if that can be written
+	async openBitmap(font: Font, id: number) {
+		const ppem = font.bitmapPpem(), picture = font.getGlyphImage(id, ppem);
+		if (!picture || picture.type !== 'png ')
+			throw new Error('this glyph has no PNG bitmap');
+		this.bitmaps.get(id)?.image.dispose();
+		const image = embedded.add(`glyph-${id}-${ppem}ppem.png`, picture.data, data => this.editBitmap(id, ppem, data, 'Edit bitmap'));
+		if (!this.bitmapEditable)
+			image.lose('this font\'s bitmaps cannot be written back');
+		this.bitmaps.set(id, {image, ppem});
+		await vscode.commands.executeCommand('vscode.openWith', image.uri, 'bitmap.viewer');
+	}
+
+	// the bitmaps being edited are what the font now holds: it may have been edited, undone or read again
+	private syncBitmaps() {
+		if (!this.bitmapEditable)
+			return;
+		for (const [id, {image, ppem}] of this.bitmaps) {
+			const picture = this.fonts[0].getGlyphImage(id, ppem);
+			if (picture?.type === 'png ')
+				image.update(picture.data);
+			else
+				image.lose(`the font no longer has a bitmap for glyph ${id}`);
+		}
 	}
 
 	bytes() {
@@ -315,7 +388,7 @@ export class FontDocument implements vscode.CustomDocument {
 }
 
 // what the inspector says about what is under the pointer is shown in the status bar while that editor is the active one
-class StatusLine {
+export class StatusLine {
 	private readonly item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	private owner?: object;
 
@@ -359,36 +432,22 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 			<div id="font-body">
 				<div id="font-side">
 					<div id="font-detail" />
+					<div id="font-layers" class="hidden">
+						<div id="font-layer-tree" class="layer-tree" />
+						<div id="font-layer-props" class="layer-props" />
+					</div>
 					<div id="font-meta" />
 					<div id="font-tables" />
 				</div>
 				<div id="font-splitter" class="splitter" />
 				<div id="font-grid" />
 				<div id="font-inspector" class="hidden">
-					<div id="insp-bar">
-						<button id="insp-back" title="Back to the glyphs (Esc)">◂ Glyphs</button>
-						<button id="insp-prev" title="Previous glyph (←)">‹</button>
-						<span id="insp-title" />
-						<button id="insp-next" title="Next glyph (→)">›</button>
-						<span class="insp-sep" />
-						<label><input id="insp-grid" type="checkbox" checked /> Grid</label>
-						<label><input id="insp-metrics" type="checkbox" checked /> Metrics</label>
-						<label><input id="insp-fill" type="checkbox" checked /> Fill</label>
-						<label><input id="insp-outline" type="checkbox" checked /> Outline</label>
-						<label><input id="insp-polygon" type="checkbox" checked /> Polygon</label>
-						<label><input id="insp-points" type="checkbox" checked /> Points</label>
-						<label><input id="insp-numbers" type="checkbox" /> Numbers</label>
-						<span class="insp-sep" />
-						<label id="insp-snap-label" class="hidden"><input id="insp-snap" type="checkbox" checked /> Snap</label>
-						<span class="insp-sep" />
-						<button id="insp-fit" title="Fit the glyph (0)">Fit</button>
-					</div>
+					<div id="insp-bar"><span id="insp-title" /></div>
 					<div id="insp-view" />
-					<div id="insp-menu" class="hidden" />
 				</div>
 			</div>,
 			<pre id="scad-error" class="hidden" />,
-		], 'tensors', ['assets/font.css', 'assets/scad.css']);
+		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
 
 		const file = document.uri.fsPath;
 		const watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
@@ -399,7 +458,7 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 			if (change.kind === 'reload')
 				this.send();
 			else
-				this.postMessage({command: 'glyphChanged', id: change.id});
+				this.postMessage({command: 'glyphChanged', id: change.id, own: change.own});
 		}));
 	}
 
@@ -460,8 +519,24 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 				const font = this.fonts[this.face];
 				return Object.fromEntries(message.ids.map(id => [id, glyphMarkup(font, id)]));
 			}
+			case 'editGlyphSvg':
+				try {
+					this.document.editSvg(message.id, message.text, message.label);
+				} catch (error: any) {
+					vscode.window.showErrorMessage(`Font editor: ${error?.message ?? error}`);
+				}
+				break;
+			case 'shapePoints':
+				return shapePoints(message.name, message.attributes);
+			case 'simplifyPoints':
+				return simplifyPoints(message.points, message.tol, message.cubic);
+			case 'fitStroke':
+				return fitStroke(message.stroke, message.tol);
 			case 'getGlyphDetail':
-				return glyphDetail(this.fonts[this.face], message.id);
+				return glyphDetail(this.fonts[this.face], message.id, this.document.svgEditable && this.face === 0, this.document.bitmapEditable && this.face === 0);
+			case 'editGlyphBitmap':
+				await this.document.openBitmap(this.fonts[this.face], message.id);
+				break;
 			case 'getTable':
 				return children(this.fonts[this.face], message.path);
 			case 'error':

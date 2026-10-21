@@ -13,6 +13,7 @@ out vec4		fragColor;
 
 // how much work the pixel cost: the marching steps taken
 int				g_steps = 0;
+vec3			g_hit = vec3(0.0);	// the point being shaded, for a colour that is a function of the point (see matColor)
 
 //@floor
 
@@ -157,6 +158,7 @@ vec3 seen(vec3 ro, vec3 rd, int budget) {
 	vec3	hit;
 	float	mat;
 	float	t = trace(ro, rd, hit, mat, budget);
+	g_hit = hit;
 	vec3	model = t < 0.0 ? background(rd)
 		: localLight(normalAt(hit, max(max(u_half.x, u_half.y), u_half.z) * 5e-4), -rd, mat, 1.0);
 	if (u_floorOn > 0.5) {
@@ -239,6 +241,7 @@ vec3 throughMedium(vec3 at, vec3 n, vec3 rd, float ior, vec3 base, float eps, fl
 // The colour of the first hit on the model: its lights, and for a metal or a transmissive material, what it reflects
 // and what is seen through it.
 vec3 shadeHit(vec3 rd, vec3 hit, float mat, float scale, float eps) {
+	g_hit			= hit;
 	vec3	n		= normalAt(hit, scale * 5e-4);
 	vec3	view	= -rd;
 	vec3	base	= matColor(mat);

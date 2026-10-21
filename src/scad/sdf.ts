@@ -3,17 +3,62 @@
 // are primitives, and the combinators are exactly the SDF operations the scad constructs mean. Each term can be
 // emitted as glsl for the raymarcher, or evaluated here, which is how the model can be measured without a GPU.
 import { vec, E3, float2, float3, float3x3, float3x4, safeNormalise } from '@isopodlabs/maths/vector';
-import { curvepathDistance2, bezier2Curve, parseCurve } from '@isopodlabs/binary_fonts';
+import { curveDistance, bezier2Curve, parseCurve } from '@isopodlabs/binary_fonts';
 import { eigenSymmetric } from '@isopodlabs/maths/linear';
-import { type TriMesh, trimeshDistance } from './meshfield';
+import type { FieldFn, ColorFn } from './fnsurface';
 
 function normalize(v: float3) {
 	return safeNormalise(v) ?? float3(0, 0, 0);
 }
 
-export interface Box2	{ min: float2, max: float2 }
-export interface Box3	{ min: float3, max: float3 }
+export type Box2		= float2.extent
+export type Box3		= float3.extent
+export const Box2		= float2.extent;
+export const Box3		= float3.extent
 export interface Hull3	{planes: {n: float3, d: number}[], faces: float3[][]}
+
+export class SDF {
+	constructor(public root: Sdf) {}
+	
+	bounds()	{ return bounds3(this.root); }
+	eval(p: float3): number {
+		return evalSdf(this.root, p);
+	}
+	normal(p: float3, eps: number)	{
+		return surfaceNormal(this.root, p, eps);
+	}
+	restrict(c: float3, r: number)	{
+		return restrict(this.root, c, r);
+	}
+	planes(p: float3, cell: float3[], eps: number) {
+		return planesOf(this.root, p, cell, eps);
+	}
+	// what the model is in a word, for diagnosis
+	describe() {
+		return describe(this.root);
+	}
+
+	walk(callback: (s: Sdf, process: (s: Sdf) => Sdf) => Sdf) {
+		return walk(this.root, callback);
+	}
+
+}
+
+function describe(s: Sdf): string {
+	switch (s.k) {
+		case 'union': case 'intersection': {
+			const c: Record<string, number> = {};
+			for (const k of s.children) {
+				const d = describe(k);
+				c[d] = (c[d] || 0) + 1;
+			}
+			return s.k.slice(0, 5) + '(' + Object.entries(c).map(([k, v]) => v > 1 ? v + 'x' + k : k).join(',') + ')';
+		}
+		case 'difference':	return 'diff(' + [s.base, ...s.cuts].map(describe).join(',') + ')';
+		case 'domain':		return 'dom.' + describe(s.body);
+		default:			return s.k;
+	}
+}
 
 // What a Minkowski operand adds to the field around the shape it is summed with: the support function of the
 // operand's own shape, so `dilate` never has to know what that shape was. q is A*Aᵗ of the operand's linear part
@@ -24,49 +69,20 @@ export interface Support {
 	bound:	number;				// how far the operand can reach from the origin, for the bounding box
 }
 
-export type Sdf =
-	| {k: 'empty'}
-	| {k: 'sphere', r: number}
-	| {k: 'box', size: float3, center: boolean}
-	| {k: 'cylinder', r: number, h: number, center: boolean}
-	| {k: 'ngonPrism', r: number, h: number, center: boolean, n: number}
-	// a smooth taper (cylinder(r1, r2) with r1 != r2 and no $fn): a faceted one is built as a real polyhedron
-	// instead (see evaluate.ts's 'cylinder' case), the same choice already made for a plain faceted cylinder
-	| {k: 'cone', r1: number, r2: number, h: number, center: boolean}
-	| {k: 'planes', planes: {n: float3, d: number}[], points: float3[], faces: float3[][]}
-	| {k: 'union', children: Sdf[]}
-	| {k: 'intersection', children: Sdf[]}
-	| {k: 'difference', base: Sdf, cuts: Sdf[]}
-	| {k: 'domain', m: float3x4, scale: number, body: Sdf}		// the body is built in the frame m
-	| Warp														// the body is built flat and bent into a revolution
-	| {k: 'dilate', body: Sdf, support: Support}				// body grown by the operand's support function
-	// hull() of exactly two same-radius spheres/circles is a capsule/stadium, not a dilated solid hull (a solid hull
-	// needs 4 non-coplanar points; two spheres give only a segment) -- see hullOf() below
-	| {k: 'capsule', a: float3, b: float3, r: number}
-	// the exact hull of two balls of different radii (a "round cone"): a capsule generalised to r1 != r2, one
-	// spherical cap at each end and a smoothly tangent conical collar between them -- degenerates to capsule at
-	// r1 = r2 and to a sharp point capped by a single sphere at r1 = 0 or r2 = 0. Built for a mixed hull() (see
-	// weightedHull3 below), whose edges connect points that may carry any radius, including zero for a sharp corner.
-	| {k: 'roundCone', a: float3, b: float3, r1: number, r2: number}
-	// surface(): a height at each point of a grid (x the column, y the row, a unit apart), over a solid down to `bottom`
-	// -- built by heightmap(), which says what the tiles are for
-	| Heightmap
-	| TriMesh													// import()ed meshes and polyhedron()s that are not convex
-	// 2-D shapes: fields of the plane that no z can change. They are not solids, so a union skips them for bounds
-	// and anything left at the top level is reported rather than drawn as the infinite prism the field describes.
-	| {k: 'circle2', r: number, n: number}						// n = 0 is a smooth circle, otherwise an n-gon
-	| {k: 'square2', size: float2, center: boolean}
-	| {k: 'polygon2', paths: float2[][]}						// each path a closed loop; more than one is holes/islands by even-odd fill
-	// a closed path of lines and quadratic Beziers (text()'s glyph outlines, in the font's own curves rather than a
-	// flattened polygon), each path its own start point and the segments that lead from it back around to it again
-	| {k: 'curvepath2', paths: bezier2Curve }
-	| {k: 'stadium2', a: float2, b: float2, r: number}			// hull() of two same-radius circles: 'capsule''s 2-D form
-	| {k: 'offset', r: number, body: Sdf}						// offset(r): the shape grown by a disc
-	| {k: 'extrude', h: number, center: boolean, body: Sdf}		// linear_extrude of a 2-D shape
-	| {k: 'revolve', angle: number, body: Sdf}					// rotate_extrude of a 2-D shape, about z
-	| {k: 'material', mat: Material, body: Sdf};				// color()/$variables round the body, which they tint
-
-export const empty: Sdf = {k: 'empty'};
+export interface TriMesh {
+	k:			'trimesh';
+	points:		float3[];			// the welded corners
+	tris:		Uint32Array;		// three corners a triangle, in the hierarchy's leaf order
+	closed:		boolean;			// every edge shared by exactly two triangles, running opposite ways in them
+	min:		float3;
+	max:		float3;
+	// the hierarchy, two vec4s a node: (box min, left) and (box max, right), where a leaf has left = -(first + 1) and
+	// right = its count of triangles, which are that run of `tris`
+	nodes:		Float32Array;
+	// ten vec4s a triangle: its corners a, b, c; its face normal; its edges' pseudonormals (ab, bc, ca); its corners'
+	// pseudonormals (a, b, c)
+	triData:	Float32Array;
+}
 
 export interface Heightmap {
 	k:			'heightmap';
@@ -82,6 +98,76 @@ export interface Heightmap {
 	nearSlope:	Float32Array;		// per tile: 1 / sqrt(1 + L^2), L the steepest slope in it and the tiles round it
 	wrap?:		Wrap;				// absent for OpenSCAD's own flat surface(); see Wrap
 	tiled?:		Tiled;				// absent for a grid that ends; read by wrap(), which see
+}
+
+export type Sdf3 =
+	| {k: 'empty'}
+	| {k: 'sphere', r: number}
+	| {k: 'box', size: float3, center: boolean}
+	| {k: 'cylinder', r: number, h: number, center: boolean}
+	| {k: 'ngonPrism', r: number, h: number, center: boolean, n: number}
+	// a smooth taper (cylinder(r1, r2) with r1 != r2 and no $fn): a faceted one is built as a real polyhedron
+	// instead (see evaluate.ts's 'cylinder' case), the same choice already made for a plain faceted cylinder
+	| {k: 'cone', r1: number, r2: number, h: number, center: boolean}
+	| {k: 'planes', planes: {n: float3, d: number}[], points: float3[], faces: float3[][]}
+	| {k: 'domain', m: float3x4, scale: number, body: Sdf}		// the body is built in the frame m
+	| Warp														// the body is built flat and bent into a revolution
+	| {k: 'dilate', body: Sdf, support: Support}				// body grown by the operand's support function
+	// hull() of exactly two same-radius spheres/circles is a capsule/stadium, not a dilated solid hull (a solid hull
+	// needs 4 non-coplanar points; two spheres give only a segment) -- see hullOf() below
+	| {k: 'capsule', a: float3, b: float3, r: number}
+	// the exact hull of two balls of different radii (a "round cone"): a capsule generalised to r1 != r2, one
+	// spherical cap at each end and a smoothly tangent conical collar between them -- degenerates to capsule at
+	// r1 = r2 and to a sharp point capped by a single sphere at r1 = 0 or r2 = 0. Built for a mixed hull() (see
+	// weightedHull3 below), whose edges connect points that may carry any radius, including zero for a sharp corner.
+	| {k: 'roundCone', a: float3, b: float3, r1: number, r2: number}
+	// surface(): a height at each point of a grid (x the column, y the row, a unit apart), over a solid down to `bottom`
+	// -- built by heightmap(), which says what the tiles are for
+	| Heightmap
+	// surface_fn() and implicit_fn(): a scalar field kept as a function, compiled to glsl for the raymarcher and to JS
+	// for the rest (see fnsurface.ts), inside the box it is asked for
+	| {k: 'fnfield', fn: FieldFn, box: Box3}
+	| TriMesh													// import()ed meshes and polyhedron()s that are not convex
+
+export type Sdf2 =
+	// 2-D shapes: fields of the plane that no z can change. They are not solids, so a union skips them for bounds
+	// and anything left at the top level is reported rather than drawn as the infinite prism the field describes.
+	| {k: 'circle2', r: number, n: number}						// n = 0 is a smooth circle, otherwise an n-gon
+	| {k: 'square2', size: float2, center: boolean}
+	| {k: 'polygon2', paths: float2[][]}						// each path a closed loop; more than one is holes/islands by even-odd fill
+	// a closed path of lines and quadratic Beziers (text()'s glyph outlines, in the font's own curves rather than a
+	// flattened polygon), each path its own start point and the segments that lead from it back around to it again
+	| {k: 'curvepath2', paths: bezier2Curve }
+	| {k: 'stadium2', a: float2, b: float2, r: number}			// hull() of two same-radius circles: 'capsule''s 2-D form
+	| {k: 'offset', r: number, body: Sdf}						// offset(r): the shape grown by a disc
+	| {k: 'extrude', h: number, center: boolean, body: Sdf}		// linear_extrude of a 2-D shape
+	| {k: 'revolve', angle: number, body: Sdf}					// rotate_extrude of a 2-D shape, about z
+
+export type Sdf = Sdf2 | Sdf3
+	| {k: 'union', children: Sdf[]}
+	| {k: 'intersection', children: Sdf[]}
+	| {k: 'difference', base: Sdf, cuts: Sdf[]}
+	| {k: 'material', mat: Material, body: Sdf};				// color()/$variables round the body, which they tint
+
+export const empty: Sdf = {k: 'empty'};
+
+export function scaleHeightmap(map: Heightmap, zscale: number, mirrorx: boolean, mirrory: boolean) {
+	const heights = Float64Array.from(map.heights, v => zscale * v);
+	if (mirrorx) {
+		for (let j = 0; j < map.rows; j++)
+			for (let i = 0; i < map.cols >> 1; i++) {
+				const k = j * map.cols + i, k2 = j * map.cols + map.cols - 1 - i;
+				[heights[k], heights[k2]] = [heights[k2], heights[k]];
+			}
+	}
+	if (mirrory) {
+		for (let j = 0; j < map.rows >> 1; j++)
+			for (let i = 0; i < map.cols; i++) {
+				const k = j * map.cols + i, k2 = (map.rows - 1 - j) * map.cols + i;
+				[heights[k], heights[k2]] = [heights[k2], heights[k]];
+			}
+	}
+	return heights;
 }
 
 // Which of a grid's axes repeat: surface()'s `tiled`, false, true or [x, y]. A tiled grid is a tile laid over and
@@ -139,7 +225,7 @@ export interface Wrap {
 // unless the bend was given one (`h`), which is the surface's second dimension as a cylinder primitive has it. A
 // body given one is fitted to it -- its rows are spread over the axis rather than sizing it -- so `h` says how long
 // the tube is rather than how long the body is, and the body's z still says how thick it stands off r.
-export interface Warp {
+interface Warp {
 	k:		'warp';
 	kind:	'cylinder' | 'sphere';
 	r:		number;
@@ -180,30 +266,353 @@ export function isConformal(m: vec<float3, E3>): boolean {
 const expand2 = (s: number) => float2(s, s);
 const expand3 = (s: number) => float3(s, s, s);
 
+
+export function walk(s: Sdf, callback: (s: Sdf, process: (s: Sdf) => Sdf) => Sdf): Sdf {
+	const recurse = (s: Sdf): Sdf => callback(s, process);
+	const process = (s: Sdf): Sdf => {
+		switch (s.k) {
+			case 'union':
+			case 'intersection':
+			{
+				const children = s.children.map(recurse).filter(c => c.k !== 'empty');
+				return children.length === 0 ? empty : children.length === 1 ? children[0] : {...s, children};
+			}
+			case 'difference': {
+				const base = recurse(s.base);
+				const cuts = s.cuts.map(recurse).filter(c => c.k !== 'empty');
+				return base.k === 'empty' ? empty : cuts.length === 0 ? base : {...s, base, cuts};
+			}
+			case 'domain':
+			case 'warp':
+			case 'dilate':
+			case 'material':
+			case 'offset':
+			case 'extrude':
+			case 'revolve':
+			{
+				const body = recurse(s.body);
+				return body.k === 'empty' ? empty : {...s, body};
+			}
+			default:
+				return s;
+		}
+	};
+
+	return recurse(s);
+}
+
+
+const LEAF = 4;
+export const TRI_TEXELS = 10;
+
+
+// Reorders order[lo..hi] so the element at k is the one a sort by key would put there, with nothing after it keyed
+// lower and nothing before it keyed higher (Hoare's selection): the median split, without sorting either half. Mutates order.
+function select(order: Uint32Array, lo: number, hi: number, k: number, key: (t: number) => number) {
+	while (hi > lo) {
+		const pivot = key(order[(lo + hi) >> 1]);
+		let i = lo, j = hi;
+		while (i <= j) {
+			while (key(order[i]) < pivot)
+				i++;
+			while (key(order[j]) > pivot)
+				j--;
+			if (i <= j) {
+				[order[i], order[j]] = [order[j], order[i]];
+				i++;
+				j--;
+			}
+		}
+		if (k <= j)
+			hi = j;
+		else if (k >= i)
+			lo = i;
+		else
+			return;
+	}
+}
+
+
+// A face's triangles, keeping its winding: its corners flattened onto the plane of its Newell normal and ear-clipped,
+// so that a concave face (the L-shaped end of an L) is covered by its own area and not its hull's.
+function triangulate(loop: number[], points: float3[]): number[][] {
+	if (loop.length <= 3)
+		return loop.length === 3 ? [loop] : [];
+	let n = float3(0, 0, 0);
+	loop.forEach((i, k) => n = n.add(points[i].cross(points[loop[(k + 1) % loop.length]])));
+	// the two axes the normal is least along, ordered so the face runs anticlockwise in them
+	const drop = Math.abs(n.x) >= Math.abs(n.y) && Math.abs(n.x) >= Math.abs(n.z) ? 'x' : Math.abs(n.y) >= Math.abs(n.z) ? 'y' : 'z';
+	const [u, v] = ({x: ['y', 'z'], y: ['z', 'x'], z: ['x', 'y']} as const)[drop];
+	const flip = n[drop] < 0 ? -1 : 1;
+	const at = (i: number) => [points[i][u], points[i][v] * flip];
+	const turn = (a: number, b: number, c: number) => {
+		const [ax, ay] = at(a), [bx, by] = at(b), [cx, cy] = at(c);
+		return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+	};
+	const within = (p: number, a: number, b: number, c: number) => turn(a, b, p) > 0 && turn(b, c, p) > 0 && turn(c, a, p) > 0;
+
+	const left = [...loop], out: number[][] = [];
+	while (left.length > 3) {
+		const ear = left.findIndex((b, k) => {
+			const a = left[(k + left.length - 1) % left.length], c = left[(k + 1) % left.length];
+			return turn(a, b, c) > 0 && !left.some(p => p !== a && p !== b && p !== c && within(p, a, b, c));
+		});
+		// a face with no ear folds over itself; its first corner is taken as one, as a fan would
+		const k = Math.max(ear, 0);
+		out.push([left[(k + left.length - 1) % left.length], left[k], left[(k + 1) % left.length]]);
+		left.splice(k, 1);
+	}
+	out.push(left);
+	return out;
+}
+
+// The nearest point of triangle abc to p, and which part of it that is: 0 the face, 1..3 the edges ab, bc, ca, and
+// 4..6 the corners a, b, c (Ericson's regions, in Real-Time Collision Detection)
+function nearest(px: number, py: number, pz: number, d: Float32Array, at: number): {qx: number, qy: number, qz: number, part: number} {
+	const ax = d[at], ay = d[at + 1], az = d[at + 2];
+	const bx = d[at + 4], by = d[at + 5], bz = d[at + 6];
+	const cx = d[at + 8], cy = d[at + 9], cz = d[at + 10];
+	const abx = bx - ax, aby = by - ay, abz = bz - az, acx = cx - ax, acy = cy - ay, acz = cz - az;
+	const apx = px - ax, apy = py - ay, apz = pz - az;
+	const d1 = abx * apx + aby * apy + abz * apz, d2 = acx * apx + acy * apy + acz * apz;
+	if (d1 <= 0 && d2 <= 0)
+		return {qx: ax, qy: ay, qz: az, part: 4};
+	const bpx = px - bx, bpy = py - by, bpz = pz - bz;
+	const d3 = abx * bpx + aby * bpy + abz * bpz, d4 = acx * bpx + acy * bpy + acz * bpz;
+	if (d3 >= 0 && d4 <= d3)
+		return {qx: bx, qy: by, qz: bz, part: 5};
+	const vc = d1 * d4 - d3 * d2;
+	if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+		const v = d1 / (d1 - d3);
+		return {qx: ax + abx * v, qy: ay + aby * v, qz: az + abz * v, part: 1};
+	}
+	const cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+	const d5 = abx * cpx + aby * cpy + abz * cpz, d6 = acx * cpx + acy * cpy + acz * cpz;
+	if (d6 >= 0 && d5 <= d6)
+		return {qx: cx, qy: cy, qz: cz, part: 6};
+	const vb = d5 * d2 - d1 * d6;
+	if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+		const w = d2 / (d2 - d6);
+		return {qx: ax + acx * w, qy: ay + acy * w, qz: az + acz * w, part: 3};
+	}
+	const va = d3 * d6 - d5 * d4;
+	if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+		const w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+		return {qx: bx + (cx - bx) * w, qy: by + (cy - by) * w, qz: bz + (cz - bz) * w, part: 2};
+	}
+	const den = 1 / (va + vb + vc), v = vb * den, w = vc * den;
+	return {qx: ax + abx * v + acx * w, qy: ay + aby * v + acy * w, qz: az + abz * v + acz * w, part: 0};
+}
+
+// the field of a polyhedron, or undefined when no face of it has any area
+export function trimesh(corners: float3[], faces: number[][]): TriMesh | undefined {
+	// weld corners at the same place, since a triangle soup (an STL) repeats each at every triangle that uses it; the
+	// hash only picks a bucket, the corners in it are compared exactly
+	const buckets = new Map<number, number[]>(), points: float3[] = [], remap = new Int32Array(corners.length);
+	corners.forEach((c, k) => {
+		const hash = c.x * 0.7548776662 + c.y * 0.5698402910 + c.z * 0.3141592653;
+		const bucket = buckets.get(hash);
+		let i = bucket?.find(i => points[i].x === c.x && points[i].y === c.y && points[i].z === c.z);
+		if (i === undefined) {
+			i = points.length;
+			points.push(c);
+			if (bucket)
+				bucket.push(i);
+			else
+				buckets.set(hash, [i]);
+		}
+		remap[k] = i;
+	});
+	const np = points.length, P = new Float64Array(np * 3);
+	points.forEach((p, i) => P.set([p.x, p.y, p.z], i * 3));
+
+	const tri: number[] = [];
+	const add = (a: number, b: number, c: number) => {
+		const ux = P[b * 3] - P[a * 3], uy = P[b * 3 + 1] - P[a * 3 + 1], uz = P[b * 3 + 2] - P[a * 3 + 2];
+		const vx = P[c * 3] - P[a * 3], vy = P[c * 3 + 1] - P[a * 3 + 1], vz = P[c * 3 + 2] - P[a * 3 + 2];
+		if (uy * vz - uz * vy || uz * vx - ux * vz || ux * vy - uy * vx)
+			tri.push(a, b, c);
+	};
+	for (const face of faces) {
+		const loop = face.filter(i => i >= 0 && i < corners.length).map(i => remap[i]);
+		if (loop.length === 3)
+			add(loop[0], loop[1], loop[2]);
+		else
+			for (const [a, b, c] of triangulate(loop, points))
+				add(a, b, c);
+	}
+	const count = tri.length / 3;
+	if (count === 0)
+		return undefined;
+
+	// wound so the normals face out, whichever way the source winds them (polyhedron() clockwise, STL anticlockwise)
+	let volume = 0;
+	for (let t = 0; t < tri.length; t += 3)
+		volume += points[tri[t]].dot(points[tri[t + 1]].cross(points[tri[t + 2]]));
+	if (volume < 0)
+		for (let t = 0; t < tri.length; t += 3)
+			[tri[t + 1], tri[t + 2]] = [tri[t + 2], tri[t + 1]];
+
+	// the pseudonormals: a corner's is its triangles' normals weighted by the angle each makes there, an edge's the sum
+	// of its two triangles' normals; each triangle keeps which three edges are its own
+	const faceN = new Float64Array(count * 3), vertexN = new Float64Array(np * 3);
+	const edgeOf = new Map<number, number>(), triEdge = new Int32Array(count * 3);
+	const edgeN = new Float64Array(count * 9), uses = new Int32Array(count * 3), forward = new Int32Array(count * 3);
+	let edges = 0;
+	for (let t = 0; t < count; t++) {
+		const i = [tri[t * 3], tri[t * 3 + 1], tri[t * 3 + 2]];
+		const e1 = [0, 1, 2].map(a => P[i[1] * 3 + a] - P[i[0] * 3 + a]), e2 = [0, 1, 2].map(a => P[i[2] * 3 + a] - P[i[0] * 3 + a]);
+		const n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+		const len = Math.hypot(n[0], n[1], n[2]);
+		faceN.set(n.map(x => x / len), t * 3);
+		for (let k = 0; k < 3; k++) {
+			const a = i[k], b = i[(k + 1) % 3], c = i[(k + 2) % 3];
+			const u = [0, 1, 2].map(x => P[b * 3 + x] - P[a * 3 + x]), v = [0, 1, 2].map(x => P[c * 3 + x] - P[a * 3 + x]);
+			const angle = Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (Math.hypot(u[0], u[1], u[2]) * Math.hypot(v[0], v[1], v[2])))));
+			for (let x = 0; x < 3; x++)
+				vertexN[a * 3 + x] += faceN[t * 3 + x] * angle;
+			const key = Math.min(a, b) * np + Math.max(a, b);
+			let e = edgeOf.get(key);
+			if (e === undefined)
+				edgeOf.set(key, e = edges++);
+			for (let x = 0; x < 3; x++)
+				edgeN[e * 3 + x] += faceN[t * 3 + x];
+			uses[e]++;
+			forward[e] += a < b ? 1 : -1;
+			triEdge[t * 3 + k] = e;
+		}
+	}
+	let closed = true;
+	for (let e = 0; e < edges; e++)
+		closed &&= uses[e] === 2 && forward[e] === 0;
+
+	// the hierarchy: split each run of triangles at the median of their centres along its widest axis
+	const order = Uint32Array.from({length: count}, (_, t) => t);
+	const lo = new Float64Array(count * 3), hi = new Float64Array(count * 3), mid = new Float64Array(count * 3);
+	for (let t = 0; t < count; t++)
+		for (let a = 0; a < 3; a++) {
+			const x = P[tri[t * 3] * 3 + a], y = P[tri[t * 3 + 1] * 3 + a], z = P[tri[t * 3 + 2] * 3 + a];
+			lo[t * 3 + a] = Math.min(x, y, z);
+			hi[t * 3 + a] = Math.max(x, y, z);
+			mid[t * 3 + a] = (lo[t * 3 + a] + hi[t * 3 + a]) / 2;
+		}
+	const nodes = new Float32Array(2 * count * 8);		// a leaf holds at least one triangle, so at most 2 count - 1 nodes
+	let used = 0;
+	const build = (first: number, n: number): number => {
+		const at = used++;
+		const bmin = [Infinity, Infinity, Infinity], bmax = [-Infinity, -Infinity, -Infinity];
+		const cmin = [Infinity, Infinity, Infinity], cmax = [-Infinity, -Infinity, -Infinity];
+		for (let k = first; k < first + n; k++) {
+			const t = order[k];
+			for (let a = 0; a < 3; a++) {
+				bmin[a] = Math.min(bmin[a], lo[t * 3 + a]);
+				bmax[a] = Math.max(bmax[a], hi[t * 3 + a]);
+				cmin[a] = Math.min(cmin[a], mid[t * 3 + a]);
+				cmax[a] = Math.max(cmax[a], mid[t * 3 + a]);
+			}
+		}
+		// padded a hair, so that float32 rounding in the texture cannot put a triangle outside its box
+		const pad = 1e-6 * Math.max(1, ...bmin.map(Math.abs), ...bmax.map(Math.abs));
+		nodes.set([bmin[0] - pad, bmin[1] - pad, bmin[2] - pad], at * 8);
+		nodes.set([bmax[0] + pad, bmax[1] + pad, bmax[2] + pad], at * 8 + 4);
+		if (n <= LEAF) {
+			nodes[at * 8 + 3] = -(first + 1);
+			nodes[at * 8 + 7] = n;
+			return at;
+		}
+		const axis = [0, 1, 2].reduce((best, a) => cmax[a] - cmin[a] > cmax[best] - cmin[best] ? a : best, 0);
+		const half = n >> 1;
+		select(order, first, first + n - 1, first + half, t => mid[t * 3 + axis]);
+		nodes[at * 8 + 3] = build(first, half);
+		nodes[at * 8 + 7] = build(first + half, n - half);
+		return at;
+	};
+	build(0, count);
+
+	const tris = new Uint32Array(count * 3), triData = new Float32Array(count * TRI_TEXELS * 4);
+	for (let k = 0; k < count; k++) {
+		const t = order[k], i = [tri[t * 3], tri[t * 3 + 1], tri[t * 3 + 2]];
+		tris.set(i, k * 3);
+		const put = (slot: number, from: Float64Array, at: number) => triData.set(from.subarray(at * 3, at * 3 + 3), (k * TRI_TEXELS + slot) * 4);
+		i.forEach((v, j) => {
+			put(j, P, v);
+			put(4 + j, edgeN, triEdge[t * 3 + j]);
+			put(7 + j, vertexN, v);
+		});
+		put(3, faceN, t);
+	}
+
+	const box = [0, 1, 2].map(a => {
+		let min = Infinity, max = -Infinity;
+		for (let i = a; i < P.length; i += 3) {
+			min = Math.min(min, P[i]);
+			max = Math.max(max, P[i]);
+		}
+		return [min, max];
+	});
+	return {k: 'trimesh', points, tris, closed, min: float3(box[0][0], box[1][0], box[2][0]), max: float3(box[0][1], box[1][1], box[2][1]), nodes: nodes.slice(0, used * 8), triData};
+}
+
+// which of a triangle's ten vec4s holds the pseudonormal of each part nearest() names
+const PART_NORMAL = [3, 4, 5, 6, 7, 8, 9];
+
+function trimeshDistance(s: TriMesh, p: float3): number {
+	const nodes = s.nodes, data = s.triData;
+	let best = Infinity, sign = 1;
+	const stack: {node: number, gap: number}[] = [{node: 0, gap: 0}];
+	while (stack.length) {
+		const {node, gap} = stack.pop()!;
+		if (gap > 0 && gap >= best)
+			continue;
+		const left = nodes[node * 8 + 3], right = nodes[node * 8 + 7];
+		if (left < 0) {
+			const first = -left - 1;
+			for (let k = first; k < first + right; k++) {
+				const at = k * TRI_TEXELS * 4;
+				const {qx, qy, qz, part} = nearest(p.x, p.y, p.z, data, at);
+				const dx = p.x - qx, dy = p.y - qy, dz = p.z - qz, d2 = dx * dx + dy * dy + dz * dz;
+				if (d2 < best) {
+					best = d2;
+					const n = at + PART_NORMAL[part] * 4;
+					sign = dx * data[n] + dy * data[n + 1] + dz * data[n + 2] < 0 ? -1 : 1;
+				}
+			}
+		} else {
+			const gl = boxDistance2(p, nodes, left * 8), gr = boxDistance2(p, nodes, right * 8);
+			// the farther child goes on first so that the nearer is taken off first
+			if (gl < gr)
+				stack.push({node: right, gap: gr}, {node: left, gap: gl});
+			else
+				stack.push({node: left, gap: gl}, {node: right, gap: gr});
+		}
+	}
+	return sign * Math.sqrt(best);
+}
+
 //-----------------------------------------------------------------------------
 // bounds
 //-----------------------------------------------------------------------------
 
 // The box the model lives in, from each primitive's own extents: conservative where a shape's exact box is awkward
 // (an n-gon is taken as its circumcircle), which only makes the camera a little further back and the trace a little longer.
-export function bounds3(s: Sdf): Box3 | undefined {
+function bounds3(s: Sdf): Box3 | undefined {
 	switch (s.k) {
 		case 'empty':
 			return undefined;
 		case 'sphere':
-			return {min: expand3(-s.r), max: expand3(s.r)};
+			return new Box3(expand3(-s.r), expand3(s.r));
 		case 'box': {
 			const h = s.center ? s.size.scale(0.5) : float3(0, 0, 0);
-			return {min: h.neg(), max: s.size.sub(h)};
+			return new Box3(h.neg(), s.size.sub(h));
 		}
 		case 'cylinder':
 		case 'ngonPrism': {
 			const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
-			return {min: float3(-s.r, -s.r, Math.min(z0, z1)), max: float3(s.r, s.r, Math.max(z0, z1))};
+			return new Box3(float3(-s.r, -s.r, Math.min(z0, z1)), float3(s.r, s.r, Math.max(z0, z1)));
 		}
 		case 'cone': {
 			const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h, r = Math.max(s.r1, s.r2);
-			return {min: float3(-r, -r, Math.min(z0, z1)), max: float3(r, r, Math.max(z0, z1))};
+			return new Box3(float3(-r, -r, Math.min(z0, z1)), float3(r, r, Math.max(z0, z1)));
 		}
 		case 'planes': {
 			let min = float3(Infinity, Infinity, Infinity), max = float3(-Infinity, -Infinity, -Infinity);
@@ -211,32 +620,34 @@ export function bounds3(s: Sdf): Box3 | undefined {
 				min = min.min(p);
 				max = max.max(p);
 			}
-			return {min, max};
+			return new Box3(min, max);
 		}
 		case 'capsule':
-			return {min: s.a.min(s.b).sub(expand3(s.r)), max: s.a.max(s.b).add(expand3(s.r))};
+			return new Box3(s.a.min(s.b).sub(expand3(s.r)), s.a.max(s.b).add(expand3(s.r)));
 		case 'roundCone': {
 			const r = Math.max(s.r1, s.r2);
-			return {min: s.a.min(s.b).sub(expand3(r)), max: s.a.max(s.b).add(expand3(r))};
+			return new Box3(s.a.min(s.b).sub(expand3(r)), s.a.max(s.b).add(expand3(r)));
 		}
 		case 'heightmap': {
 			if (!s.wrap)
-				return {min: float3(0, 0, s.bottom), max: float3(s.cols - 1, s.rows - 1, s.top)};
+				return new Box3(float3(0, 0, s.bottom), float3(s.cols - 1, s.rows - 1, s.top));
 			// a wrapped map lives on a surface of radius r: the sphere's own box, or the cylinder's, rows one apart
 			const R = Math.max(s.wrap.r + Math.max(s.top, s.bottom), 0), h = (s.rows - 1) / 2 * (s.wrap.row ?? 1);
 			return s.wrap.kind === 'sphere'
-				? {min: expand3(-R), max: expand3(R)}
-				: {min: float3(-R, -R, -h), max: float3(R, R, h)};
+				? new Box3(expand3(-R), expand3(R))
+				: new Box3(float3(-R, -R, -h), float3(R, R, h));
 		}
+		case 'fnfield':
+			return s.box;
 		case 'trimesh':
-			return {min: s.min, max: s.max};
+			return new Box3(s.min, s.max);
 		case 'union': {
 			let out: Box3 | undefined;
 			for (const c of s.children) {
 				const b = bounds3(c);
 				if (!b)
 					continue;
-				out = out ? {min: out.min.min(b.min),  max: out.max.max(b.max)} : b;
+				out = out ? new Box3(out.min.min(b.min), out.max.max(b.max)) : b;
 			}
 			return out;
 		}
@@ -248,7 +659,7 @@ export function bounds3(s: Sdf): Box3 | undefined {
 				const b = bounds3(c);
 				if (!b)
 					continue;
-				out = out ? {min: out.min.max(b.min), max: out.max.min(b.max)} : b;
+				out = out ? new Box3(out.min.max(b.min), out.max.min(b.max)) : b;
 			}
 			// boxes that do not overlap on some axis mean the intersection itself is empty
 			return out && out.min.x <= out.max.x && out.min.y <= out.max.y && out.min.z <= out.max.z ? out : undefined;
@@ -273,18 +684,18 @@ export function bounds3(s: Sdf): Box3 | undefined {
 				min = min.min(p);
 				max = max.max(p);
 			}
-			return {min, max};
+			return new Box3(min, max);
 		}
 		case 'warp': {
 			// the body's z is the radius it stands off r, and its y runs along the axis (a cylinder) or from pole to
 			// pole (a sphere, which the turn's own angle then cuts a lune out of)
 			const R = s.r + (s.box.max.z - s.box.min.z);	// the body's floor sits on r, its top is the thickness
 			if (s.kind === 'sphere')
-				return {min: expand3(-R), max: expand3(R)};
+				return new Box3(expand3(-R), expand3(R));
 			// the axis the bend was given, or the body's own height -- which is what h defaults to, the body fitted
 			// to an axis of its own length being the body itself
 			const h = (s.axis ?? (s.box.max.y - s.box.min.y)) / 2;
-			return {min: float3(-R, -R, -h), max: float3(R, R, h)};
+			return new Box3(float3(-R, -R, -h), float3(R, R, h));
 		}
 		case 'dilate': {
 			const b = bounds3(s.body);
@@ -295,9 +706,9 @@ export function bounds3(s: Sdf): Box3 | undefined {
 			if (brush) {
 				const r = s.support.r, d = brush.dir;
 				const e = float3(r * Math.sqrt(Math.max(0, 1 - d.x * d.x)), r * Math.sqrt(Math.max(0, 1 - d.y * d.y)), r * Math.sqrt(Math.max(0, 1 - d.z * d.z)));
-				return {min: b.min.sub(e), max: b.max.add(e)};
+				return new Box3(b.min.sub(e), b.max.add(e));
 			}
-			return {min: b.min.sub(expand3(s.support.bound)), max: b.max.add(expand3(s.support.bound))};
+			return new Box3(b.min.sub(expand3(s.support.bound)), b.max.add(expand3(s.support.bound)));
 		}
 		case 'material':
 			return bounds3(s.body);
@@ -307,7 +718,7 @@ export function bounds3(s: Sdf): Box3 | undefined {
 			if (!b)
 				return undefined;
 			const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
-			return {min: float3(b.min.x, b.min.y, Math.min(z0, z1)), max: float3(b.max.x, b.max.y, Math.max(z0, z1))};
+			return new Box3(float3(b.min.x, b.min.y, Math.min(z0, z1)), float3(b.max.x, b.max.y, Math.max(z0, z1)));
 		}
 		case 'revolve': {
 			// the 2-D shape's x is the radius and its y becomes z, so a point at (x, y) sweeps a ring of radius x
@@ -315,7 +726,7 @@ export function bounds3(s: Sdf): Box3 | undefined {
 			if (!b)
 				return undefined;
 			const r = Math.max(Math.abs(b.min.x), Math.abs(b.max.x));
-			return {min: float3(-r, -r, b.min.y), max: float3(r, r, b.max.y)};
+			return new Box3(float3(-r, -r, b.min.y), float3(r, r, b.max.y));
 		}
 		case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'offset':
 			return undefined;			// 2-D: no z extent at all, and no solid to put in a box
@@ -325,15 +736,15 @@ export function bounds3(s: Sdf): Box3 | undefined {
 // The plane a 2-D shape occupies. Separate from bounds() because a 2-D shape has no box of its own to give a camera,
 // but an extrude needs to know where it lies.
 export function bounds2(s: Sdf): Box2 | undefined {
-	const union = (a: Box2 | undefined, b: Box2 | undefined) =>	!a ? b : !b ? a : {min: a.min.min(b.min), max: a.max.max(b.max)};
+	const union = (a: Box2 | undefined, b: Box2 | undefined) =>	!a ? b : !b ? a : new Box2(a.min.min(b.min), a.max.max(b.max));
 	switch (s.k) {
 		case 'material':
 			return bounds2(s.body);
 		case 'circle2':
-			return {min: expand2(-s.r), max: expand2(s.r)};
+			return new Box2(expand2(-s.r), expand2(s.r));
 		case 'square2': {
 			const h = s.center ? s.size.scale(0.5) : float2(0, 0);
-			return {min: h.neg(), max: s.size.sub(h)};
+			return new Box2(h.neg(), s.size.sub(h));
 		}
 		case 'polygon2': {
 			let min = expand2(Infinity), max = expand2(-Infinity);
@@ -344,7 +755,7 @@ export function bounds2(s: Sdf): Box2 | undefined {
 					max = max.max(p);
 					any = true;
 				}
-			return any ? {min, max} : undefined;
+			return any ? new Box2(min, max) : undefined;
 		}
 		case 'curvepath2': {
 			// a quadratic Bezier always lies within the hull of its own start, control and end points, so their box
@@ -354,10 +765,10 @@ export function bounds2(s: Sdf): Box2 | undefined {
 		}
 		case 'offset': {
 			const b = bounds2(s.body);
-			return b ? {min: b.min.sub(expand2(s.r)), max: b.max.add(expand2(s.r))} : undefined;
+			return b ? new Box2(b.min.sub(expand2(s.r)), b.max.add(expand2(s.r))) : undefined;
 		}
 		case 'stadium2':
-			return {min: s.a.min(s.b).sub(expand2(s.r)), max: s.a.max(s.b).add(expand2(s.r))};
+			return new Box2(s.a.min(s.b).sub(expand2(s.r)), s.a.max(s.b).add(expand2(s.r)));
 		case 'union': case 'intersection':
 			return s.children.reduce((a, c) => union(a, bounds2(c)), undefined as Box2 | undefined);
 		case 'difference':
@@ -373,7 +784,7 @@ export function bounds2(s: Sdf): Box2 | undefined {
 				min = min.min(p);
 				max = max.max(p);
 			}
-			return {min, max};
+			return new Box2(min, max);
 		}
 		default:
 			return undefined;
@@ -391,82 +802,6 @@ export function emptyReason(sdf: Sdf, warnings: string[]): string | undefined {
 	if (!Number.isFinite(box.min.x) || !Number.isFinite(box.min.y) || !Number.isFinite(box.min.z))
 		return `the geometry has no finite extent.${why}`;
 	return undefined;
-}
-
-//-----------------------------------------------------------------------------
-// evaluating the field here, so the model can be measured without a GPU
-//-----------------------------------------------------------------------------
-
-// One face of a polyhedron, in a frame of its own: the plane it lies in, the perpendicular distance to that plane,
-// and its vertices as 2-D coordinates within the face. The distance to the face as a *region* is what makes a rounded
-// polyhedron round: taking the distance to the plane instead lets a face reach past its own edges.
-export interface Face {
-	centre:	float3;
-	u:		float3;
-	v:		float3;
-	tris:	[float2, float2, float2][];		// a fan, wound anticlockwise as seen from outside
-}
-
-// A face's frame is worked out once: it depends on nothing but the face, and the field asks for it at every sample.
-const frames = new WeakMap<float3[], {n: float3, frame: Face | undefined}>();
-export function faceFrame(face: float3[], n: float3): Face | undefined {
-	const known = frames.get(face);
-	if (known && known.n.x === n.x && known.n.y === n.y && known.n.z === n.z)
-		return known.frame;
-	const frame = makeFaceFrame(face, n);
-	frames.set(face, {n, frame});
-	return frame;
-}
-
-function makeFaceFrame(face: float3[], n: float3): Face | undefined {
-	if (face.length < 3)
-		return undefined;
-	let centre = float3(0, 0, 0);
-	for (const p of face)
-		centre = centre.add(p)
-	centre = centre.scale(1/ face.length);
-
-	// u lies in the face; v = n x u, so (u, v, n) is right-handed and an anticlockwise face has positive area
-	let u = float3(0, 0, 0);
-	for (let i = 1; i < face.length && u.x === u.y && u.y === u.z; i++) {
-		const d = face[i].sub(centre);
-		const len = d.len();
-		if (len > 1e-12)
-			u = d.scale(1 / len);
-	}
-	if (u.x === u.y && u.y === u.z)
-		return undefined;
-	const v = n.cross(u);
-
-	const flat = (p: float3) => float2(p.dot(u), p.dot(v));
-	const flatCentre: float2 = flat(centre);
-	const corners = face.map(p => flat(p).sub(flatCentre));
-
-	let area = 0;
-	for (let i = 0; i < corners.length; i++) {
-		const a = corners[i], b = corners[(i + 1) % corners.length];
-		area += a.x * b.y - b.x * a.y;
-	}
-	if (area < 0)
-		corners.reverse();
-
-	const tris: [float2, float2, float2][] = [];
-	for (let i = 1; i + 1 < corners.length; i++)
-		tris.push([corners[0], corners[i], corners[i + 1]]);
-	return {centre, u, v, tris};
-}
-
-// the signed distance in 2-D from q to the triangle, negative inside it
-export function tri2(q: float2, a: float2, b: float2, c: float2): number {
-	const edge = (p: float2, r: float2, s: float2) => {
-		const e = s.sub(p), w = r.sub(p);
-		const t = Math.max(0, Math.min(1, w.dot(e) / e.dot(e) || 1));
-		const dx = w.x - t * e.x, dy = w.y - t * e.y;
-		return {side: e.x * w.y - e.y * w.x, d2: dx * dx + dy * dy};
-	};
-	const e0 = edge(a, q, b), e1 = edge(b, q, c), e2 = edge(c, q, a);
-	const d = Math.sqrt(Math.min(e0.d2, e1.d2, e2.d2));
-	return e0.side < 0 || e1.side < 0 || e2.side < 0 ? d : -d;
 }
 
 // The corners of a shape that has a known finite set of them, so a frame around it can be taken from those, or one
@@ -521,77 +856,6 @@ export function verticesOf2(s: Sdf): float2[] | undefined {
 	}
 }
 
-//-----------------------------------------------------------------------------
-// offset(delta): exact mitring, for a body that is one simple convex polygon
-//-----------------------------------------------------------------------------
-
-// Whether a polygon's own vertex order traces a convex, simply-wound boundary -- every turn the same way, not just
-// "these points happen to be in convex position" (a hull would tell you that, but not whether the given order
-// traces it without folding back on itself). Undefined for fewer than three vertices or a degenerate polygon.
-export function polygonConvexity(points: float2[]): {ccw: boolean} | undefined {
-	const n = points.length;
-	if (n < 3)
-		return undefined;
-	let sign = 0;
-	for (let i = 0; i < n; i++) {
-		const a = points[(i + n - 1) % n], b = points[i], c = points[(i + 1) % n];
-		const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
-		if (Math.abs(cross) < 1e-12)
-			continue;			// a straight (180 degree) vertex -- doesn't break convexity either way
-		const s = Math.sign(cross);
-		if (sign === 0)
-			sign = s;
-		else if (s !== sign)
-			return undefined;	// a turn the other way: concave, or the order doesn't trace a simple boundary
-	}
-	return sign ? {ccw: sign > 0} : undefined;
-}
-
-// Whether every edge of a mitred result still points the same way as the edge it came from -- the check the caller
-// runs to catch a delta that shrinks a convex polygon past itself. A shrink that far can still (by coincidence, for
-// a symmetric shape) come back round to a result that is itself convex and correctly wound, so re-checking
-// polygonConvexity on the output is not enough on its own; an edge that has reversed, gone to zero length, or
-// swung round more than a right angle from where it started is what actually says the mitre construction broke.
-export function offsetPreservesEdges(points: float2[], mitred: float2[]): boolean {
-	const n = points.length;
-	for (let i = 0; i < n; i++) {
-		const orig = points[(i + 1) % n].sub(points[i]);
-		const moved = mitred[(i + 1) % n].sub(mitred[i]);
-		if (orig.dot(moved) <= 0)
-			return false;
-	}
-	return true;
-}
-
-// The exact mitred offset of a convex polygon by delta (outward for delta > 0): each edge's own offset line moves
-// out along its normal by delta, and each new vertex is where its two adjacent edges' offset lines meet -- the
-// textbook construction, valid here because a convex polygon's edges can never fold back on each other as they
-// move, PROVIDED delta does not shrink an edge past where it would disappear; undefined when two adjacent edges are
-// parallel (a redundant straight vertex, so no single mitre point exists). A delta so negative the polygon
-// collapses past itself is instead caught by the caller with offsetPreservesEdges on the result.
-export function mitredOffset2(points: float2[], delta: number, ccw: boolean): float2[] | undefined {
-	const n = points.length;
-	const side = ccw ? 1 : -1;
-	const outward = (a: float2, b: float2): float2 | undefined => {
-		const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
-		return len > 1e-12 ? float2(side * dy / len, -side * dx / len) : undefined;
-	};
-	const out: float2[] = [];
-	for (let i = 0; i < n; i++) {
-		const prev = points[(i + n - 1) % n], cur = points[i], next = points[(i + 1) % n];
-		const n0 = outward(prev, cur), n1 = outward(cur, next);
-		if (!n0 || !n1)
-			return undefined;
-		const c0 = n0.x * prev.x + n0.y * prev.y + delta;
-		const c1 = n1.x * cur.x + n1.y * cur.y + delta;
-		const det = n0.x * n1.y - n0.y * n1.x;
-		if (Math.abs(det) < 1e-9)
-			return undefined;	// the two edges are parallel (a straight vertex) -- no single mitre point
-		out.push(float2((c0 * n1.y - c1 * n0.y) / det, (n0.x * c1 - n1.x * c0) / det));
-	}
-	return out;
-}
-
 // The box a term can be culled by: a 3-D term's own bounds. A 2-D one (a glyph of a text(), or one circle of several,
 // before the lot is extruded) has none, being no solid, but its field does not depend on z, so the box of its plane
 // carried out to infinity in z bounds it just as well -- and gives a union of them the same culling any other union
@@ -601,7 +865,7 @@ function cullBox(s: Sdf): Box3 | undefined {
 	if (b || !is2d(s))
 		return b;
 	const b2 = bounds2(s);
-	return b2 && {min: float3(b2.min.x, b2.min.y, -Infinity), max: float3(b2.max.x, b2.max.y, Infinity)};
+	return b2 && new Box3(float3(b2.min.x, b2.min.y, -Infinity), float3(b2.max.x, b2.max.y, Infinity));
 }
 
 // the largest extent of a box that has one -- the padding is a fraction of it, and an unbounded axis must not make
@@ -621,8 +885,16 @@ function boxOf(s: Sdf): Box3 | undefined {
 	return b ?? undefined;
 }
 
+function boxDistance2(p: float3, n: Float32Array, at: number): number {
+	const dx = Math.max(n[at] - p.x, 0, p.x - n[at + 4]);
+	const dy = Math.max(n[at + 1] - p.y, 0, p.y - n[at + 5]);
+	const dz = Math.max(n[at + 2] - p.z, 0, p.z - n[at + 6]);
+	return dx * dx + dy * dy + dz * dz;
+}
+
+
 // how far p is from a box (0 inside it, and for a term with no box, which could be anywhere)
-function boxDistance(b: Box3 | undefined, p: float3): number {
+function boxDistance3(b: Box3 | undefined, p: float3): number {
 	if (!b)
 		return 0;
 	// a hair of slack, so that rounding cannot put a point on the surface outside its own box
@@ -633,13 +905,92 @@ function boxDistance(b: Box3 | undefined, p: float3): number {
 		Math.max(b.min.z - pad - p.z, 0, p.z - b.max.z - pad));
 }
 
+//-----------------------------------------------------------------------------
+// evaluating the field here, so the model can be measured without a GPU
+//-----------------------------------------------------------------------------
+
+// One face of a polyhedron, in a frame of its own: the plane it lies in, the perpendicular distance to that plane,
+// and its vertices as 2-D coordinates within the face. The distance to the face as a *region* is what makes a rounded
+// polyhedron round: taking the distance to the plane instead lets a face reach past its own edges.
+interface Face {
+	centre:	float3;
+	u:		float3;
+	v:		float3;
+	tris:	[float2, float2, float2][];		// a fan, wound anticlockwise as seen from outside
+}
+
+// A face's frame is worked out once: it depends on nothing but the face, and the field asks for it at every sample.
+const frames = new WeakMap<float3[], {n: float3, frame: Face | undefined}>();
+function faceFrame(face: float3[], n: float3): Face | undefined {
+	const known = frames.get(face);
+	if (known && known.n.x === n.x && known.n.y === n.y && known.n.z === n.z)
+		return known.frame;
+
+	const frame = make(face, n);
+	frames.set(face, {n, frame});
+	return frame;
+
+
+	function make(face: float3[], n: float3): Face | undefined {
+		if (face.length < 3)
+			return undefined;
+		let centre = float3(0, 0, 0);
+		for (const p of face)
+			centre = centre.add(p)
+		centre = centre.scale(1/ face.length);
+
+		// u lies in the face; v = n x u, so (u, v, n) is right-handed and an anticlockwise face has positive area
+		let u = float3(0, 0, 0);
+		for (let i = 1; i < face.length && u.x === u.y && u.y === u.z; i++) {
+			const d = face[i].sub(centre);
+			const len = d.len();
+			if (len > 1e-12)
+				u = d.scale(1 / len);
+		}
+		if (u.x === u.y && u.y === u.z)
+			return undefined;
+		const v = n.cross(u);
+
+		const flat = (p: float3) => float2(p.dot(u), p.dot(v));
+		const flatCentre: float2 = flat(centre);
+		const corners = face.map(p => flat(p).sub(flatCentre));
+
+		let area = 0;
+		for (let i = 0; i < corners.length; i++) {
+			const a = corners[i], b = corners[(i + 1) % corners.length];
+			area += a.x * b.y - b.x * a.y;
+		}
+		if (area < 0)
+			corners.reverse();
+
+		const tris: [float2, float2, float2][] = [];
+		for (let i = 1; i + 1 < corners.length; i++)
+			tris.push([corners[0], corners[i], corners[i + 1]]);
+		return {centre, u, v, tris};
+	}
+}
+
+
+// the signed distance in 2-D from q to the triangle, negative inside it
+function tri2(q: float2, a: float2, b: float2, c: float2): number {
+	const edge = (p: float2, r: float2, s: float2) => {
+		const e = s.sub(p), w = r.sub(p);
+		const t = Math.max(0, Math.min(1, w.dot(e) / e.dot(e) || 1));
+		const dx = w.x - t * e.x, dy = w.y - t * e.y;
+		return {side: e.x * w.y - e.y * w.x, d2: dx * dx + dy * dy};
+	};
+	const e0 = edge(a, q, b), e1 = edge(b, q, c), e2 = edge(c, q, a);
+	const d = Math.sqrt(Math.min(e0.d2, e1.d2, e2.d2));
+	return e0.side < 0 || e1.side < 0 || e2.side < 0 ? d : -d;
+}
+
 // Whether a union should be culled by its terms' boxes. Three or more terms always: a union asks all of them at every
 // point, and the box test is cheap next to even one primitive. Two terms too when together they are heavy, which a
 // recursive module makes them -- every level of a tree is the branch it draws plus one union of the two subtrees, and
 // each subtree is far bigger than the box test that could rule it out. The count is worked out once per union, not
 // at every sample.
-const CULL_MIN = 3, CULL_COST = 8;
-const culls = new WeakMap<Sdf[], boolean>();
+const CULL_MIN	= 3, CULL_COST = 8;
+const culls		= new WeakMap<Sdf[], boolean>();
 function cullsUnion(children: Sdf[]): boolean {
 	let c = culls.get(children);
 	if (c === undefined) {
@@ -665,7 +1016,7 @@ function pickMin(children: Sdf[], p: float3): {child: Sdf | undefined, value: nu
 	const gap = new Float64Array(children.length);
 	let first = 0;
 	for (let i = 0; i < children.length; i++) {
-		gap[i] = boxDistance(boxOf(children[i]), p);
+		gap[i] = boxDistance3(boxOf(children[i]), p);
 		if (gap[i] < gap[first])
 			first = i;
 	}
@@ -686,7 +1037,7 @@ function pickMin(children: Sdf[], p: float3): {child: Sdf | undefined, value: nu
 function pickDifference(s: Sdf & {k: 'difference'}, p: float3): {value: number, cut: Sdf | undefined} {
 	let value = evalSdf(s.base, p), cut: Sdf | undefined;
 	for (const c of s.cuts) {
-		const gap = boxDistance(boxOf(c), p);
+		const gap = boxDistance3(boxOf(c), p);
 		if (gap <= 0 || gap < -value) {
 			const v = -evalSdf(c, p);
 			if (v > value) {
@@ -698,7 +1049,109 @@ function pickDifference(s: Sdf & {k: 'difference'}, p: float3): {value: number, 
 	return {value, cut};
 }
 
-export function evalSdf(s: Sdf, p: float3): number {
+// The distance in the plane to a (possibly multi-path) polygon, signed by an odd-even crossing test run across every
+// path's edges with one shared parity -- the standard test, which handles a concave outline and, with more than one
+// path, holes or islands (a hole's own crossings flip the parity back); it is what makes polygon() a field rather
+// than a stack of half-planes. The per-edge test below is the one maths' crossesRay (and line2.crossesRay) run: it is
+// written out rather than called because this is a per-edge inner loop, where the call measured ~20% slower -- and
+// going through line2.closestPoint for the distance on top of that allocates, ~11x slower again.
+function polygonDistance2(px: number, py: number, paths: float2[][]): number {
+	let d2 = Infinity, sign = 1;
+	for (const points of paths) {
+		if (!points.length)
+			continue;
+		d2 = Math.min(d2, (px - points[0].x) ** 2 + (py - points[0].y) ** 2);
+		for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+			const {x: ax, y: ay} = points[j], {x: bx, y: by} = points[i];	// v0 is the previous vertex, v1 the current one
+			const ex = bx - ax, ey = by - ay, wx = px - ax, wy = py - ay;
+			const t = Math.max(0, Math.min(1, (wx * ex + wy * ey) / (ex * ex + ey * ey || 1)));
+			d2 = Math.min(d2, (wx - ex * t) ** 2 + (wy - ey * t) ** 2);
+			const c0 = py >= ay, c1 = py < by, c2 = ex * wy > ey * wx;
+			if (c0 === c1 && c0 === c2)
+				sign = -sign;
+		}
+	}
+	return sign * Math.sqrt(d2);
+}
+
+// A solid of revolution, from the 2-D shape the point's own half-plane sees: rotating the shape about z means the
+// point (x, y, z) is the profile point (hypot(x,y), z). That is exact for a full turn, since the nearest point of the
+// surface is always in the point's own half-plane. A partial turn is the same solid cut by a wedge through the axis,
+// which the intersection bound max() is enough for.
+function revolveDistance(s: Sdf & {k: 'revolve'}, p: float3): number {
+	const radius = Math.hypot(p.x, p.y);
+	const d = evalSdf(s.body, float3(radius, p.z, 0));
+	if (s.angle >= 360)
+		return d;
+	const half = s.angle * Math.PI / 360;
+	const angle = Math.atan2(p.y, p.x);
+	// The wedge |angle| <= half, as the furthest of its two bounding half-planes. Both run through the axis, so the
+	// distance to the one at angle h is radius*sin(angle - h): zero on the boundary, positive on the far side.
+	const wedge = Math.max(radius * Math.sin(angle - half), radius * Math.sin(-half - angle));
+	return Math.max(d, wedge);
+}
+
+// the 2D distance to a regular n-gon of circumradius r, shared by the evaluated field and its glsl
+function ngonDistance(x: number, y: number, r: number, n: number): number {
+	const an = Math.PI / n;
+	const ang = Math.atan2(x, y) - (Math.PI / 2 - an);		// OpenSCAD's first vertex is on +x
+	const folded = ang - 2 * an * Math.round(ang / (2 * an));
+	return Math.hypot(x, y) * Math.cos(folded) - r * Math.cos(an);
+}
+
+// The exact distance to a smooth taper (cylinder(r1, r2) with r1 != r2): Inigo Quilez's capped-cone construction,
+// which handles r1 or r2 being 0 (a point) as a special case of the same formula rather than needing one of its
+// own. Adapted from its canonical form (the axis along y, centred on the origin) to this evaluator's z-up axis and
+// z0/z1 span by recentring p.z on the cone's own mid-height and using half of z1 - z0 in place of its h. Kept in
+// step by hand with sdCone in sdflib.frag, since nothing generates either from the other.
+function coneDistance(s: Sdf & {k: 'cone'}, p: float3): number {
+	const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
+	const hy = (z1 - z0) / 2;
+	const qx = Math.hypot(p.x, p.y), qy = p.z - (z0 + z1) / 2;
+	const k1x = s.r2, k1y = hy;
+	const k2x = s.r2 - s.r1, k2y = 2 * hy;
+	const cax = qx - Math.min(qx, qy < 0 ? s.r1 : s.r2), cay = Math.abs(qy) - hy;
+	const dotk2k2 = k2x * k2x + k2y * k2y;
+	const t = dotk2k2 > 1e-12 ? Math.max(0, Math.min(1, ((k1x - qx) * k2x + (k1y - qy) * k2y) / dotk2k2)) : 0;
+	const cbx = qx - k1x + k2x * t, cby = qy - k1y + k2y * t;
+	const sign = cbx < 0 && cay < 0 ? -1 : 1;
+	return sign * Math.sqrt(Math.min(cax * cax + cay * cay, cbx * cbx + cby * cby));
+}
+
+// The exact distance to the hull of two balls of different radii, a.k.a. a "round cone": Inigo Quilez's construction,
+// unlike coneDistance's (a flat-capped frustum) this has a spherical cap at each end and is exactly what a mixed
+// hull() (see weightedHull3 below) needs along an edge between two points of any radii, including zero. Degenerates
+// to the plain capsule formula at r1 = r2, and is guarded separately for two more degenerate inputs neither capsule
+// nor a plain cone need worry about: coincident centres (whichever radius is bigger is the whole answer), and a
+// radius difference bigger than the distance between the centres (the smaller ball is entirely in the bigger one's
+// shadow along the axis, so again the bigger ball alone is the answer). Kept in step by hand with sdRoundCone in
+// sdflib.frag, since nothing generates either from the other.
+function roundConeDistance(p: float3, a: float3, b: float3, r1: number, r2: number): number {
+	const ba = b.sub(a);
+	const l2 = ba.dot(ba);
+	if (l2 < 1e-18)
+		return p.sub(a).len() - Math.max(r1, r2);
+	const rr = r1 - r2;
+	const a2 = l2 - rr * rr;
+	if (a2 <= 0)
+		return r1 >= r2 ? p.sub(a).len() - r1 : p.sub(b).len() - r2;
+	const il2 = 1 / l2;
+	const pa = p.sub(a);
+	const y = pa.dot(ba);
+	const z = y - l2;
+	const w = pa.scale(l2).sub(ba.scale(y));
+	const x2 = w.dot(w);
+	const y2 = y * y * l2;
+	const z2 = z * z * l2;
+	const k = Math.sign(rr) * rr * rr * x2;
+	if (Math.sign(z) * a2 * z2 > k)
+		return Math.sqrt(x2 + z2) * il2 - r2;
+	if (Math.sign(y) * a2 * y2 < k)
+		return Math.sqrt(x2 + y2) * il2 - r1;
+	return (Math.sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+function evalSdf(s: Sdf, p: float3): number {
 	switch (s.k) {
 		case 'empty':
 			return 1e20;
@@ -768,7 +1221,7 @@ export function evalSdf(s: Sdf, p: float3): number {
 		case 'polygon2':
 			return polygonDistance2(p.x, p.y, s.paths);
 		case 'curvepath2':
-			return curvepathDistance2(p.xy, s.paths);
+			return curveDistance(p.xy, s.paths);
 		case 'offset':
 			return evalSdf(s.body, p) - s.r;
 		case 'extrude': {
@@ -820,6 +1273,13 @@ export function evalSdf(s: Sdf, p: float3): number {
 			return roundConeDistance(p, s.a, s.b, s.r1, s.r2);
 		case 'heightmap':
 			return heightmapDistance(s, p);
+		case 'fnfield': {
+			// the box it stands in, and the field's own estimate inside it: both are bounds, so the larger is one too
+			const c = s.box.centre(), h = s.box.extent().scale(0.5);
+			const qx = Math.abs(p.x - c.x) - h.x, qy = Math.abs(p.y - c.y) - h.y, qz = Math.abs(p.z - c.z) - h.z;
+			const box = Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0);
+			return Math.max(box, s.fn.distance(p.x, p.y, p.z));
+		}
 		case 'trimesh':
 			return trimeshDistance(s, p);
 		case 'stadium2': {
@@ -835,7 +1295,7 @@ export function evalSdf(s: Sdf, p: float3): number {
 // exactly, so it is taken from whichever primitive decides the field there, through the combinators and transforms.
 // What has no formula here -- a Minkowski sum, an offset, a 2-D shape -- is differenced, but only that term rather than
 // the whole model. Six evaluations of the whole tree was what this replaces.
-export function surfaceNormal(s: Sdf, p: float3, eps: number): float3 {
+function surfaceNormal(s: Sdf, p: float3, eps: number): float3 {
 	const n = analyticNormal(s, p, eps);
 	const l = n ? n.len() : 0;
 	return n && l > 1e-9 ? n.scale(1 / l) : numericNormal(s, p, eps);
@@ -954,111 +1414,425 @@ function analyticNormal(s: Sdf, p: float3, eps: number): float3 | undefined {
 	}
 }
 
-// The distance in the plane to a (possibly multi-path) polygon, signed by an odd-even crossing test run across every
-// path's edges with one shared parity -- the standard test, which handles a concave outline and, with more than one
-// path, holes or islands (a hole's own crossings flip the parity back); it is what makes polygon() a field rather
-// than a stack of half-planes. The per-edge test below is the one maths' crossesRay (and line2.crossesRay) run: it is
-// written out rather than called because this is a per-edge inner loop, where the call measured ~20% slower -- and
-// going through line2.closestPoint for the distance on top of that allocates, ~11x slower again.
-export function polygonDistance2(px: number, py: number, paths: float2[][]): number {
-	let d2 = Infinity, sign = 1;
-	for (const points of paths) {
-		if (!points.length)
-			continue;
-		d2 = Math.min(d2, (px - points[0].x) ** 2 + (py - points[0].y) ** 2);
-		for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
-			const {x: ax, y: ay} = points[j], {x: bx, y: by} = points[i];	// v0 is the previous vertex, v1 the current one
-			const ex = bx - ax, ey = by - ay, wx = px - ax, wy = py - ay;
-			const t = Math.max(0, Math.min(1, (wx * ex + wy * ey) / (ex * ex + ey * ey || 1)));
-			d2 = Math.min(d2, (wx - ex * t) ** 2 + (wy - ey * t) ** 2);
-			const c0 = py >= ay, c1 = py < by, c2 = ex * wy > ey * wx;
-			if (c0 === c1 && c0 === c2)
-				sign = -sign;
+//-----------------------------------------------------------------------------
+// asking the field about a region, for the mesher
+//-----------------------------------------------------------------------------
+// A mesher samples the field in cells, and wants to know of each cell which parts of the model can matter in it, and
+// whether the surface there is a plane it can describe with one vertex. Both are answers only the model can give, so they
+// are asked of it, with `restrict` and `surfaceFrame`. Both rest on the field being a
+// bound on distance, so that over a ball of radius r it changes by at most r.
+
+// how far a field can change over a distance: 1 for a distance, more for the one kind that is only a bound on it, a
+// Minkowski sum with a brush that is not a ball (measured with the brush's support along the body's normal, which changes
+// abruptly where that normal does)
+const reachOf = (s: Sdf) => s.k === 'dilate' && s.support.q ? 3 : 1;
+
+// how far a transform can stretch a vector: the largest singular value of its linear part
+const stretches = new WeakMap<float3x4, number>();
+function stretchOf(inv: float3x4): number {
+	let k = stretches.get(inv);
+	if (k === undefined) {
+		const c = [inv.x, inv.y, inv.z];
+		const g = c.map(a => c.map(b => a.dot(b)));
+		stretches.set(inv, k = Math.sqrt(Math.max(...eigenSymmetric(g).values)));
+	}
+	return k;
+}
+
+// two unit vectors square to d and to each other
+function perpendicular(d: float3): [float3, float3] {
+	const a = normalize(Math.abs(d.x) < 0.6 ? d.cross(float3(1, 0, 0)) : d.cross(float3(0, 1, 0)));
+	return [a, d.cross(a)];
+}
+
+// the exact pieces of a convex polyhedron grown by a ball, as terms of the field like any other: a slab over each
+// face (its polygon carried a radius out along the normal, and a radius in, where every point is still within r of the
+// face and so inside the sum -- the inner half is there so that its far plane lies deep in the body rather than touching the
+// body's own face), a cylinder along each edge, a ball at each vertex
+function slabOver(n: float3, d: number, r: number, frame: Face, poly: float2[]): Sdf {
+	const centre = frame.centre.add(n.scale(d - n.dot(frame.centre)));
+	return {k: 'domain', m: float3x4(frame.u, frame.v, n, centre), scale: 1,
+		body: {k: 'extrude', h: 2 * r, center: true, body: {k: 'polygon2', paths: [poly]}}};
+}
+
+function cylinderAlong(mid: float3, dir: float3, half: number, r: number): Sdf {
+	const [a, b] = perpendicular(dir);
+	return {k: 'domain', m: float3x4(a, b, dir, mid), scale: 1, body: {k: 'cylinder', r, h: 2 * half, center: true}};
+}
+
+// the points between two planes square to dir, as far out sideways as anything the mesher will ask about
+const BAND_WIDTH = 1e9;
+function bandAbout(dir: float3, mid: number, half: number): Sdf {
+	const [a, b] = perpendicular(dir);
+	return {k: 'domain', m: float3x4(a, b, dir, dir.scale(mid)), scale: 1, body: {k: 'box', size: float3(BAND_WIDTH, BAND_WIDTH, 2 * half), center: true}};
+}
+
+const fanOf = (frame: Face) => [frame.tris[0][0], frame.tris[0][1], ...frame.tris.map(t => t[2])];
+const pointKey = (p: float3) => `${Math.round(p.x * 1e6)},${Math.round(p.y * 1e6)},${Math.round(p.z * 1e6)}`;
+
+// A prism grown by a disc lying square to its axis: the prism's cross-section grown by the disc, kept between the caps,
+// which do not move. The grown cross-section is the cross-section, a slab over each side, and a cylinder along the axis
+// at each corner, and the caps are a band -- so what the field measures as one distance is made of terms that are each
+// a plane, a cylinder or nothing at all.
+function decomposeBrush(b: PlaneBrush, r: number): Sdf | undefined {
+	const sides = b.sides;
+	if (sides.k !== 'planes' || sides.faces.some(f => !f || f.length < 3))
+		return undefined;
+	const along		= (p: float3) => p.dot(b.dir);
+	const withAxis	= (p: float3, value: number) => p.sub(b.dir.scale(along(p) - value));
+
+	const tall = b.half + 2 * r + 1;			// far enough along the axis that only the caps end them
+	const kids: Sdf[] = [sides];
+	const corners = new Map<string, float3>();
+	for (let i = 0; i < sides.faces.length; i++) {
+		const pl = sides.planes[i];
+		// the side carried past the caps, so that it is the band that ends it
+		const face = sides.faces[i].map(p => withAxis(p, along(p) >= b.mid ? b.mid + tall : b.mid - tall));
+		const frame = faceFrame(face, pl.n);
+		if (!frame)
+			return undefined;
+		kids.push(slabOver(pl.n, pl.d, r, frame, fanOf(frame)));
+		for (const p of sides.faces[i]) {
+			const at = withAxis(p, b.mid);
+			corners.set(pointKey(at), at);
 		}
 	}
-	return sign * Math.sqrt(d2);
+	for (const c of corners.values())
+		kids.push(cylinderAlong(c, b.dir, tall, r));
+	return {k: 'intersection', children: [bandAbout(b.dir, b.mid, b.half), {k: 'union', children: kids}]};
 }
 
-// A solid of revolution, from the 2-D shape the point's own half-plane sees: rotating the shape about z means the
-// point (x, y, z) is the profile point (hypot(x,y), z). That is exact for a full turn, since the nearest point of the
-// surface is always in the point's own half-plane. A partial turn is the same solid cut by a wedge through the axis,
-// which the intersection bound max() is enough for.
-function revolveDistance(s: Sdf & {k: 'revolve'}, p: float3): number {
-	const radius = Math.hypot(p.x, p.y);
-	const d = evalSdf(s.body, float3(radius, p.z, 0));
-	if (s.angle >= 360)
-		return d;
-	const half = s.angle * Math.PI / 360;
-	const angle = Math.atan2(p.y, p.x);
-	// The wedge |angle| <= half, as the furthest of its two bounding half-planes. Both run through the axis, so the
-	// distance to the one at angle h is radius*sin(angle - h): zero on the boundary, positive on the far side.
-	const wedge = Math.max(radius * Math.sin(angle - half), radius * Math.sin(-half - angle));
-	return Math.max(d, wedge);
+// A flat brush is the one Minkowski sum whose pieces are worth having as terms of their own: a window onto the field of
+// just the slab or cylinder that matters in a cell is far cheaper than the whole sum, which measures the entire
+// cross-section at every sample. Found once per sum.
+const brushPieces = new WeakMap<Sdf, Sdf | null>();
+function brushPiecesOf(s: Sdf & {k: 'dilate'}): Sdf | undefined {
+	let pieces = brushPieces.get(s);
+	if (pieces === undefined) {
+		const brush = s.support.q ? planeBrush(s.body, s.support) : undefined;
+		pieces = brush && decomposeBrush(brush, s.support.r) || null;
+		brushPieces.set(s, pieces);
+	}
+	return pieces ?? undefined;
 }
 
-// the 2D distance to a regular n-gon of circumradius r, shared by the evaluated field and its glsl
-function ngonDistance(x: number, y: number, r: number, n: number): number {
-	const an = Math.PI / n;
-	const ang = Math.atan2(x, y) - (Math.PI / 2 - an);		// OpenSCAD's first vertex is on +x
-	const folded = ang - 2 * an * Math.round(ang / (2 * an));
-	return Math.hypot(x, y) * Math.cos(folded) - r * Math.cos(an);
+// The field restricted to the ball (c, r): a model with whatever cannot decide the surface inside the ball taken out
+// of it, so that it is cheaper to ask and has less to be confused by. A part of a union that is above another's highest
+// value cannot be the smallest anywhere in the ball (the same for the other combinators), and a part that is positive
+// throughout cannot be zero anywhere in it, however it compares with the others. What is left is the handful of parts
+// that could shape the surface there; a combination left with one part is that part.
+export class Restricted extends SDF {
+	constructor(root: Sdf, public lo = 0, public hi = Infinity) {
+		super(root);
+	}
 }
 
-// The exact distance to a smooth taper (cylinder(r1, r2) with r1 != r2): Inigo Quilez's capped-cone construction,
-// which handles r1 or r2 being 0 (a point) as a special case of the same formula rather than needing one of its
-// own. Adapted from its canonical form (the axis along y, centred on the origin) to this evaluator's z-up axis and
-// z0/z1 span by recentring p.z on the cone's own mid-height and using half of z1 - z0 in place of its h. Kept in
-// step by hand with sdCone in sdflib.frag, since nothing generates either from the other.
-function coneDistance(s: Sdf & {k: 'cone'}, p: float3): number {
-	const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
-	const hy = (z1 - z0) / 2;
-	const qx = Math.hypot(p.x, p.y), qy = p.z - (z0 + z1) / 2;
-	const k1x = s.r2, k1y = hy;
-	const k2x = s.r2 - s.r1, k2y = 2 * hy;
-	const cax = qx - Math.min(qx, qy < 0 ? s.r1 : s.r2), cay = Math.abs(qy) - hy;
-	const dotk2k2 = k2x * k2x + k2y * k2y;
-	const t = dotk2k2 > 1e-12 ? Math.max(0, Math.min(1, ((k1x - qx) * k2x + (k1y - qy) * k2y) / dotk2k2)) : 0;
-	const cbx = qx - k1x + k2x * t, cby = qy - k1y + k2y * t;
-	const sign = cbx < 0 && cay < 0 ? -1 : 1;
-	return sign * Math.sqrt(Math.min(cax * cax + cay * cay, cbx * cbx + cby * cby));
+function restrict(s: Sdf, c: float3, r: number): Restricted {
+	const slack = 1e-9 * (1 + r);
+	switch (s.k) {
+		case 'union': {
+			const got = s.children.map(k => restrict(k, c, r));
+			let minHi = Infinity;
+			for (const g of got)
+				minHi = Math.min(minHi, g.hi);
+			let keep = got.filter(g => g.lo <= minHi + slack && g.lo <= 0);
+			if (!keep.length)
+				keep = got.filter(g => g.lo <= minHi + slack);
+			const lo = Math.min(...keep.map(g => g.lo));
+			if (keep.length === 1)
+				return new Restricted(keep[0].root, lo, minHi);
+			return new Restricted(keep.length === got.length && keep.every((g, i) => g.root === s.children[i]) ? s : {k: 'union', children: keep.map(g => g.root)}, lo, minHi);
+		}
+		case 'intersection': {
+			const got = s.children.map(k => restrict(k, c, r));
+			let maxLo = -Infinity;
+			for (const g of got)
+				maxLo = Math.max(maxLo, g.lo);
+			// and the other way about: a part that is negative throughout cannot be the largest where the largest is zero
+			let keep = got.filter(g => g.hi >= maxLo - slack && g.hi >= 0);
+			if (!keep.length)
+				keep = got.filter(g => g.hi >= maxLo - slack);
+			const hi = Math.max(...keep.map(g => g.hi));
+			if (keep.length === 1)
+				return new Restricted(keep[0].root, maxLo, hi);
+			return new Restricted(keep.length === got.length && keep.every((g, i) => g.root === s.children[i]) ? s : {k: 'intersection', children: keep.map(g => g.root)}, maxLo, hi);
+		}
+		case 'difference': {
+			// the largest of the base and the cuts' negations, so a cut is a part with its bounds turned over. The base stays,
+			// since there is no field to leave if it were the part that went
+			const base = restrict(s.base, c, r);
+			const cuts = s.cuts.map(k => restrict(k, c, r));
+			let maxLo = base.lo;
+			for (const g of cuts)
+				maxLo = Math.max(maxLo, -g.hi);
+			const keep = cuts.filter(g => -g.lo >= maxLo - slack && -g.lo >= 0);
+			const hi = Math.max(base.hi, ...keep.map(g => -g.lo));
+			if (!keep.length)
+				return new Restricted(base.root, maxLo, hi);
+			const same = base.root === s.base && keep.length === cuts.length && keep.every((g, i) => g.root === s.cuts[i]);
+			return new Restricted(same ? s : {k: 'difference', base: base.root, cuts: keep.map(g => g.root)}, maxLo, hi);
+		}
+		case 'domain': {
+			// the ball, carried into the body's frame, sits inside a ball stretched by at most the transform's stretch
+			const inv = inverseOrIdentity(s.m);
+			const inner = restrict(s.body, inv.mulPos(c), r * stretchOf(inv));
+			return new Restricted(inner.root === s.body ? s : {...s, body: inner.root}, inner.lo * s.scale, inner.hi * s.scale);
+		}
+		case 'material':
+			return restrict(s.body, c, r);
+		case 'dilate': {
+			const pieces = brushPiecesOf(s);
+			if (pieces)
+				return restrict(pieces, c, r);
+		}
+		// falls through: a sum that is not taken apart is one term
+		default: {
+			const v = evalSdf(s, c), reach = reachOf(s) * r;
+			return new Restricted(s, v - reach, v + reach);
+		}
+	}
 }
 
-// The exact distance to the hull of two balls of different radii, a.k.a. a "round cone": Inigo Quilez's construction,
-// unlike coneDistance's (a flat-capped frustum) this has a spherical cap at each end and is exactly what a mixed
-// hull() (see weightedHull3 below) needs along an edge between two points of any radii, including zero. Degenerates
-// to the plain capsule formula at r1 = r2, and is guarded separately for two more degenerate inputs neither capsule
-// nor a plain cone need worry about: coincident centres (whichever radius is bigger is the whole answer), and a
-// radius difference bigger than the distance between the centres (the smaller ball is entirely in the bigger one's
-// shadow along the axis, so again the bigger ball alone is the answer). Kept in step by hand with sdRoundCone in
-// sdflib.frag, since nothing generates either from the other.
-function roundConeDistance(p: float3, a: float3, b: float3, r1: number, r2: number): number {
-	const ba = b.sub(a);
-	const l2 = ba.dot(ba);
-	if (l2 < 1e-18)
-		return p.sub(a).len() - Math.max(r1, r2);
-	const rr = r1 - r2;
-	const a2 = l2 - rr * rr;
-	if (a2 <= 0)
-		return r1 >= r2 ? p.sub(a).len() - r1 : p.sub(b).len() - r2;
-	const il2 = 1 / l2;
-	const pa = p.sub(a);
-	const y = pa.dot(ba);
-	const z = y - l2;
-	const w = pa.scale(l2).sub(ba.scale(y));
-	const x2 = w.dot(w);
-	const y2 = y * y * l2;
-	const z2 = z * z * l2;
-	const k = Math.sign(rr) * rr * rr * x2;
-	if (Math.sign(z) * a2 * z2 > k)
-		return Math.sqrt(x2 + z2) * il2 - r2;
-	if (Math.sign(y) * a2 * y2 < k)
-		return Math.sqrt(x2 + y2) * il2 - r1;
-	return (Math.sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+export interface Plane {
+	n:	float3;		// a unit normal; the plane is the points x with n.x = d
+	d:	number;
+}
+
+// whether a solid is a convex polyhedron under transforms, so that a ball's growth of it leaves each face a plane
+function convexPolyhedral(s: Sdf): boolean {
+	return s.k === 'box' || s.k === 'planes' || ((s.k === 'domain' || s.k === 'material') && convexPolyhedral(s.body));
+}
+
+// the two caps of a prism of height h along z, as the plane fields of each (positive outside)
+const capFields = (z: number, h: number, center: boolean): [number, number] =>
+	center ? [-z - h / 2, z - h / 2] : [-z, z - h];
+
+// how far a plane's field changes across the cell: the cell is the parallelepiped of the point plus or minus each of three
+// vectors, a cube for the mesher and, carried into a transformed body's frame, the shape that cube becomes. A plane whose
+// field at the point is less than minus this is behind the whole cell.
+const spread = (n: float3, cell: float3[]) => cell.reduce((w, g) => w + Math.abs(n.dot(g)), 0);
+
+// the farthest the cell reaches from its point, in all three directions or (for a field of the plane) in the plane
+function circumradius(cell: float3[], planar = false): number {
+	let best = 0;
+	for (let m = 0; m < 4; m++) {					// the other four corners are the same distances
+		let x = 0, y = 0, z = 0;
+		for (let k = 0; k < 3; k++) {
+			const sign = k === 0 ? 1 : (m >> (k - 1)) & 1 ? -1 : 1;
+			x += sign * cell[k].x;
+			y += sign * cell[k].y;
+			z += sign * cell[k].z;
+		}
+		best = Math.max(best, planar ? Math.hypot(x, y) : Math.hypot(x, y, z));
+	}
+	return best;
+}
+
+// +1 if the polygon is one convex loop wound anticlockwise, -1 if clockwise, 0 if it is anything else
+const convexity = new WeakMap<float2[][], number>();
+function convexSense(s: Sdf & {k: 'polygon2'}): number {
+	let sense = convexity.get(s.paths);
+	if (sense === undefined) {
+		sense = 0;
+		if (s.paths.length === 1 && s.paths[0].length >= 3) {
+			const pts = s.paths[0];
+			let pos = 0, neg = 0, area = 0;
+			for (let i = 0; i < pts.length; i++) {
+				const a = pts[i], b = pts[(i + 1) % pts.length], c = pts[(i + 2) % pts.length];
+				const turn = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+				if (turn > 1e-12) ++pos;
+				else if (turn < -1e-12) ++neg;
+				area += a.x * b.y - b.x * a.y;
+			}
+			if (!(pos && neg) && area !== 0)
+				sense = area > 0 ? 1 : -1;
+		}
+		convexity.set(s.paths, sense);
+	}
+	return sense;
+}
+
+// A polygon's outline is a straight line where the nearest part of it is the inside of one edge: there its field is the
+// signed distance to that edge's line, linear, and so is any offset of it. The edge holds the whole cell if the cell stays
+// over the edge and every other edge stays farther than it is by the width of the cell.
+function polygonPlane(s: Sdf & {k: 'polygon2'}, p: float3, cell: float3[]): Plane | undefined {
+	let best = Infinity, second = Infinity, a = float2(0, 0), b = a;
+	for (const path of s.paths)
+		for (let i = 0; i < path.length; i++) {
+			const u = path[i], v = path[(i + 1) % path.length];
+			const e = v.sub(u), len2 = e.dot(e);
+			const w = float2(p.x - u.x, p.y - u.y);
+			const t = len2 > 0 ? Math.max(0, Math.min(1, w.dot(e) / len2)) : 0;
+			const d = Math.hypot(w.x - e.x * t, w.y - e.y * t);
+			if (d < best) {
+				second = best;
+				best = d;
+				a = u;
+				b = v;
+			} else if (d < second)
+				second = d;
+		}
+	const e = b.sub(a), len = e.len();
+	if (!(len > 1e-12))
+		return undefined;
+	const dir = e.scale(1 / len), along = float2(p.x - a.x, p.y - a.y).dot(dir);
+	const width = spread(float3(dir.x, dir.y, 0), cell);
+	if (!(along >= width && len - along >= width))
+		return undefined;
+	// Outside a convex polygon, over an edge, the nearest part of the outline is that edge wherever the point is on the
+	// outer side of its line, however near the next edge is by comparison. Elsewhere another edge must stay farther.
+	const sense = convexSense(s);
+	const out = sense ? float3(dir.y * sense, -dir.x * sense, 0) : undefined;
+	if (!(out && out.x * (p.x - a.x) + out.y * (p.y - a.y) >= spread(out, cell)) && !(second - best >= 2 * circumradius(cell, true)))
+		return undefined;
+	// the outward side is the one on which the field grows
+	const side = float3(dir.y, -dir.x, 0), step = 1e-4 * len;
+	const sign = polygonDistance2(p.x + side.x * step, p.y + side.y * step, s.paths) >= polygonDistance2(p.x - side.x * step, p.y - side.y * step, s.paths) ? 1 : -1;
+	const n = side.scale(sign);
+	return {n, d: n.x * a.x + n.y * a.y};
+}
+
+// a square as the polygon it is, once
+const outlines = new WeakMap<Sdf, Sdf & {k: 'polygon2'}>();
+function squareOutline(s: Sdf & {k: 'square2'}): Sdf & {k: 'polygon2'} {
+	let o = outlines.get(s);
+	if (!o) {
+		const x0 = s.center ? -s.size.x / 2 : 0, y0 = s.center ? -s.size.y / 2 : 0;
+		outlines.set(s, o = {k: 'polygon2', paths: [[float2(x0, y0), float2(x0 + s.size.x, y0), float2(x0 + s.size.x, y0 + s.size.y), float2(x0, y0 + s.size.y)]]});
+	}
+	return o;
+}
+
+// A plane of a body in the frame inv takes the body into, as a plane of the frame outside it
+function planeOutOf(inv: float3x4, pl: Plane): Plane {
+	const m = float3(inv.x.dot(pl.n), inv.y.dot(pl.n), inv.z.dot(pl.n)), len = m.len();
+	return {n: m.scale(1 / len), d: (pl.d - pl.n.dot(inv.w)) / len};
+}
+
+// The planes that the surface in a cell is made of, if it is made of nothing else: wherever the surface is in the cell it
+// is in one of these, and the model is, within the cell, some combination of their half-spaces. Whatever cannot reach the
+// cell is left out: the rest of a union are above zero over a cell whose circumradius is no more than their values, the
+// rest of an intersection below, a face of a box or a prism is behind the cell by the extent of the cell along its normal.
+// Undefined where it is not certain, which is a curve, a part the model has no formula for, or too many to count.
+function planesOf(s: Sdf, p: float3, cell: float3[], eps: number): Plane[] | undefined {
+	switch (s.k) {
+		case 'union': case 'intersection': case 'difference': {
+			// the largest of the parts, or the smallest, as an intersection or a union; a cut is the negation of the part it is
+			const parts = s.k === 'difference' ? [s.base, ...s.cuts] : s.children;
+			const sign = (i: number) => s.k === 'union' || (s.k === 'difference' && i) ? 1 : -1;
+			const R = circumradius(cell);
+			const out: Plane[] = [];
+			for (let i = 0; i < parts.length; i++) {
+				// above zero throughout the cell, for a union (a cut is out of the way the same, a part of an intersection
+				// or the base the other)
+				if (sign(i) * evalSdf(parts[i], p) >= R * reachOf(parts[i]))
+					continue;
+				const got = planesOf(parts[i], p, cell, eps);
+				if (!got)
+					return undefined;
+				out.push(...got);
+			}
+			return out;
+		}
+		case 'domain': {
+			const inv = inverseOrIdentity(s.m);
+			const got = planesOf(s.body, inv.mulPos(p), cell.map(g => inv.mulDir(g)), eps);
+			return got && got.map(pl => planeOutOf(inv, pl));
+		}
+		case 'material':
+			return planesOf(s.body, p, cell, eps);
+		case 'box': {
+			const c = s.center ? float3(0, 0, 0) : s.size.scale(0.5);
+			const at = [c.x, c.y, c.z], h = [s.size.x / 2, s.size.y / 2, s.size.z / 2], q = [p.x, p.y, p.z];
+			const out: Plane[] = [];
+			for (let i = 0; i < 6; i++) {
+				const a = i >> 1, up = (i & 1) === 1;
+				const n = float3(a === 0 ? 1 : 0, a === 1 ? 1 : 0, a === 2 ? 1 : 0).scale(up ? 1 : -1);
+				const d = up ? at[a] + h[a] : -(at[a] - h[a]);
+				// behind the cell by its extent along the normal, or a face the surface can be on
+				if (n.dot(p) - d > -spread(n, cell))
+					out.push({n, d});
+			}
+			return out;
+		}
+		case 'planes': {
+			const out: Plane[] = [];
+			for (const pl of s.planes)
+				if (pl.n.dot(p) - pl.d > -spread(pl.n, cell))
+					out.push(pl);
+			return out;
+		}
+		case 'polygon2': {
+			const pl = polygonPlane(s, p, cell);
+			return pl && [pl];
+		}
+		case 'square2':
+			return planesOf(squareOutline(s), p, cell, eps);
+		case 'offset': {
+			// a level of a field that is linear in the cell is the plane shifted by the level
+			if (s.body.k !== 'polygon2' && s.body.k !== 'square2' && s.body.k !== 'offset')
+				return undefined;
+			const got = planesOf(s.body, p, cell, eps);
+			return got && got.length === 1 ? [{n: got[0].n, d: got[0].d + s.r}] : undefined;
+		}
+		case 'cylinder': case 'ngonPrism': case 'extrude': {
+			const [bottom, top] = capFields(p.z, s.h, s.center);
+			const high = spread(float3(0, 0, 1), cell);
+			const z0 = s.center ? -s.h / 2 : 0, z1 = s.center ? s.h / 2 : s.h;
+			const out: Plane[] = [];
+			if (bottom > -high)
+				out.push({n: float3(0, 0, -1), d: -z0});
+			if (top > -high)
+				out.push({n: float3(0, 0, 1), d: z1});
+			// the side is nothing to the cell if it is behind it, and a plane only for an extrusion of a straight edge
+			const side = s.k === 'cylinder' ? Math.hypot(p.x, p.y) - s.r : s.k === 'ngonPrism' ? ngonDistance(p.x, p.y, s.r, s.n) : evalSdf(s.body, p);
+			if (side > -circumradius(cell, true)) {
+				if (s.k !== 'extrude')
+					return undefined;
+				const got = planesOf(s.body, p, cell, eps);
+				if (!got)
+					return undefined;
+				out.push(...got);
+			}
+			return out;
+		}
+		case 'dilate': {
+			// growing a corner rounds it: only a single face stays a plane, shifted out by the growth
+			if (!s.support.q) {
+				if (!convexPolyhedral(s.body))
+					return undefined;
+				const got = planesOf(s.body, p, cell, eps);
+				return got && (got.length === 0 ? got : got.length === 1 ? [{n: got[0].n, d: got[0].d + s.support.r}] : undefined);
+			}
+			const brush = planeBrush(s.body, s.support);
+			if (!brush)
+				return undefined;
+			// the field is that of 'extrude' with the cross-section grown: its sides are the cross-section's faces moved out,
+			// and its caps, which do not move, are behind the cell as far as the grown cross-section is
+			const a = p.dot(brush.dir) - brush.mid, on = p.sub(brush.dir.scale(a));
+			const high = spread(brush.dir, cell);
+			const out: Plane[] = [];
+			if (a - brush.half > -high)
+				out.push({n: brush.dir, d: brush.mid + brush.half});
+			if (-a - brush.half > -high)
+				out.push({n: brush.dir.scale(-1), d: -(brush.mid - brush.half)});
+			if (evalSdf(brush.sides, on) - s.support.r > -circumradius(cell)) {
+				const wall = planesOf(brush.sides, on, cell, eps);
+				if (!wall || wall.length > 1)
+					return undefined;
+				for (const pl of wall)
+					out.push({n: pl.n, d: pl.d + s.support.r});
+			}
+			return out;
+		}
+		default:
+			return undefined;
+	}
 }
 
 // The faces of a body that is a convex polyhedron, as the planes and polygons the `planes` primitive carries: a box, a
 // prism on a regular n-gon, or a polyhedron itself. Anything with a curved side is not one.
-export function polyhedronOf(body: Sdf): Hull3| undefined {
+function polyhedronOf(body: Sdf): Hull3| undefined {
 	switch (body.k) {
 		case 'planes':
 			return body.faces.length && body.faces.length === body.planes.length && body.faces.every(f => f && f.length >= 3)
@@ -1623,7 +2397,7 @@ export function sameRadiusCircles(body: Sdf): {centres: float2[], r: number} | u
 //
 // The obvious formula, `d - r*|grad(d).xy|`, cannot be right here: across the rim the gradient swings from the cap
 // normal to the wall normal, so the offset subtracted falls from r to nothing and the rim is rolled over by r/2.
-export interface PlaneBrush {
+interface PlaneBrush {
 	dir: float3;			// the direction (a unit vector) the brush has no thickness along, and the body's axis
 	mid: number;			// the caps, which do not move, as positions along dir
 	half: number;
@@ -1632,7 +2406,7 @@ export interface PlaneBrush {
 
 // found once per operand: the field asks at every sample, and a box has to be turned into its faces to be asked
 const brushes = new WeakMap<Sdf, {support: Support, brush: PlaneBrush | undefined}>();
-export function planeBrush(original: Sdf, support: Support): PlaneBrush | undefined {
+function planeBrush(original: Sdf, support: Support): PlaneBrush | undefined {
 	const known = brushes.get(original);
 	if (known && known.support === support)
 		return known.brush;
@@ -1730,84 +2504,6 @@ export function is2d(s: Sdf): boolean {
 	}
 }
 
-// A 2-D shape that no extrude consumed describes an infinite prism, which is not what the file drew and not something
-// a camera can frame, so it is dropped and reported once. The extrudes take their own children, so this only ever
-// meets the shapes left outside them.
-export function strip2d(s: Sdf): {sdf: Sdf, stripped: boolean} {
-	let stripped = false;
-	const walk = (s: Sdf): Sdf => {
-		switch (s.k) {
-			case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
-				stripped = true;
-				return empty;
-			case 'union':
-				return union(s.children.map(walk));
-			case 'intersection': {
-				const children = s.children.map(walk).filter(c => c.k !== 'empty');
-				return children.length === 0 ? empty : children.length === 1 ? children[0] : {k: 'intersection', children};
-			}
-			case 'difference': {
-				const base = walk(s.base);
-				return base.k === 'empty' ? empty : {k: 'difference', base, cuts: s.cuts.map(walk)};
-			}
-			// a wrapper around nothing is nothing, or a big drawing of 2-D shapes is a union of thousands of dead terms
-			case 'domain': {
-				const body = walk(s.body);
-				return body.k === 'empty' ? empty : {k: 'domain', m: s.m, scale: s.scale, body};
-			}
-			case 'warp': {
-				const body = walk(s.body);
-				return body.k === 'empty' ? empty : {k: 'warp', kind: s.kind, r: s.r, box: s.box, axis: s.axis, body};
-			}
-			case 'dilate': {
-				const body = walk(s.body);
-				return body.k === 'empty' ? empty : {k: 'dilate', body, support: s.support};
-			}
-			case 'material': {
-				const body = walk(s.body);
-				return body.k === 'empty' ? empty : {k: 'material', mat: s.mat, body};
-			}
-			case 'extrude': case 'revolve':
-				return s;			// these are what a 2-D shape is for
-			default:
-				return s;
-		}
-	};
-	return {sdf: walk(s), stripped};
-}
-
-// The shapes strip2d drops, as sheets: each 2-D shape outside an extrude pulled up into an extrude of its own, centred
-// on the plane and `thickness` tall. A sheet of no height at all would need no side walls to march, but the shader
-// takes a surface's normal from the field on both sides of it, and the field of a surface with no inside is |z|,
-// whose gradient is noise at the surface. So the thickness is whatever is small enough not to be seen -- a thousandth
-// of the picture -- and only large enough for that. What is shown this way is not a solid, so it is the viewer's
-// alone: an export takes the stripped shape.
-export function flat2d(s: Sdf, thickness: number): Sdf {
-	const sheet = (body: Sdf): Sdf => ({k: 'extrude', h: thickness, center: true, body});
-	const walk = (s: Sdf): Sdf => {
-		switch (s.k) {
-			case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
-				return sheet(s);
-			case 'union':
-				// one sheet for a union of shapes, as one extrude takes them, so a big union is still one the batch can hold
-				return s.children.every(is2d) ? sheet(s) : union(s.children.map(walk));
-			case 'intersection':
-				return s.children.every(is2d) ? sheet(s) : empty;
-			case 'difference':
-				return is2d(s.base) ? sheet(s) : empty;
-			case 'domain':
-				return is2d(s.body) ? sheet(s) : empty;
-			case 'material': {
-				const body = walk(s.body);
-				return body.k === 'empty' ? empty : {k: 'material', mat: s.mat, body};
-			}
-			default:
-				return empty;
-		}
-	};
-	return walk(s);
-}
-
 //-----------------------------------------------------------------------------
 // surface(): a heightmap
 //-----------------------------------------------------------------------------
@@ -1823,9 +2519,7 @@ const HEIGHTMAP_TILE = 8;
 // lowest height that surface() adds, is simply the innermost shell there.
 // `tiled` says which of the grid's axes repeat once it is wrapped, and is carried for wrap() to read: it is the flat
 // grid's own property, since it is the grid -- not the bend -- that is a tile (see Tiled).
-export function heightmap(cols: number, rows: number, heights: ArrayLike<number>, bottom: number, wrap?: Wrap, tiled?: Tiled): Heightmap | undefined {
-	if (cols < 2 || rows < 2)
-		return undefined;
+export function heightmap(cols: number, rows: number, heights: ArrayLike<number>, bottom: number, wrap?: Wrap, tiled?: Tiled): Heightmap {
 	const h = Float32Array.from(heights);
 	if (wrap) {
 		let floor = Math.min(bottom, h[0]);
@@ -2526,7 +3220,7 @@ export function projection(body: Sdf, cut: boolean): {sdf: Sdf, traced?: number}
 		const h = size / TRACE_CELLS;
 		traced = Math.max(traced ?? 0, h);
 		const pad = float2(h, h);
-		const box = {min: float2(b.min.x, b.min.y).sub(pad), max: float2(b.max.x, b.max.y).add(pad)};
+		const box = new Box2(float2(b.min.x, b.min.y).sub(pad), float2(b.max.x, b.max.y).add(pad));
 		const f = cut
 			? (x: number, y: number) => evalSdf(s, float3(x, y, 0))
 			: (x: number, y: number) => shadowDistance(s, x, y, b.min.z, b.max.z, h / 4);
@@ -2543,12 +3237,13 @@ export function projection(body: Sdf, cut: boolean): {sdf: Sdf, traced?: number}
 // What a surface is made of. rgb and opacity come from color(); everything else from `$` variables, which OpenSCAD
 // ignores, so a file that sets them is still a valid scad file and simply renders without the effect there.
 export interface Material {
-	rgb: float3;
-	opacity: number;		// color()'s alpha: how much light it does not let through
-	specular: number;		// how strong the highlight is; where it falls is the Fresnel term's business
-	roughness: number;		// how wide the highlight and the reflection are
-	ior: number;			// the refractive index: 1 is air, which bends nothing
-	metallic: number;		// 1 puts the colour in the reflection and lets nothing through
+	rgb:		float3;
+	opacity:	number;		// color()'s alpha: how much light it does not let through
+	specular:	number;		// how strong the highlight is; where it falls is the Fresnel term's business
+	roughness:	number;		// how wide the highlight and the reflection are
+	ior:		number;		// the refractive index: 1 is air, which bends nothing
+	metallic:	number;		// 1 puts the colour in the reflection and lets nothing through
+	colorFn?:	ColorFn;	// a colour that is a function of the point, in place of rgb (which is then only what is shown where a pixel has no point to ask)
 }
 
 // The viewer's own material: what geometry no color() and no `$` variable mentions is drawn in. The index of
@@ -2565,45 +3260,29 @@ export function sameMaterial(a: Material, b: Material): boolean {
 	return Math.abs(a.rgb.x - b.rgb.x) < 1e-9 && Math.abs(a.rgb.y - b.rgb.y) < 1e-9 && Math.abs(a.rgb.z - b.rgb.z) < 1e-9 &&
 		Math.abs(a.opacity - b.opacity) < 1e-9 && Math.abs(a.specular - b.specular) < 1e-9 &&
 		Math.abs(a.roughness - b.roughness) < 1e-9 && Math.abs(a.ior - b.ior) < 1e-9 &&
-		Math.abs(a.metallic - b.metallic) < 1e-9;
+		Math.abs(a.metallic - b.metallic) < 1e-9 && a.colorFn === b.colorFn;
 }
 
 // Every material in the field with the default at index 0, in the order they are met. Both the emitter and the mirror
 // read the indices off this one walk, so the material the shader reports and the one measured here cannot drift.
 function materialWalk(root: Sdf): {ids: Map<Sdf, number>, palette: Material[]} {
 	const ids = new Map<Sdf, number>(), palette: Material[] = [DEFAULT_MATERIAL];
-	const walk = (s: Sdf) => {
-		switch (s.k) {
-			case 'material': {
-				// the same material written twice is one entry, so the palette stays as short as it can be
-				let i = palette.findIndex(m => sameMaterial(m, s.mat));
-				if (i < 0) {
-					palette.push(s.mat);
-					i = palette.length - 1;
-				}
-				ids.set(s, i);
-				walk(s.body);
-				return;
+	walk(root, (s, process) => {
+		if (s.k=== 'material') {
+			// the same material written twice is one entry, so the palette stays as short as it can be
+			let i = palette.findIndex(m => sameMaterial(m, s.mat));
+			if (i < 0) {
+				palette.push(s.mat);
+				i = palette.length - 1;
 			}
-			case 'union': case 'intersection':
-				s.children.forEach(walk);
-				return;
-			case 'difference':
-				walk(s.base);
-				s.cuts.forEach(walk);
-				return;
-			case 'domain': case 'dilate': case 'offset': case 'extrude': case 'revolve':
-				walk(s.body);
-				return;
-			default:
-				return;
+			ids.set(s, i);
 		}
-	};
-	walk(root);
+		return process(s);
+	});
 	return {ids, palette};
 }
 
-export function materials(root: Sdf): Material[] {
+export function materials(root: Sdf) {
 	return materialWalk(root).palette;
 }
 
@@ -2693,6 +3372,7 @@ interface BatchLeaf {
 	material:	number;
 	box:		Box3;
 	order:		number;
+	term?:		Sdf;			// the shape itself, which the grid is built by measuring
 }
 
 const IDENTITY_MAP = float3x4.identity();
@@ -2827,7 +3507,100 @@ function emitBatch(e: Emit, leaves: BatchLeaf[], p: string): string {
 	for (const l of leaves)
 		if (l.segs)
 			e.data.push(...l.segs);
-	return `sdBatch(${p}, ${nodeBase}, ${leafBase})`;
+	const grid = emitGrid(e, leaves);
+	return grid < 0 ? `sdBatch(${p}, ${nodeBase}, ${leafBase})` : `sdBatchGrid(${p}, ${nodeBase}, ${leafBase}, ${grid})`;
+}
+
+// A grid over the plane for a union of 2-D shapes, which the hierarchy cannot serve well when the shapes are long and
+// thin and lie across one another: their boxes all overlap, so no box can be skipped, and every step measures nearly
+// every shape. Each cell of the grid lists the shapes that could be the nearest to some point in it. A shape's
+// distance over a cell is within (its distance at the centre) +- (the cell's radius x how fast the distance can change),
+// so a shape is dropped from a cell when even its lowest possible distance is above the lowest highest-possible
+// distance of any shape. What is left still holds the minimum exactly, and the shader measures only those.
+// Laid out after the segments: two header texels, (x0, y0, 1/cell width, 1/cell height) and (nx, ny, first cell, 0);
+// a texel for each cell, (first list texel, count); where the list would be too long the count is -2 and the texel is
+// the first of a finer grid of 8 x 8 cells over that cell's rectangle (to as many levels as it takes, to three), or -1
+// where even that was too crowded and the hierarchy answers; then the lists and the finer grids, a list's shape
+// indices four to a texel. Returns the header's texel, or -1 if there is no grid.
+const GRID_MIN_LEAVES = 8, GRID_MAX_LIST = 24, GRID_MAX_CELLS = 16384, GRID_WORK = 600000, GRID_SUB = 8, GRID_DEPTH = 3;
+function emitGrid(e: Emit, leaves: BatchLeaf[]): number {
+	if (leaves.length < GRID_MIN_LEAVES)
+		return -1;
+	const finite = (v: number) => Math.abs(v) < 1e19;
+	let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+	const lip: number[] = [];
+	for (const l of leaves) {
+		// only shapes of the plane that depend on the plane alone, and sit somewhere
+		if (!l.term || l.kind < BATCH_KINDS.square2 || l.m.z.x !== 0 || l.m.z.y !== 0
+			|| !finite(l.box.min.x) || !finite(l.box.max.x) || !finite(l.box.min.y) || !finite(l.box.max.y))
+			return -1;
+		x0 = Math.min(x0, l.box.min.x); x1 = Math.max(x1, l.box.max.x);
+		y0 = Math.min(y0, l.box.min.y); y1 = Math.max(y1, l.box.max.y);
+		// the largest factor the plane part of the map can stretch by, times the distance scale
+		const a = l.m.x.x, b = l.m.y.x, c = l.m.x.y, d = l.m.y.y;
+		const t = a * a + b * b + c * c + d * d, det = a * d - b * c;
+		lip.push(l.scale * Math.sqrt((t + Math.sqrt(Math.max(0, t * t - 4 * det * det))) / 2));
+	}
+	const w = x1 - x0, h = y1 - y0;
+	if (!(w > 0 && h > 0))
+		return -1;
+	const cells = Math.min(GRID_MAX_CELLS, Math.floor(GRID_WORK / leaves.length));
+	const size = Math.sqrt(w * h / cells);
+	const nx = Math.max(1, Math.ceil(w / size)), ny = Math.max(1, Math.ceil(h / size));
+	const cw = w / nx, ch = h / ny, radius = Math.hypot(cw, ch) / 2;
+
+	// what a rectangle of the grid holds: a list of shapes, or if the list is long a finer grid over it, or at last
+	// nothing (the hierarchy answers there)
+	type Cell = {list: number[]} | {sub: Cell[]} | undefined;
+	const build = (cx: number, cy: number, cw: number, ch: number, among: number[], depth: number): Cell => {
+		const p = float3(cx + cw / 2, cy + ch / 2, 0), r = Math.hypot(cw, ch) / 2;
+		const d = among.map(k => evalSdf(leaves[k].term!, p));
+		let top = Infinity;
+		d.forEach((v, i) => top = Math.min(top, v + lip[among[i]] * r));
+		const slack = 1e-6 * (Math.abs(top) + 1);
+		const list = among.filter((k, i) => d[i] - lip[k] * r <= top + slack);
+		if (list.length <= GRID_MAX_LIST)
+			return {list};
+		if (depth >= GRID_DEPTH)
+			return undefined;
+		const sub: Cell[] = [];
+		for (let j = 0; j < GRID_SUB; j++)
+			for (let i = 0; i < GRID_SUB; i++)
+				sub.push(build(cx + i * cw / GRID_SUB, cy + j * ch / GRID_SUB, cw / GRID_SUB, ch / GRID_SUB, list, depth + 1));
+		return {sub};
+	};
+	const all = leaves.map((_, k) => k);
+	const top: Cell[] = [];
+	for (let j = 0; j < ny; j++)
+		for (let i = 0; i < nx; i++)
+			top.push(build(x0 + i * cw, y0 + j * ch, cw, ch, all, 1));
+
+	const base = e.data.length / 4, cellBase = base + 2, extraBase = cellBase + nx * ny;
+	const extra: number[] = [];
+	// writes a cell's texel, with whatever it points at after the ones so far
+	const place = (c: Cell): [number, number] => {
+		if (!c)
+			return [0, -1];
+		if ('list' in c) {
+			const at = extraBase + extra.length / 4;
+			for (let k = 0; k < c.list.length; k += 4)
+				extra.push(c.list[k], c.list[k + 1] ?? 0, c.list[k + 2] ?? 0, c.list[k + 3] ?? 0);
+			return [at, c.list.length];
+		}
+		const at = extraBase + extra.length / 4, first = extra.length;
+		extra.push(...new Array(c.sub.length * 4).fill(0));
+		c.sub.forEach((child, k) => {
+			const [x, y] = place(child);
+			extra[first + 4 * k] = x;
+			extra[first + 4 * k + 1] = y;
+		});
+		return [at, -2];
+	};
+	e.data.push(x0, y0, 1 / cw, 1 / ch, nx, ny, cellBase, 0);
+	for (const c of top)
+		e.data.push(...place(c), 0, 0);
+	e.data.push(...extra);
+	return base;
 }
 
 interface Emit {
@@ -2859,7 +3632,17 @@ function materialFunction(palette: Material[]): string {
 		lines.push(`\treturn ${of(palette[palette.length - 1])};`);
 		lines.push('}');
 	};
-	accessor('matColor', 'vec3', m => v3(m.rgb));
+	// a colour that is a function of the point asks for it at g_hit, the point being shaded (set by the shader before it
+	// shades), carried into the frame the function was written in
+	const fns = new Map<Material, string>();
+	palette.forEach((m, i) => {
+		if (m.colorFn) {
+			const name = `matFn${i}`;
+			fns.set(m, name);
+			lines.push(m.colorFn.glsl(name));
+		}
+	});
+	accessor('matColor', 'vec3', m => fns.has(m) ? `${fns.get(m)}(g_hit)` : v3(m.rgb));
 	accessor('matOpacity', 'float', m => f(m.opacity));
 	accessor('matSpec', 'float', m => f(m.specular));
 	accessor('matRough', 'float', m => f(m.roughness));
@@ -2950,7 +3733,7 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 				}
 				if ((found.length >= BATCH_MIN || (found.length >= 2 && segments >= BATCH_SEGMENTS)) && found.length <= BATCH_MAX) {
 					const taken = new Set(found.map(f => f.term));
-					line(`${v} = ${emitBatch(e, found.map((f, order) => ({...f.leaf, box: f.box, order})), p)};`);
+					line(`${v} = ${emitBatch(e, found.map((f, order) => ({...f.leaf, box: f.box, order, term: f.term})), p)};`);
 					kids = flat.filter(t => !taken.has(t));
 				}
 			}
@@ -3212,6 +3995,13 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 				: `vec2 ${v} = vec2(sdHeightmap(${p}, ${common}), ${f(mat)});`);
 			return;
 		}
+		case 'fnfield': {
+			const name = `fn${e.n++}`, c = s.box.centre(), h = s.box.extent().scale(0.5);
+			e.helpers.push(s.fn.glsl(name));
+			line(`vec3 ${v}_q = abs(${p} - ${v3(c)}) - ${v3(h)};`);
+			line(`vec2 ${v} = vec2(max(length(max(${v}_q, vec3(0.0))) + min(max(${v}_q.x, max(${v}_q.y, ${v}_q.z)), 0.0), ${name}(${p})), ${f(mat)});`);
+			return;
+		}
 		case 'trimesh': {
 			// the hierarchy and the triangles go in the batch texture as they are laid out (see sdMesh in sdflib.frag)
 			const append = (values: Float32Array) => {
@@ -3245,7 +4035,7 @@ export function emitGlsl(root: Sdf): {helpers: string[], body: string[], data: F
 export function countPrimitives(s: Sdf): number {
 	switch (s.k) {
 		case 'empty': return 0;
-		case 'sphere': case 'box': case 'cylinder': case 'ngonPrism': case 'cone': case 'planes': case 'capsule': case 'roundCone': case 'heightmap': case 'trimesh': return 1;
+		case 'sphere': case 'box': case 'cylinder': case 'ngonPrism': case 'cone': case 'planes': case 'capsule': case 'roundCone': case 'heightmap': case 'fnfield': case 'trimesh': return 1;
 		case 'union': case 'intersection': return s.children.reduce((n, c) => n + countPrimitives(c), 0);
 		case 'difference': return countPrimitives(s.base) + s.cuts.reduce((n, c) => n + countPrimitives(c), 0);
 		case 'domain': case 'warp': case 'dilate': case 'material': case 'offset': case 'extrude': case 'revolve':

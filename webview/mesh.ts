@@ -1,8 +1,10 @@
 // The mesh viewer's page: it draws the meshes the extension read from a file, each where the file places it, over the
 // floor the scad viewer draws, and says what is under the cursor.
 import { vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Canvas3D, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
+import { Canvas3D, Pixels, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
 import { Orbit } from './orbit.js';
+import { Gizmo } from './gizmo.js';
+import { Cascade, CascadeItem, svgFace, choiceItem, toggleItem } from './cascade.js';
 import { float3, float4, float3x3, float3x4, float4x4, matmul, matmulExt} from '@isopodlabs/maths/vector';
 import type { GlyphAtlas } from './sdf.js';
 
@@ -13,6 +15,7 @@ export interface MeshData {
 	colors:		Uint8Array;			// rgba a corner
 	uvs?:		Float32Array;		// 2 a corner, when a run is textured
 	faces:		Float32Array;		// the face of the file's mesh each corner is of
+	edges:		Float32Array;		// per corner, which sides of its triangle are sides of the file's face (bits 0, 1, 2)
 	runs:		{texture: number, first: number, count: number}[];	// texture -1: none
 	lines:		Float32Array;		// 3 an end, two ends a segment
 	labels:		string[];			// what a face is, as faceLabels names it
@@ -25,16 +28,12 @@ export interface InstanceData {
 	object:		string;
 }
 
-export interface TextureData {
-	width:		number;
-	height:		number;
-	pixels:		Uint8Array;			// rgba, row 0 the top
-}
+export type TextureData = Pixels;
 
 export interface Model {
 	meshes:		MeshData[],
 	instances:	InstanceData[],
-	textures:	(TextureData | undefined)[],
+	textures:	(Pixels | undefined)[],
 	info:		string,
 	warnings:	string[],
 	unit:		string,
@@ -50,8 +49,7 @@ export type MessageOut =
 export type MessageIn =
 	| ({command: 'model'} & Model)
 	| {command: 'error', message: string}
-	| {command: 'fitToWindow'}
-	| {command: 'resetZoom'};
+	| {command: 'fitToWindow'};
 
 interface Shaders { vert: string, frag: string, floorVert: string, floorFrag: string }
 
@@ -81,6 +79,15 @@ let gpuTextures:	(WebGLTexture | undefined)[] = [];
 let model:			Model | undefined;
 let up:				'y' | 'z' = 'z';
 let floorOn			= true;
+
+// how the model is drawn, which the menu changes
+const view = {
+	display:	'solid' as 'solid' | 'wire' | 'edges',		// edges: all of it, with the edges over
+	shading:	'smooth' as 'smooth' | 'flat' | 'unlit',
+	colours:	true,
+	lines:		true,
+	backs:		'tint' as 'tint' | 'plain' | 'hide',
+};
 let center			= float3(0, 0, 0);
 let half			= float3(1, 1, 1);
 const size			= () => half.len();
@@ -99,6 +106,7 @@ function makeGpuMesh(data: MeshData) {
 			a_color:	{size: 4, data: data.colors},
 			a_uv:		data.uvs && {size: 2, data: data.uvs},
 			a_face:		{size: 1, data: data.faces},
+			a_edges:	{size: 1, data: data.edges},
 		}),
 		lines: data.lines.length ? {vao: createVertexArray(gl, program!.program, {a_position: {size: 3, data: data.lines}}), count: data.lines.length / 3} : undefined,
 		data
@@ -138,10 +146,13 @@ function measure() {
 const orbit: Orbit = new Orbit(canvas, {
 	anchor:		(x, y): float3 => pickAt(x, y)?.pos ?? floorAt(x, y) ?? orbit.along(x, y, center, size()),
 	size,
-	changed:	() => render(),
+	redraw:	() => render(),
 	dragStart:	() => hideTooltip(),
 	zoomed:		(x, y) => schedulePick(x, y),
+	contextMenu:(x, y) => { hideTooltip(); menu.open(x, y); }
+
 });
+const gizmo = new Gizmo(canvas, orbit.gizmoHooks());
 
 function home() {
 	// from in front, to the right and above, as the scad viewer starts
@@ -153,8 +164,18 @@ function home() {
 function drawMeshes(viewProj: float4x4, pick: number) {
 	const p = program!;
 	for (const [index, instance] of (model?.instances ?? []).entries()) {
-		const mesh = gpuMeshes[instance.mesh], m = instanceMatrix(instance);
-		p.use({u_model: affine(m.flat()), u_viewProj: viewProj.flat(), u_pick: pick, u_instance: index, u_mirrored: m.det() < 0 ? 1 : 0, u_lit: 1});
+		const mesh = gpuMeshes[instance.mesh], m = instanceMatrix(instance), mirrored = m.det() < 0;
+		p.use({
+			u_model: affine(m.flat()), u_viewProj: viewProj.flat(), u_pick: pick, u_instance: index, u_mirrored: mirrored ? 1 : 0, u_lit: 1,
+			u_shade:	view.shading === 'smooth' ? 0 : view.shading === 'flat' ? 1 : 2,
+			u_wire:		view.display === 'solid' ? 0 : view.display === 'edges' ? 1 : 2,
+			u_plain:	view.colours ? 0 : 1,
+			u_backs:	view.backs === 'tint' ? 0 : 1,
+		});
+		if (view.backs === 'hide') {
+			gl.enable(gl.CULL_FACE);
+			gl.frontFace(mirrored ? gl.CW : gl.CCW);
+		}
 		gl.bindVertexArray(mesh.vao);
 		for (const run of mesh.data.runs) {
 			const texture = run.texture >= 0 ? gpuTextures[run.texture] : undefined;
@@ -163,13 +184,14 @@ function drawMeshes(viewProj: float4x4, pick: number) {
 			p.use({u_textured: texture ? 1 : 0, u_texture: 0});
 			gl.drawArrays(gl.TRIANGLES, run.first, run.count);
 		}
-		if (mesh.lines && !pick) {
+		if (mesh.lines && !pick && view.lines) {
 			p.use({u_lit: 0, u_textured: 0});
 			gl.bindVertexArray(mesh.lines.vao);
 			gl.vertexAttrib4f(gl.getAttribLocation(p.program, 'a_color'), 0.85, 0.87, 0.9, 1);
 			gl.drawArrays(gl.LINES, 0, mesh.lines.count);
 		}
 	}
+	gl.disable(gl.CULL_FACE);
 	gl.bindVertexArray(null);
 }
 
@@ -196,6 +218,7 @@ function render() {
 }
 
 function draw() {
+	gizmo.show(true);
 	canvas3d.resize();
 	canvas3d.initViewport();
 	gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -239,7 +262,6 @@ function glyphUniforms() {
 //--- what is under the cursor ------------------------------------------------
 
 let pickTarget: Offscreen | undefined;
-const pickPixel = new Float32Array(4);
 
 // what turns clip space so the pixel under (ndcX, ndcY) fills the viewport: for drawing that one pixel alone
 function pickWindow(ndcX: number, ndcY: number, width: number, height: number): float4x4 {
@@ -268,16 +290,16 @@ function pickAt(clientX: number, clientY: number, full = false) {
 		gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 		program!.use({u_origin: orbit.eye._values, u_basis: orbit.basis.flat()});
 		drawMeshes(viewProj, mode);
-		pickTarget!.readPixels(pickPixel);
+		const pixels = pickTarget!.readPixels();
 		pickTarget!.end();
-		return [...pickPixel];
+		return [...pixels];
 	};
 	const first = read(1);
 	const result = first[3] < 0 ? undefined : {
-		pos:		float3(first[0], first[1], first[2]),
+		pos:		float3.load(first),
 		instance:	Math.round(first[3]),
 		face:		full ? Math.round(read(2)[0]) : -1,
-		colour:		full ? read(3) : undefined,
+		colour:		full ? float4.load(read(3)) : undefined,
 	};
 	gl.enable(gl.BLEND);
 	return result;
@@ -309,7 +331,7 @@ function pick(clientX: number, clientY: number) {
 		`(${p3(hit.pos)})${model.unit ? ` ${model.unit}` : ''}`,
 		`${hit.pos.sub(orbit.eye).len().toFixed(2)} from the camera`,
 		`${instance.object || 'object'}, face ${hit.face}${label ? `: ${label}` : ''}`,
-		`rgb(${[c[0], c[1], c[2]].map(v => Math.round(v * 255)).join(', ')})${c[3] < 0.99 ? `, alpha ${c[3].toFixed(2)}` : ''}`,
+		`rgb(${[c.x, c.y, c.z].map(v => Math.round(v * 255)).join(', ')})${c.w < 0.99 ? `, alpha ${c.w.toFixed(2)}` : ''}`,
 	].join('\n');
 	const rect = canvas.getBoundingClientRect();
 	tooltip.style.left	= `${clientX - rect.left + 14}px`;
@@ -338,21 +360,81 @@ canvas.addEventListener('pointerleave', () => {
 	hideTooltip();
 });
 
-// g the floor; u which axis is up
+//--- the menu ----------------------------------------------------------------
+
+const icons = {
+	solid:		'<path d="M8 2l5.5 3v6L8 14l-5.5-3V5z" fill="currentColor" fill-opacity=".35"/><path d="M2.5 5L8 8l5.5-3M8 8v6"/>',
+	edges:		'<path d="M8 2l5.5 3v6L8 14l-5.5-3V5z" fill="currentColor" fill-opacity=".35"/><path d="M2.5 5L8 8l5.5-3M8 8v6M5.2 3.5l5.6 3M10.8 3.5l-5.6 3"/>',
+	wire:		'<path d="M8 2l5.5 3v6L8 14l-5.5-3V5zM2.5 5L8 8l5.5-3M8 8v6"/>',
+	smooth:		'<circle cx="8" cy="8" r="5.5" fill="currentColor" fill-opacity=".3"/><path d="M4.5 6.5c1-1.5 3-2 4.5-1.5"/>',
+	flat:		'<path d="M8 2l5 3.5-1.5 6L8 14l-3.5-2.500L3 5.500z" fill="currentColor" fill-opacity=".3"/><path d="M8 2v5l5-1.500M8 7l-5-1.500M8 7l3.5 4.500M8 7l-3.5 4.5"/>',
+	unlit:		'<circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11"/>',
+	colours:	'<circle cx="6" cy="6" r="3.5" fill="currentColor" fill-opacity=".25"/><circle cx="10" cy="6" r="3.5" fill="currentColor" fill-opacity=".25"/><circle cx="8" cy="10" r="3.5" fill="currentColor" fill-opacity=".25"/>',
+	lines:		'<path d="M2 12L7 4l3 5 4-6"/>',
+	tint:		'<path d="M3 4h10v8H3z" fill="currentColor" fill-opacity=".3"/><path d="M3 4l10 8"/>',
+	plain:		'<path d="M3 4h10v8H3z"/>',
+	hide:		'<path d="M3 4h10v8H3z" stroke-dasharray="2 2"/>',
+	floor:		'<path d="M2 11l3-5h6l3 5zM6 6l-1 5M10 6l1 5M3.5 8.500h9"/>',
+	up:			'<path d="M8 14V3M4.5 6.500L8 3l3.5 3.5"/>',
+	fit:		'<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>',
+};
+
+const menu = new Cascade($('main'), (): CascadeItem[] => [
+	choiceItem('Display', [
+		{value: 'solid' as const,	face: svgFace(icons.solid),	caption: 'Solid'},
+		{value: 'edges' as const,	face: svgFace(icons.edges),	caption: 'Solid with edges'},
+		{value: 'wire' as const,	face: svgFace(icons.wire),	caption: 'Wireframe'},
+	], () => view.display, v => { view.display = v; render(); }),
+	choiceItem('Shading', [
+		{value: 'smooth' as const,	face: svgFace(icons.smooth),	caption: 'Smooth'},
+		{value: 'flat' as const,	face: svgFace(icons.flat),		caption: 'Flat'},
+		{value: 'unlit' as const,	face: svgFace(icons.unlit),		caption: 'Unlit'},
+	], () => view.shading, v => { view.shading = v; render(); }),
+	toggleItem('File colours and textures', svgFace(icons.colours), () => view.colours, v => { view.colours = v; render(); }),
+	toggleItem('File lines', svgFace(icons.lines), () => view.lines, v => { view.lines = v; render(); }),
+	choiceItem('Back faces', [
+		{value: 'tint' as const,	face: svgFace(icons.tint),	caption: 'Tinted'},
+		{value: 'plain' as const,	face: svgFace(icons.plain),	caption: 'As front faces'},
+		{value: 'hide' as const,	face: svgFace(icons.hide),	caption: 'Hidden'},
+	], () => view.backs, v => { view.backs = v; render(); }),
+	toggleItem('Floor', svgFace(icons.floor), () => floorOn, v => { floorOn = v; render(); }),
+	choiceItem('Up axis', [
+		{value: 'z' as const,	face: svgFace(icons.up) + '<small>Z</small>',	caption: 'Z up'},
+		{value: 'y' as const,	face: svgFace(icons.up) + '<small>Y</small>',	caption: 'Y up'},
+	], () => up, setUp),
+	{
+		face:		() => svgFace(icons.fit),
+		caption:	() => 'Fit to window',
+		select:		() => { home(); render(); },
+	},
+]);
+
+function setUp(value: 'y' | 'z') {
+	up = value;
+	measure();
+	home();
+	showInfo();
+	render();
+}
+
+// g the floor; u which axis is up; w cycles solid, solid with edges, wireframe
 window.addEventListener('keydown', event => {
+	if (event.ctrlKey || event.metaKey || event.altKey)
+		return;
 	switch (event.key.toLowerCase()) {
 		case 'g':
 			floorOn = !floorOn;
 			break;
 		case 'u':
-			up = up === 'z' ? 'y' : 'z';
-			measure();
-			home();
-			showInfo();
+			setUp(up === 'z' ? 'y' : 'z');
+			break;
+		case 'w':
+			view.display = view.display === 'solid' ? 'edges' : view.display === 'edges' ? 'wire' : 'solid';
 			break;
 		default:
 			return;
 	}
+	menu.refresh();
 	render();
 });
 
@@ -381,7 +463,7 @@ function setModel(m: Model) {
 	gpuTextures.forEach(t => t && gl.deleteTexture(t));
 
 	gpuMeshes	= m.meshes.map(makeGpuMesh);
-	gpuTextures	= m.textures.map(t => t && canvas3d.createTextureFromImage({data: t.pixels, width: t.width, height: t.height}, {min: 'linear', mag: 'linear'}));
+	gpuTextures	= m.textures.map(t => t && canvas3d.createTextureFromImage(t, {min: 'linear', mag: 'linear'}));
 
 	measure();
 	if (first)
@@ -406,7 +488,6 @@ window.addEventListener('message', event => {
 			errorBox.classList.remove('hidden');
 			break;
 		case 'fitToWindow':
-		case 'resetZoom':
 			home();
 			render();
 			break;

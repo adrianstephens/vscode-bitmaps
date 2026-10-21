@@ -5,12 +5,13 @@ import * as vscode from 'vscode';
 import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
 
+import { parse, type UserModule } from './scad/parser';
 import { files, setActiveViewer, readShader, digitAtlas } from './extension';
 import { webviewPage } from './BitmapViewer';
 import type { MessageOut, MessageIn } from '../webview/sdf';
 import { evaluate, evaluateCsg } from './scad/evaluate';
-import { buildIndex } from './scad/fonts';
-import { bounds3, emitGlsl, countPrimitives, emptyReason, materials, union } from './scad/sdf';
+import { buildIndex } from './fonts';
+import * as SDF from './scad/sdf';
 import { float3 } from '@isopodlabs/maths/vector';
 
 import { meshAdaptive, checkMesh, Cancelled } from './scad/mesher';
@@ -24,6 +25,8 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 	private watch:		vscode.Disposable;
 	// a render that waits on a surface()'s PNG can be overtaken by a later edit's, and only the latest is drawn
 	private renders		= 0;
+	// a module the menu asked to run, called after the file's own text; the file draws nothing itself when it is offered
+	private run?:		string;
 	// what the files this document reads amount to, so an edit does not rebuild an imported mesh that has not changed
 
 	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, public document: vscode.TextDocument) {
@@ -61,57 +64,97 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 
 
 	// what the current text says the model is
-	private async model(): Promise<Extract<MessageIn, {command: 'sdf'}> | {error: string}> {
-		const text = this.document.getText();
-		const name = this.document.uri.fsPath;
+	private async render() {
+		const which		= ++this.renders;
+		const source	= this.document.getText();
+		const name		= this.document.uri.fsPath;
 		try {
-			const evaluated = await files.with(() => evaluate(text, name, files));
-			const {warnings} = evaluated;
-			let sdf = evaluated.sdf;
-			if (evaluated.flat) {
-				// 2-D shapes outside an extrude are drawn as sheets, a thousandth of the picture thick
-				const all = bounds3(union([sdf, evaluated.flat(0)]));
-				if (all)
-					sdf = union([sdf, evaluated.flat(Math.max(all.max.x - all.min.x, all.max.y - all.min.y, all.max.z - all.min.z) * 1e-3)]);
-			}
-			const empty = emptyReason(sdf, warnings);
-			if (empty)
-				return {error: empty};
-			const box = bounds3(sdf)!;
+			const file		= await files.with(() => parse(source, name, files));
+			const modules	= [...file.scope.modules.values()];
+			const callable	= (m: UserModule) => m.parameters.every(p => p.expr);
+			const names		= [...modules.filter(callable), ...modules.filter(m => !callable(m))].map(m => m.name);
 
-			const {helpers, body, data} = emitGlsl(sdf);
+			if (this.run && !names.includes(this.run))
+				this.run = undefined;
+
+			//const text = this.run ? `${source}\n${this.run}();\n` : source;
+			const {sdf, warnings, box, camera} = await files.with(() => evaluate(file, name, files, {$preview: true, $entry: this.run}));
+
+			this.postMessage({command: 'modules', names: !box || this.run ? names : [], running: this.run});
+
+			if (!box || !Number.isFinite(box.min.x) || !Number.isFinite(box.min.y) || !Number.isFinite(box.min.z)) {
+				//this.postMessage({command: 'error', message: `nothing is drawn: ${!box ? 'no geometry reached the top level (check the conditions around it)' : 'the geometry has no finite extent'}.${warnings.length ? `\n\nThe evaluator also reported:\n  ${warnings.join('\n  ')}` : ''}`});
+				return;
+			}
+		
+			const center	= box.max.add(box.min).scale(0.5);
+			const size		= box.max.sub(box.min);
+			
+			let stripped = false;
+			let sdf2 = sdf.walk((sdf, process) => {
+				switch (sdf.k) {
+					case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
+						stripped = true;
+						return SDF.empty;
+					case 'offset': case 'extrude': case 'revolve':
+						return sdf;			// these are what a 2-D shape is for
+					default:
+						return process(sdf);
+				}
+			});
+
+			if (stripped) {
+				warnings.push('a 2-D shape (circle, square or polygon) outside linear_extrude/rotate_extrude, which the viewer draws as a flat sheet and an export leaves out');
+
+				const thickness = Math.max(size.x, size.y, size.z) * 1e-3;
+				const sheet = (body: SDF.Sdf): SDF.Sdf => ({k: 'extrude', h: thickness, center: true, body});
+
+				const flat = sdf.walk((s, process) => {
+					switch (s.k) {
+						case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
+							return sheet(s);
+						case 'union':
+							// one sheet for a union of shapes, as one extrude takes them, so a big union is still one the batch can hold
+							return s.children.every(SDF.is2d) ? sheet(s) : process(s);
+						case 'intersection':
+							return s.children.every(SDF.is2d) ? sheet(s) : SDF.empty;
+						case 'difference':
+							return SDF.is2d(s.base) ? sheet(s) : SDF.empty;
+						case 'domain':
+							return SDF.is2d(s.body) ? sheet(s) : SDF.empty;
+						case 'material':
+							return process(s);
+						default:
+							return SDF.empty;
+					}
+				});
+				
+				sdf2 = SDF.union([sdf2, flat]);
+			}
+
+			const palette	= SDF.materials(sdf2);
+
+			const {helpers, body, data} = SDF.emitGlsl(sdf2);
 			// map() returns the distance and the material together, so both come out of the one evaluation
-			const code = [...helpers, 'vec2 map(vec3 p) {', ...body, '\treturn d;', '}'].join('\n');
-			const size = box.max.sub(box.min);
-			const center = box.max.add(box.min).scale(0.5);
-			const count = countPrimitives(sdf);
-			const mm = size._values.map(v => v.toFixed(1)).join(' x ');
-			const materials_ = materials(sdf).length - 1;
-			return {
+			const code		= [...helpers, 'vec2 map(vec3 p) {', ...body, '\treturn d;', '}'].join('\n');
+			const count		= SDF.countPrimitives(sdf2);
+
+			if (which !== this.renders || this.disposed)
+				return;
+
+			this.postMessage({
 				command:	'sdf',
 				code, data, center,
 				half:		size.scale(0.5).add(float3(1e-3, 1e-3, 1e-3)),
-				info:		`${count} primitives, ${mm} mm, ${helpers.length} generated functions${materials_ ? `, ${materials_} material${materials_ === 1 ? '' : 's'}` : ''}`,
+				info:		`${count} primitives, ${size._values.map(v => v.toFixed(1)).join(' x ')} mm, ${helpers.length} generated functions${palette.length > 1 ? `, ${palette.length - 1} material${palette.length === 2 ? '' : 's'}` : ''}`,
 				warnings,
-				camera:		evaluated.camera,
-			};
+				camera,
+			});
 		} catch (error: any) {
-			return {error: `${error?.message ?? error}`};
+			this.postMessage({command: 'error', message: `${error?.message ?? error}`});
 		}
 	}
 
-
-	private async render() {
-		const which = ++this.renders;
-		const model = await this.model();
-		if (which !== this.renders || this.disposed)
-			return;
-		if ('error' in model) {
-			this.postMessage({command: 'error', message: model.error});
-			return;
-		}
-		this.postMessage(model);
-	}
 
 	async command(message: MessageOut) {
 		switch (message.command) {
@@ -126,6 +169,11 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 			// undefined when no usable font is installed, in which case the floor simply goes without numbers
 			case 'getGlyphs':
 				return digitAtlas();
+
+			case 'run':
+				this.run = message.name;
+				this.render();
+				break;
 
 			case 'ready':
 				this.render();
@@ -183,13 +231,14 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 
 	try {
 		// a final export, not the live preview -- OpenSCAD's own $preview is false for this too
-		const result	= await files.with(() => evaluate(document.getText(), target.fsPath, files, false));
-		const empty		= emptyReason(result.sdf, result.warnings);
-		if (empty)
-			throw empty;
-
+		const file		= await files.with(() => parse(document.getText(), target.fsPath, files));
+		const result	= await files.with(() => evaluate(file, target.fsPath, files, {$preview: false}));
 		const sdf		= result.sdf;
-		const box		= bounds3(sdf)!;
+		const box		= sdf.bounds()!;
+
+		if (!box)
+			throw `nothing is drawn: no geometry reached the top level (check the conditions around it)`;
+
 		const size		= box.max.sub(box.min);
 		const longest	= Math.max(size.x, size.y, size.z);
 
