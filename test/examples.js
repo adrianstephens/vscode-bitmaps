@@ -6,10 +6,10 @@
 // only thing that fails the run.
 const fs = require('fs');
 const path = require('path');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { emitGlsl, emptyReason } = require('../out/src/scad/sdf.js');
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 
 const ROOT = '/Volumes/DevSSD/dev/github/openscad/examples';
 
@@ -31,6 +31,8 @@ function findScadFiles(dir) {
 const files = new FileReader();
 
 (async () => {
+	// (text() finds its fonts in the system's, which are looked for once, as the extension does before its first render)
+	await require('../out/src/fonts.js').buildIndex();
 	if (!fs.existsSync(ROOT)) {
 		console.log(`${ROOT} not found -- skipping (this survey only runs where the openscad checkout is available)`);
 		process.exit(0);

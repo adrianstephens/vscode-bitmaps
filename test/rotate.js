@@ -10,7 +10,7 @@
 // The shader is compiled and run for real in headless Chrome (test/webgl.js), not through a hand-written
 // reimplementation of GLSL.
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const { float3 } = require('@isopodlabs/maths/vector');

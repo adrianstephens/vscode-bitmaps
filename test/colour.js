@@ -6,9 +6,12 @@
 // operand decides a union, the one bounding an intersection decides that, and a cut face keeps the colour of what
 // it was cut out of.
 const { makeMap } = require('./glsl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, evalMaterial, materials, SDF } = require('../out/src/scad/sdf.js');
-const evalSdf = (s, p) => new SDF(s).eval(p);
+const { float3 } = require('@isopodlabs/maths/vector');
+// (the points here are arrays, which the mirror takes as float3s)
+const v3 = p => Array.isArray(p) ? float3(p[0], p[1], p[2]) : p;
+const evalSdf = (s, p) => new SDF(s).eval(v3(p));
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };
@@ -31,7 +34,7 @@ color([0.1, 0.2, 0.3]) translate([15,0,0]) cube(4);
 color("RED") translate([20,0,0]) cube(4);
 `);
 	// a palette entry is a whole material now: this file is only about the colour part of it
-	const p = materials(sdf), rgb = p.map(m => m.rgb);
+	const p = materials(sdf), rgb = p.map(m => [m.rgb.x, m.rgb.y, m.rgb.z]);
 	console.log(`palette: ${rgb.map(c => `[${c.map(v => v.toFixed(3)).join(',')}]`).join(' ')}`);
 	check(p.length === 5, `expected the default and 4 distinct colours, got ${p.length}`);
 	check(rgb[1].every((v, i) => near(v, [1, 0, 0][i])), 'color("red") is not (1,0,0)');
@@ -61,7 +64,7 @@ translate([0, -20, 0]) intersection() {
 	const RED = [1, 0, 0], GREEN = [0, 128 / 255, 0], BLUE = [0, 0, 1];
 	const PURPLE = [128 / 255, 0, 128 / 255], ORANGE = [1, 165 / 255, 0];
 	const palette = materials(sdf);
-	const rgbAt = (p) => palette[evalMaterial(sdf, p)].rgb;
+	const rgbAt = (p) => { const c = palette[evalMaterial(sdf, v3(p))].rgb; return [c.x, c.y, c.z]; };
 	const is = (p, hex) => rgbAt(p).every((v, i) => near(v, hex[i]));
 	const show = (p) => `[${rgbAt(p).map(v => v.toFixed(2)).join(',')}]`;
 
@@ -72,7 +75,7 @@ translate([0, -20, 0]) intersection() {
 		if (Math.abs(evalSdf(sdf, p)) > 0.08)		// only where the tracer would stop and read a material off
 			continue;
 		n++;
-		const got = map(p)[1], want = evalMaterial(sdf, p);
+		const got = map(p)[1], want = evalMaterial(sdf, v3(p));
 		if (!Number.isFinite(got) || got !== want)
 			worst = Infinity, at = p;
 		if (want === 4)

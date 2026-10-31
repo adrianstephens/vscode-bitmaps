@@ -11,11 +11,6 @@ let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };
 
 const W = 700, H = 500;
-const shaders = {
-	bg: ['bitmap.vert', 'background.frag'], '2d': ['bitmap.vert', 'bitmap.frag'], array2d: ['bitmap.vert', 'array2d.frag'], '3d': ['volume.vert', 'volume.frag'], '3d2d': ['bitmap.vert', 'volume2d.frag'],
-	cube: ['cube.vert', 'cube.frag'], cube2d: ['bitmap.vert', 'cube2d.frag'], layer: ['layer.vert', 'layer.frag'], composite: ['bitmap.vert', 'composite.frag'], planes: ['planes.vert', 'planes.frag'], warp: ['bitmap.vert', 'warp.frag'],
-};
-const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name), 'utf8');
 
 (async () => {
 	const problems = [], edits = [], errors = [], waiting = new Map();
@@ -34,10 +29,6 @@ const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name)
 				edits.push(m.label);
 			else if (m.command === 'error')
 				errors.push(m.message);
-			else if (m.command === 'getShaders') {
-				const [vert, frag] = shaders[m.type];
-				reply({vert: asset(vert), frag: asset(frag)});
-			}
 		},
 	});
 	await readyP;
@@ -51,7 +42,8 @@ const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name)
 		return got;
 	};
 	const px = (r, x, y) => Array.from(r.data.subarray((y * r.width + x) * 4, (y * r.width + x) * 4 + 4));
-	const ink = () => page.$eval('#overlay', c => { const d = c.getContext('2d', {willReadFrequently: true}).getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n; });
+	// what is drawn over the picture: the tools' (selection, brush) and a transform's box
+	const ink = () => page.$$eval('#overlay, #transform-overlay', cs => { let n = 0; for (const c of cs) { const d = c.getContext('2d', {willReadFrequently: true}).getImageData(0, 0, c.width, c.height).data; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; } return n; });
 	const cursor = () => page.$eval('#viewport', e => e.style.cursor);
 	const filled = (w, h, f) => { const d = new Uint8ClampedArray(w * h * 4); for (let i = 0; i < w * h; i++) d.set(f(i % w, Math.floor(i / w)), i * 4); return d; };
 	// where a point of a picture w x h, fitted, is on the screen
@@ -161,6 +153,26 @@ const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name)
 		await page.keyboard.press('Escape');
 		await pause(150);
 
+		// a stroke across the edge between two faces paints both, as one edit
+		{
+			await load({command: 'loadCube', image: {data: filled(64, 64 * 6, () => [255, 255, 255, 255]), width: 64, height: 64 * 6}}, 800);
+			await menu(page, 350, 250, ['fold']);
+			await pause(800);
+			await page.keyboard.press('b');
+			edits.length = 0;
+			const at = (x, y) => [(W - 256) / 2 + x, (H - 192) / 2 + y];	// (unfolded, a face is a pixel to a pixel)
+			await drag(at(100, 96), at(156, 96), 20);
+			const r = await raw(), face = (i, x, y) => px({data: r.data.subarray(i * 64 * 64 * 4), width: 64}, x, y);
+			check(face(4, 62, 32)[0] < 128, `+Z is painted up to its edge (${face(4, 62, 32)})`);
+			check(face(0, 1, 32)[0] < 128, `+X is painted from its edge (${face(0, 1, 32)})`);
+			check(face(0, 50, 32)[0] === 255 && face(4, 20, 32)[0] === 255, `and not beyond the stroke (${face(0, 50, 32)} ${face(4, 20, 32)})`);
+			check(edits.length === 1, `it is one edit (${edits})`);
+			await send({command: 'undo'});
+			await pause(300);
+			const u = await raw();
+			check(u.data.every(v => v === 255), 'undone, both faces are whole again');
+		}
+
 		// a cross of 4 x 3 faces, as a plain image, is made into a cubemap
 		await load({command: 'load2d', image: {data: filled(256, 192, (x, y) => [x, y, 128, 255]), width: 256, height: 192}});
 		errors.length = 0;
@@ -168,6 +180,36 @@ const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name)
 		await pause(800);
 		const r = await raw();
 		check(errors.length === 0 && r.type === 'cube' && r.width === 64 && r.height === 64 * 6, `a cross of faces becomes a cubemap (${errors} ${r.type} ${r.width}x${r.height})`);
+	}
+
+	// a warp: the grid dragged in its middle bends the picture (the edge between two colours bows down there, and the canvas grows to fit),
+	// as one edit that undoes
+	{
+		const BLUE = [40, 80, 200, 255];
+		await load({command: 'load2d', image: {data: filled(100, 80, (x, y) => y < 40 ? ORANGE : BLUE), width: 100, height: 80}});
+		edits.length = 0;
+		const at = where(100, 80);
+		await menu(page, 350, 250, ['transform', 'transform-image', 'warp']);
+		check(await ink() > 0, 'a warp shows its grid');
+		await page.mouse.move(...at(0, 0));
+		await pause(100);
+		check(await cursor() === 'crosshair', `a corner of its grid is a handle (${await cursor()})`);
+		await page.mouse.move(...at(50, 40));
+		await pause(100);
+		check(await cursor() === 'move', `and the grid can be taken hold of anywhere (${await cursor()})`);
+		await drag(at(50, 40), at(50, 60));
+		await page.keyboard.press('Enter');
+		await pause(500);
+		check(edits.at(-1) === 'Warp', `it is one edit (${edits.at(-1)})`);
+		const r = await raw();
+		const edge = x => { let y = 0; while (y < r.height && !(px(r, x, y)[2] > 150 && px(r, x, y)[3] > 200)) y++; return y; };
+		check(r.height > 80 && r.width === 100, `the canvas grows to fit what was pulled down (${r.width}x${r.height})`);
+		check(Math.abs(edge(50) - 60) <= 1 && edge(3) < edge(50) - 10, `the middle of the edge between the colours comes down with the pointer, its ends less (${edge(3)} ${edge(50)})`);
+		check(px(r, 3, 3)[0] === 200, `what is by a corner stays (${px(r, 3, 3)})`);
+		await send({command: 'undo'});
+		await pause(300);
+		const u = await raw();
+		check(u.height === 80 && px(u, 50, 45)[2] === 200, 'undone, the picture is as it was');
 	}
 
 	check(problems.length === 0, `no page errors or warnings:\n     ${problems.join('\n     ')}`);

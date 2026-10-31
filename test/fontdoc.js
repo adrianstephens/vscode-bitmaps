@@ -20,6 +20,7 @@ Module._load = function (r, ...a) {
 	return r === 'vscode' ? vscode : r === '@isopodlabs/vscode_utils/webview' ? {Panel: class {}, Assets: class {}} : r === './extension' || r === './BitmapViewer' ? {} : origLoad.call(this, r, ...a);
 };
 const { FontDocument, glyphDetail } = require('../out/src/FontViewer.js');
+const { ON_CURVE } = require('@isopodlabs/binary_fonts');
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };
@@ -35,20 +36,19 @@ const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; }
 	doc.onDidChange(c => changes.push(c));
 
 	const font = doc.fonts[0], id = font.getGlyphMapping()['E'.codePointAt(0)];
-	const original = font.getGlyph(id).curve.map(v => [v.x, -v.y, v.flags]).flat();
-	const moved = original.slice();
-	moved[3] += 50;
+	// (the points as the page has them: y down)
+	const original = font.getGlyph(id).curve.map(v => ({x: v.x, y: -v.y, flags: v.flags}));
+	const moved = original.map(v => ({...v}));
+	moved[1].x += 50;
 	doc.edit(id, moved, 'Move point');
 	check(events.length === 1 && events[0].label === 'Move point', 'edit fired an edit event');
-	check(font.getGlyph(id).curve[1].x === original[3] + 50, 'the font has the edit');
+	check(font.getGlyph(id).curve[1].x === original[1].x + 50, 'the font has the edit');
 
-	const hinted = fs.readFileSync(file).length;
 	events[0].undo();
-	const bytesUndone = font.snapshotGlyph(id).data;
-	check(font.getGlyph(id).curve[1].x === original[3], 'undo restored the point');
+	check(font.getGlyph(id).curve[1].x === original[1].x, 'undo restored the point');
 	check(changes.at(-1).kind === 'glyph' && changes.at(-1).id === id, 'undo told the views');
 	events[0].redo();
-	check(font.getGlyph(id).curve[1].x === original[3] + 50, 'redo redid it');
+	check(font.getGlyph(id).curve[1].x === original[1].x + 50, 'redo redid it');
 
 	await doc.write(vscode.Uri.file(file));
 	check(fs.readFileSync(file).length > 0, 'saved');
@@ -57,16 +57,16 @@ const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; }
 
 	const again = new FontDocument(vscode.Uri.file(file));
 	await again.load();
-	check(again.fonts[0].getGlyph(id).curve[1].x === original[3] + 50, 'the saved file has the edit');
+	check(again.fonts[0].getGlyph(id).curve[1].x === original[1].x + 50, 'the saved file has the edit');
 
 	// undo all the way restores the exact bytes, hinting included
 	events[0].undo();
 	const fresh = new FontDocument(vscode.Uri.file('/System/Library/Fonts/Supplemental/Georgia.ttf'));
 	await fresh.load();
-	check(Buffer.compare(Buffer.from(font.snapshotGlyph(id).data), Buffer.from(fresh.fonts[0].snapshotGlyph(id).data)) === 0, 'undo restored the original glyph bytes');
+	check(Buffer.compare(Buffer.from(font.glyphdata[id]), Buffer.from(fresh.fonts[0].glyphdata[id])) === 0, 'undo restored the original glyph bytes');
 
 	let threw = false;
-	try { doc.edit(id, [1, 2, 1], 'bad'); } catch { threw = true; }
+	try { doc.edit(id, [{x: 1, y: 2, flags: ON_CURVE}], 'bad'); } catch { threw = true; }
 	check(threw, 'a glyph that does not begin with a begin point is refused');
 
 	const ttc = new FontDocument(vscode.Uri.file('/System/Library/Fonts/Helvetica.ttc'));
@@ -81,7 +81,7 @@ const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; }
 	doc.edit(comp, detail.points, 'Decompose glyph');
 	check(glyphDetail(font, comp).components.length === 0 && glyphDetail(font, comp).points.length === detail.points.length, 'decomposed: simple, same number of points');
 	// the components were put where they belong: what they make fills the box the composite says it has
-	const xs = detail.points.filter((_, i) => i % 3 === 0), ys = detail.points.filter((_, i) => i % 3 === 1).map(y => -y);
+	const xs = detail.points.map(p => p.x), ys = detail.points.map(p => -p.y);
 	const stored = font.getGlyph(comp);
 	check(Math.min(...xs) === stored.min.x && Math.max(...xs) === stored.max.x && Math.min(...ys) === stored.min.y && Math.max(...ys) === stored.max.y, `the composite's components are where its box says (${Math.min(...xs)}..${Math.max(...xs)}, ${Math.min(...ys)}..${Math.max(...ys)})`);
 	events[0].undo();

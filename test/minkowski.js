@@ -4,8 +4,8 @@
 // distributes over union: a union()/for loop of spheres as one operand grows the body separately by each and unions
 // the results, rather than summing their radii the way separate sibling operands (genuinely different terms of the
 // same sum) do.
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { evaluate } = require('./scadhost.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const { makeShader, close } = require('./webgl.js');

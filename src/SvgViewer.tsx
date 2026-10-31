@@ -21,6 +21,7 @@ export class SvgDocument implements vscode.CustomDocument {
 	private readonly changed = new vscode.EventEmitter<void>();
 	readonly onDidChange = this.changed.event;
 	readonly edited = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<SvgDocument>>();
+	private latest?: {after: string};	// the last edit, while nothing has been done since: a later step of it changes it
 
 	constructor(public readonly uri: vscode.Uri) {}
 
@@ -30,6 +31,7 @@ export class SvgDocument implements vscode.CustomDocument {
 	}
 
 	async load(text?: string) {
+		this.latest	= undefined;
 		const data = text ?? new TextDecoder('utf-8').decode(await vscode.workspace.fs.readFile(this.uri));
 		this.text	= data.replace(/^﻿/, '');
 		this.saved	= text === undefined ? this.text : undefined;
@@ -51,16 +53,26 @@ export class SvgDocument implements vscode.CustomDocument {
 		this.changed.fire();
 	}
 
-	// the page changed the drawing: the text it now has, and how to go back to what it was
-	edit(text: string, label: string) {
-		const before = this.text;
+	// The page changed the drawing: the text it now has, and how to go back to what it was. A later step of the last edit (a value still
+	// being turned) changes that edit, if nothing has been done since; if something has (an undo), the page is shown the drawing again,
+	// and the step is dropped.
+	edit(text: string, label: string, continues = false) {
+		if (continues) {
+			if (this.latest) {
+				this.latest.after = text;
+				this.text = text;
+			}
+			return;
+		}
+		const before = this.text, latest = this.latest = {after: text};
 		this.text = text;
 		this.dirty = true;
 		const apply = (t: string) => {
+			this.latest = undefined;
 			this.text = t;
 			this.changed.fire();
 		};
-		this.edited.fire({document: this, label, undo: () => apply(before), redo: () => apply(text)});
+		this.edited.fire({document: this, label, undo: () => apply(before), redo: () => apply(latest.after)});
 	}
 
 	async write(target: vscode.Uri) {
@@ -98,7 +110,7 @@ class SvgViewer extends webview.Panel<MessageOut, MessageIn> {
 				</div>
 			</div>,
 			<pre id="scad-error" class="hidden" />,
-		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
+		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/pathedit.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
 
 		const file = document.uri.fsPath;
 		const watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
@@ -165,7 +177,7 @@ class SvgViewer extends webview.Panel<MessageOut, MessageIn> {
 					this.statusLine.show(this, this.status);
 				break;
 			case 'edit':
-				this.document.edit(message.text, message.label);
+				this.document.edit(message.text, message.label, message.continues);
 				this.syncImages();
 				break;
 			case 'editImage':

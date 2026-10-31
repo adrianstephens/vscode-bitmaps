@@ -5,7 +5,7 @@
 import { vec, E3, float2, float3, float3x3, float3x4, safeNormalise } from '@isopodlabs/maths/vector';
 import { curveDistance, bezier2Curve, parseCurve } from '@isopodlabs/binary_fonts';
 import { eigenSymmetric } from '@isopodlabs/maths/linear';
-import type { FieldFn, ColorFn } from './fnsurface';
+import type { FieldFn, ColorFn, DisplaceFn, Texture, TexturePlace } from './fnsurface';
 
 function normalize(v: float3) {
 	return safeNormalise(v) ?? float3(0, 0, 0);
@@ -28,10 +28,21 @@ export class SDF {
 		return surfaceNormal(this.root, p, eps);
 	}
 	restrict(c: float3, r: number)	{
-		return restrict(this.root, c, r);
+		// a part keeps the whole model's numbering of its materials, which its own walk would not give
+		const got = restrict(this.root, c, r);
+		got.ids = this.ids ??= materialWalk(this.root).byMat;
+		return got;
 	}
 	planes(p: float3, cell: float3[], eps: number) {
 		return planesOf(this.root, p, cell, eps);
+	}
+	// which of materials() the surface at p is made of
+	ids?: Map<Material, number>;
+	material(p: float3): number {
+		return evalMaterial(this.root, p, this.ids ??= materialWalk(this.root).byMat);
+	}
+	materials() {
+		return materials(this.root);
 	}
 	// what the model is in a word, for diagnosis
 	describe() {
@@ -128,6 +139,7 @@ export type Sdf3 =
 	// for the rest (see fnsurface.ts), inside the box it is asked for
 	| {k: 'fnfield', fn: FieldFn, box: Box3}
 	| TriMesh													// import()ed meshes and polyhedron()s that are not convex
+	| Displace													// the body's surface moved along its normal by a function
 
 export type Sdf2 =
 	// 2-D shapes: fields of the plane that no z can change. They are not solids, so a union skips them for bounds
@@ -150,6 +162,25 @@ export type Sdf = Sdf2 | Sdf3
 	| {k: 'material', mat: Material, body: Sdf};				// color()/$variables round the body, which they tint
 
 export const empty: Sdf = {k: 'empty'};
+
+// displace(): the body's surface moved out along its normal by h, a function of the point (and the normal, when it asks).
+// With `base`, h is read where a point stands over the body's surface -- the point less the normal times the body's
+// distance -- which is how a mesh is displaced; without it, where the point itself is, which is the same for an h that
+// does not change along the normal and saves differencing the body for the normal when h does not ask for it.
+// Its field is the body's distance less h, which changes by up to 1 + slope per unit, so it is divided by that to stay a
+// bound; and since no h is outside lo..hi, the body's own distance less hi (or lo, inside) is a bound too, which is what
+// is used away from the moved surface, where it is the longer step. See displaceDistance.
+export interface Displace {
+	k:		'displace';
+	fn:		DisplaceFn;
+	lo:		number;			// the least h can be, and the most, both found by looking and padded by the slope
+	hi:		number;
+	slope:	number;			// a bound on how fast h changes
+	base:	boolean;		// h is read at the body's surface under the point, rather than at the point
+	eps:	number;			// the step the body's normal is differenced over
+	box:	Box3;
+	body:	Sdf;
+}
 
 export function scaleHeightmap(map: Heightmap, zscale: number, mirrorx: boolean, mirrory: boolean) {
 	const heights = Float64Array.from(map.heights, v => zscale * v);
@@ -285,6 +316,7 @@ export function walk(s: Sdf, callback: (s: Sdf, process: (s: Sdf) => Sdf) => Sdf
 			case 'domain':
 			case 'warp':
 			case 'dilate':
+			case 'displace':
 			case 'material':
 			case 'offset':
 			case 'extrude':
@@ -638,6 +670,7 @@ function bounds3(s: Sdf): Box3 | undefined {
 				: new Box3(float3(-R, -R, -h), float3(R, R, h));
 		}
 		case 'fnfield':
+		case 'displace':
 			return s.box;
 		case 'trimesh':
 			return new Box3(s.min, s.max);
@@ -1275,19 +1308,40 @@ function evalSdf(s: Sdf, p: float3): number {
 			return heightmapDistance(s, p);
 		case 'fnfield': {
 			// the box it stands in, and the field's own estimate inside it: both are bounds, so the larger is one too
-			const c = s.box.centre(), h = s.box.extent().scale(0.5);
+			const c = s.box.centre(), h = s.box.size().scale(0.5);
 			const qx = Math.abs(p.x - c.x) - h.x, qy = Math.abs(p.y - c.y) - h.y, qz = Math.abs(p.z - c.z) - h.z;
 			const box = Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0);
 			return Math.max(box, s.fn.distance(p.x, p.y, p.z));
 		}
 		case 'trimesh':
 			return trimeshDistance(s, p);
+		case 'displace':
+			return displaceDistance(s, p);
 		case 'stadium2': {
 			const pa = float2(p.x, p.y).sub(s.a), ba = s.b.sub(s.a);
 			const h = Math.max(0, Math.min(1, pa.dot(ba) / (ba.dot(ba) || 1)));
 			return Math.hypot(pa.x - ba.x * h, pa.y - ba.y * h) - s.r;
 		}
 	}
+}
+
+// How far from a displaced surface, as the shader's 'displace' term has it: the larger of the body's distance less hi and
+// the field over 1 + slope (the smaller of it and the body's distance less lo, inside). The second can only be the larger
+// within (hi - lo) / slope of the shell h can reach, so beyond that the first is taken without asking h -- exactly where
+// the two agree, which keeps the estimate continuous.
+const displaceReach = (s: Displace) => s.slope > 0 ? (s.hi - s.lo) / s.slope : 1e30;
+
+function displaceDistance(s: Displace, p: float3): number {
+	const d = evalSdf(s.body, p), reach = displaceReach(s);
+	if (d - s.hi > reach)
+		return d - s.hi;
+	if (d - s.lo < -reach)
+		return d - s.lo;
+	const n = s.fn.normal || s.base ? numericNormal(s.body, p, s.eps) : float3(0, 0, 0);
+	const q = s.base ? p.sub(n.scale(d)) : p;
+	const h = s.fn.value(q.x, q.y, q.z, n.x, n.y, n.z);
+	const f = (d - (Number.isNaN(h) ? 0 : h)) / (1 + s.slope);
+	return f >= 0 ? Math.max(f, d - s.hi) : Math.min(f, d - s.lo);
 }
 
 // The outward normal of the surface at a point that is on it (or so near it that nothing else is): the direction the
@@ -1578,8 +1632,11 @@ function restrict(s: Sdf, c: float3, r: number): Restricted {
 			const inner = restrict(s.body, inv.mulPos(c), r * stretchOf(inv));
 			return new Restricted(inner.root === s.body ? s : {...s, body: inner.root}, inner.lo * s.scale, inner.hi * s.scale);
 		}
-		case 'material':
-			return restrict(s.body, c, r);
+		case 'material': {
+			// kept round what is left of its body, so what the cell is made of can still be asked
+			const inner = restrict(s.body, c, r);
+			return new Restricted(inner.root === s.body ? s : {...s, body: inner.root}, inner.lo, inner.hi);
+		}
 		case 'dilate': {
 			const pieces = brushPiecesOf(s);
 			if (pieces)
@@ -1763,6 +1820,21 @@ function planesOf(s: Sdf, p: float3, cell: float3[], eps: number): Plane[] | und
 			return out;
 		}
 		case 'polygon2': {
+			// a convex polygon is the intersection of its edges' half-planes, as a 'planes' body is of its faces': every
+			// edge the cell is not wholly behind, corners and all
+			const sense = convexSense(s);
+			if (sense) {
+				const out: Plane[] = [], pts = s.paths[0];
+				for (let i = 0; i < pts.length; i++) {
+					const a = pts[i], b = pts[(i + 1) % pts.length], e = b.sub(a), len = e.len();
+					if (!(len > 1e-12))
+						continue;
+					const n = float3(e.y * sense / len, -e.x * sense / len, 0), d = n.x * a.x + n.y * a.y;
+					if (n.dot(p) - d > -spread(n, cell))
+						out.push({n, d});
+				}
+				return out;
+			}
 			const pl = polygonPlane(s, p, cell);
 			return pl && [pl];
 		}
@@ -3265,8 +3337,9 @@ export function sameMaterial(a: Material, b: Material): boolean {
 
 // Every material in the field with the default at index 0, in the order they are met. Both the emitter and the mirror
 // read the indices off this one walk, so the material the shader reports and the one measured here cannot drift.
-function materialWalk(root: Sdf): {ids: Map<Sdf, number>, palette: Material[]} {
-	const ids = new Map<Sdf, number>(), palette: Material[] = [DEFAULT_MATERIAL];
+// byMat is the same numbering by the material itself, which survives restrict() making new nodes round it.
+function materialWalk(root: Sdf): {ids: Map<Sdf, number>, byMat: Map<Material, number>, palette: Material[]} {
+	const ids = new Map<Sdf, number>(), byMat = new Map<Material, number>(), palette: Material[] = [DEFAULT_MATERIAL];
 	walk(root, (s, process) => {
 		if (s.k=== 'material') {
 			// the same material written twice is one entry, so the palette stays as short as it can be
@@ -3276,10 +3349,11 @@ function materialWalk(root: Sdf): {ids: Map<Sdf, number>, palette: Material[]} {
 				i = palette.length - 1;
 			}
 			ids.set(s, i);
+			byMat.set(s.mat, i);
 		}
 		return process(s);
 	});
-	return {ids, palette};
+	return {ids, byMat, palette};
 }
 
 export function materials(root: Sdf) {
@@ -3288,19 +3362,18 @@ export function materials(root: Sdf) {
 
 // The material shown at a point, by the rule the shader uses: the nearest operand wins a union, the operand bounding
 // an intersection does, and cut faces keep the material of what they were cut out of, which is what OpenSCAD shows.
-export function evalMaterial(root: Sdf, p: float3): number {
-	const {ids} = materialWalk(root);
-	const walk = (s: Sdf, mat: number): number => {
+export function evalMaterial(root: Sdf, p: float3, ids = materialWalk(root).byMat): number {
+	const walk = (s: Sdf, p: float3, mat: number): number => {
 		switch (s.k) {
 			case 'material':
-				return walk(s.body, ids.get(s) ?? mat);
+				return walk(s.body, p, ids.get(s.mat) ?? mat);
 			case 'union': {
 				let best = 1e20, id = mat;
 				for (const c of s.children) {
 					const d = evalSdf(c, p);
 					if (d < best) {
 						best = d;
-						id = walk(c, mat);
+						id = walk(c, p, mat);
 					}
 				}
 				return id;
@@ -3311,21 +3384,26 @@ export function evalMaterial(root: Sdf, p: float3): number {
 					const d = evalSdf(c, p);
 					if (d > best) {
 						best = d;
-						id = walk(c, mat);
+						id = walk(c, p, mat);
 					}
 				}
 				return id;
 			}
 			case 'difference':
 				// only the base chooses: the faces a cut exposes are the base's own material
-				return walk(s.base, mat);
-			case 'domain': case 'offset': case 'extrude': case 'revolve':
-				return walk(s.body, mat);
+				return walk(s.base, p, mat);
+			case 'domain':
+				// the body's parts are compared where the point is in the body's frame
+				return walk(s.body, inverseOrIdentity(s.m).mulPos(p), mat);
+			case 'revolve':
+				return walk(s.body, float3(Math.hypot(p.x, p.y), p.z, 0), mat);
+			case 'offset': case 'extrude': case 'displace':
+				return walk(s.body, p, mat);
 			default:
 				return mat;			// a dilate is measured through a helper that carries no colour
 		}
 	};
-	return walk(root, 0);
+	return walk(root, p, 0);
 }
 
 //-----------------------------------------------------------------------------
@@ -3599,7 +3677,8 @@ function emitGrid(e: Emit, leaves: BatchLeaf[]): number {
 	e.data.push(x0, y0, 1 / cw, 1 / ch, nx, ny, cellBase, 0);
 	for (const c of top)
 		e.data.push(...place(c), 0, 0);
-	e.data.push(...extra);
+	for (const v of extra)		// (one at a time: there may be more than a call can take)
+		e.data.push(v);
 	return base;
 }
 
@@ -3609,6 +3688,20 @@ interface Emit {
 	n: number;				// names helpers apart
 	ids: Map<Sdf, number>;	// each color() and the material index it emits
 	data: number[];			// floats for the batch texture (see batchUnion), four to a texel
+	textures: Map<Texture, number>;	// the texel each texture() a function reads starts at
+}
+
+// Where a texture's pixels are in the batch texture, put there the first time a function reads it
+function texturePlace(e: Emit): TexturePlace {
+	return t => {
+		let at = e.textures.get(t);
+		if (at === undefined) {
+			e.textures.set(t, at = e.data.length / 4);
+			for (const x of t.rgba)
+				e.data.push(x);
+		}
+		return at;
+	};
 }
 
 // The combinators carry the material of the operand that decided the result, so map() can return both at once. They
@@ -3623,7 +3716,7 @@ float boxDist(vec3 p, vec3 lo, vec3 hi) { return length(max(max(lo - p, p - hi),
 // The palette the material indices select from, one function per property so the shader carries its own materials
 // with no uniform. Each is an if-chain rather than an array because the test harness reads these functions too, and a
 // chain is a smaller thing for it to have to understand.
-function materialFunction(palette: Material[]): string {
+function materialFunction(palette: Material[], place: TexturePlace): string {
 	const lines = ['// the material palette: index 0 is the viewer\'s own, then each one the model set, in the order met'];
 	const accessor = (name: string, type: string, of: (m: Material) => string) => {
 		lines.push(`${type} ${name}(float m) {`);
@@ -3632,17 +3725,17 @@ function materialFunction(palette: Material[]): string {
 		lines.push(`\treturn ${of(palette[palette.length - 1])};`);
 		lines.push('}');
 	};
-	// a colour that is a function of the point asks for it at g_hit, the point being shaded (set by the shader before it
-	// shades), carried into the frame the function was written in
+	// a colour that is a function of the point asks for it at g_hit, the point being shaded, where the surface's normal is
+	// g_normal (both set by the shader before it shades), each carried into the frame the function was written in
 	const fns = new Map<Material, string>();
 	palette.forEach((m, i) => {
 		if (m.colorFn) {
 			const name = `matFn${i}`;
 			fns.set(m, name);
-			lines.push(m.colorFn.glsl(name));
+			lines.push(m.colorFn.glsl(name, place));
 		}
 	});
-	accessor('matColor', 'vec3', m => fns.has(m) ? `${fns.get(m)}(g_hit)` : v3(m.rgb));
+	accessor('matColor', 'vec3', m => fns.has(m) ? `${fns.get(m)}(g_hit, g_normal)` : v3(m.rgb));
 	accessor('matOpacity', 'float', m => f(m.opacity));
 	accessor('matSpec', 'float', m => f(m.specular));
 	accessor('matRough', 'float', m => f(m.roughness));
@@ -3996,10 +4089,38 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 			return;
 		}
 		case 'fnfield': {
-			const name = `fn${e.n++}`, c = s.box.centre(), h = s.box.extent().scale(0.5);
-			e.helpers.push(s.fn.glsl(name));
+			const name = `fn${e.n++}`, c = s.box.centre(), h = s.box.size().scale(0.5);
+			e.helpers.push(s.fn.glsl(name, texturePlace(e)));
 			line(`vec3 ${v}_q = abs(${p} - ${v3(c)}) - ${v3(h)};`);
 			line(`vec2 ${v} = vec2(max(length(max(${v}_q, vec3(0.0))) + min(max(${v}_q.x, max(${v}_q.y, ${v}_q.z)), 0.0), ${name}(${p})), ${f(mat)});`);
+			return;
+		}
+		case 'displace': {
+			// the body is a function of its own, asked once at the point and, for a normal, a step each way; its material
+			// is the term's. Away from the moved surface h is not asked at all (see displaceDistance, which this mirrors).
+			const body = `sdBody${e.n++}`, h = `disp${e.n++}`;
+			const inner: string[] = [];
+			emit(e, inner, 'd', s.body, 'p', '', mat);
+			e.helpers.push(`vec2 ${body}(vec3 p) {\n${inner.map(l => '\t' + l).join('\n')}\n\treturn d;\n}`);
+			e.helpers.push(s.fn.glsl(h, texturePlace(e)));
+			const reach = f(displaceReach(s)), hi = f(s.hi), lo = f(s.lo);
+			line(`vec2 ${v}_b = ${body}(${p});`);
+			line(`float ${v}_d = ${v}_b.x - ${hi};`);
+			line(`if (${v}_b.x - ${lo} < -${reach})`);
+			line(`\t${v}_d = ${v}_b.x - ${lo};`);
+			line(`else if (${v}_d <= ${reach}) {`);
+			if (s.fn.normal || s.base) {
+				line(`\tvec3 ${v}_e = vec3(${f(s.eps)}, 0.0, 0.0);`);
+				line(`\tvec3 ${v}_n = normalize(vec3(` +
+					`${body}(${p} + ${v}_e.xyy).x - ${body}(${p} - ${v}_e.xyy).x, ` +
+					`${body}(${p} + ${v}_e.yxy).x - ${body}(${p} - ${v}_e.yxy).x, ` +
+					`${body}(${p} + ${v}_e.yyx).x - ${body}(${p} - ${v}_e.yyx).x) + vec3(1e-20));`);
+			}
+			const at = s.base ? `${p} - ${v}_n * ${v}_b.x` : p;
+			line(`\tfloat ${v}_f = (${v}_b.x - ${h}(${at}, ${s.fn.normal || s.base ? `${v}_n` : 'vec3(0.0)'})) * ${f(1 / (1 + s.slope))};`);
+			line(`\t${v}_d = ${v}_f >= 0.0 ? max(${v}_f, ${v}_b.x - ${hi}) : min(${v}_f, ${v}_b.x - ${lo});`);
+			line('}');
+			line(`vec2 ${v} = vec2(${v}_d, ${v}_b.y);`);
 			return;
 		}
 		case 'trimesh': {
@@ -4025,7 +4146,8 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 // the generated map() body and the functions it calls, to be spliced into the raymarcher
 export function emitGlsl(root: Sdf): {helpers: string[], body: string[], data: Float32Array} {
 	const {ids, palette} = materialWalk(root);
-	const e: Emit = {helpers: [OP_HELPERS, materialFunction(palette)], body: [], n: 0, ids, data: []};
+	const e: Emit = {helpers: [OP_HELPERS], body: [], n: 0, ids, data: [], textures: new Map()};
+	e.helpers.push(materialFunction(palette, texturePlace(e)));
 	emit(e, e.body, 'd', root, 'p', '\t', 0);
 	return {helpers: e.helpers, body: e.body, data: new Float32Array(e.data)};
 }
@@ -4038,7 +4160,7 @@ export function countPrimitives(s: Sdf): number {
 		case 'sphere': case 'box': case 'cylinder': case 'ngonPrism': case 'cone': case 'planes': case 'capsule': case 'roundCone': case 'heightmap': case 'fnfield': case 'trimesh': return 1;
 		case 'union': case 'intersection': return s.children.reduce((n, c) => n + countPrimitives(c), 0);
 		case 'difference': return countPrimitives(s.base) + s.cuts.reduce((n, c) => n + countPrimitives(c), 0);
-		case 'domain': case 'warp': case 'dilate': case 'material': case 'offset': case 'extrude': case 'revolve':
+		case 'domain': case 'warp': case 'dilate': case 'displace': case 'material': case 'offset': case 'extrude': case 'revolve':
 			return countPrimitives(s.body);
 		case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': return 1;
 	}

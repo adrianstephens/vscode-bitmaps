@@ -33,7 +33,7 @@ type V3 = [number, number, number];
 // A matrix or stack of slices, as the viewer draws them from the values (a matrix is a stack of one slice):
 // voxels along each axis, index (z * dims[1] + y) * dims[0] + x, of elements which they were reduced from; scale is the magnitude which gets the full colour
 interface Rendered {
-	values:	Float32Array;
+	values:	Float32Array<ArrayBuffer>;
 	dims:	V3;
 	extent:	V3;
 	scale:	number;

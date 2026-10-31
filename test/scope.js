@@ -5,10 +5,10 @@
 // $children/children() give a module body access to what was passed to it. None of this had a dedicated test
 // before -- it was only ever exercised by chance, through the real OpenSCAD examples survey (test/examples.js),
 // which needs that external checkout and skips itself without it.
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };

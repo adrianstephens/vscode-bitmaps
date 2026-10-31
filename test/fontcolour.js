@@ -34,8 +34,10 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	if (!(font instanceof Font))
 		font = font.fonts[0];
 	const info = {...fontInfo(font, file, 0, ['Face']), editable: false};
-	const docIndex = id => font.svgDocuments().findIndex(d => id >= d.start && id <= d.end);
-	const glyphId = +process.env.FONTCOLOUR_GLYPH || font.svgDocuments()[0].start;
+	// the documents of the font's SVG table, each with the glyphs it draws and its text
+	const svgDocuments = f => f['SVG '].documents.map(d => ({start: d.startGlyphID, end: d.endGlyphID, text: new TextDecoder().decode(d.doc.subarray(0, d.doc_length))}));
+	const docIndex = id => svgDocuments(font).findIndex(d => id >= d.start && id <= d.end);
+	const glyphId = +process.env.FONTCOLOUR_GLYPH || svgDocuments(font)[0].start;
 
 	const server = http.createServer((req, res) => {
 		const url = decodeURIComponent(req.url.split('?')[0]);
@@ -43,7 +45,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 			res.writeHead(200, {'content-type': 'text/html'});
 			res.end(`<!DOCTYPE html><html><head>
 				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'}})}</script>
-				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
+				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/pathedit.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
 				<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 			</head><body class="tensors">
 				<div id="font-toolbar"><select id="font-face" class="hidden"></select><label>Size <input id="font-size" type="number" min="6" max="1000" value="56"> px</label><label><input id="font-unicode" type="checkbox"> Mapped only</label></div>
@@ -80,7 +82,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 			reply(m.requestId, shapePoints(m.name, m.attributes));
 		else if (m.command === 'editGlyphSvg') {
 			edits.push(m);
-			font.setGlyphSVGDocument(m.id, m.text);
+			font.setGlyphSVG(m.id, m.text);
 			page.evaluate(id => window.postMessage({command: 'glyphChanged', id, own: true}, '*'), m.id);
 		} else if (m.command === 'error')
 			check(false, `the page reported: ${m.message}`);
@@ -88,7 +90,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	await page.goto(`http://localhost:${server.address().port}/index.html`);
 	await pause(1200);
 
-	const before = font.svgDocuments()[docIndex(glyphId)].text;
+	const before = svgDocuments(font)[docIndex(glyphId)].text;
 
 	// the colour glyph's thumbnail is drawn in its colours
 	check(await page.$eval(`[data-id="${glyphId}"] svg`, e => e.querySelectorAll('path[fill^="#"]').length) > 0, 'the grid draws the glyph in colour');
@@ -97,7 +99,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	check(!(await page.$eval('#font-inspector', e => e.classList.contains('hidden'))), 'the inspector opened');
 	const vbox = await (await page.$('#insp-view')).boundingBox();
 	const out = await cascade.strips(page, vbox.x + 40, vbox.y + 40, []);
-	check(out[0].includes('colour') && out[0].includes('back') && out[0].includes('add'), `a colour glyph's menu: ${out[0]}`);
+	check(out[0].includes('colour') && out[0].includes('back') && out[0].includes('tool'), `a colour glyph's menu: ${out[0]}`);
 	await page.keyboard.press('Escape');
 	check(!(await page.$eval('#font-layers', e => e.classList.contains('hidden'))), 'its layers are listed');
 	const rows = await page.$$eval('#font-layer-tree .select', r => r.map(x => x.textContent));
@@ -115,7 +117,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	await page.evaluate(() => { const i = document.querySelector('.layer-props .fill-box .fill-colour'); i.value = '#123456'; i.dispatchEvent(new Event('input', {bubbles: true})); i.dispatchEvent(new Event('change', {bubbles: true})); });
 	await pause(400);
 	check(edits.length >= 1 && edits.at(-1).label === 'Change fill', `a fill change was sent: ${edits.at(-1)?.label}`);
-	const after = font.svgDocuments()[docIndex(glyphId)].text;
+	const after = svgDocuments(font)[docIndex(glyphId)].text;
 	check(after !== before && after.includes('#123456'), `the font's SVG table has the new colour (was ${was})`);
 	check(await page.$$eval('#insp-view .svg-doc [fill="#123456"]', e => e.length) === 1, 'the drawing shows it');
 	if (process.env.FONTCOLOUR_SHOT)
@@ -131,7 +133,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	await page.mouse.up();
 	await pause(400);
 	check(edits.length === n + 1 && edits.at(-1).label === 'Move point', `moving a point is an edit: ${edits.at(-1)?.label}`);
-	check(font.svgDocuments()[docIndex(glyphId)].text !== after, 'the outline in the table moved');
+	check(svgDocuments(font)[docIndex(glyphId)].text !== after, 'the outline in the table moved');
 	// the glyph still draws, in its colours, in the grid
 	check(await page.$eval(`[data-id="${glyphId}"] svg`, e => e.querySelectorAll('path').length) > 0, 'the grid shows the edited glyph');
 
@@ -151,7 +153,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 	// written as a font and read again, with the edits in it
 	const again = await load(TTF_OTF.write(font));
 	const font2 = again instanceof Font ? again : again.fonts[0];
-	check(font2.svgDocuments()[docIndex(glyphId)].text === font.svgDocuments()[docIndex(glyphId)].text, 'the font written and read again has the edited drawing');
+	check(svgDocuments(font2)[docIndex(glyphId)].text === svgDocuments(font)[docIndex(glyphId)].text, 'the font written and read again has the edited drawing');
 
 	await browser.close();
 	server.close();

@@ -93,9 +93,18 @@ export class Pan extends Navigate<float2> {
 		};
 	}
 
-	protected zoom(anchor: float2, factor: number, event: WheelEvent) {
+	protected zoom(anchor: float2, factor: number, event: {clientX: number, clientY: number}) {
 		const p = this.toCanvas(event.clientX, event.clientY);
 		this.scale	= this.clampScale(this.scale * factor);
 		this.offset	= this.clampOffset(p.sub(anchor.scale(this.scale)));
+	}
+
+	// for something over the picture that moves the view itself (the shape editor): zoomed about a point of the window, which
+	// stays where it is, or moved by so many canvas pixels
+	zoomAbout(clientX: number, clientY: number, factor: number) {
+		this.zoom(this.toImage(clientX, clientY), factor, {clientX, clientY});
+	}
+	moveBy(d: float2) {
+		this.offset = this.clampOffset(this.offset.add(d));
 	}
 }

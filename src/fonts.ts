@@ -9,9 +9,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as bin from '@isopodlabs/binary';
-import { load, loadAsync, Font, bezier2Curve, mapCurve } from '@isopodlabs/binary_fonts';
+import { load, loadAsync, Font, FontGroup, bezier2Curve, mapCurve, parseCurve, curveVertex, ON_BEGIN, ON_CURVE, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
 import { float2 } from '@isopodlabs/maths/vector';
-import type { ScadFiles } from './filereader';
+import { type ScadFiles, type AsyncFiles, asyncFileReader } from './filereader';
+import type { GlyphRun } from '../webview/textedit';
 
 //-----------------------------------------------------------------------------
 // finding a font by name
@@ -20,6 +21,7 @@ import type { ScadFiles } from './filereader';
 interface FontEntry {
 	family:		string;
 	subfamily:	string;
+	postscript?: string;
 	filePath:	string;
 	ttcIndex?:	number;		// which font within a .ttc/.otc collection
 }
@@ -70,12 +72,12 @@ export function buildIndex() {
 										const font = await f;
 										const family = font.family();
 										if (family)
-											return {family, subfamily: font.subfamily(), filePath, ttcIndex} as FontEntry;
+											return {family, subfamily: font.subfamily(), postscript: font.postscriptName(), filePath, ttcIndex} as FontEntry;
 									}));
 								} else {
 									const family = result.family();
 									if (family)
-										return {family, subfamily: result.subfamily(), filePath} as FontEntry;
+										return {family, subfamily: result.subfamily(), postscript: result.postscriptName(), filePath} as FontEntry;
 								}
 							}
 						} finally {
@@ -91,6 +93,34 @@ export function buildIndex() {
 		} catch {
 		}
 	}
+}
+
+/** The installed fonts as a text layer names them: a family and style, and the PostScript name a PSD finds the font by. */
+export interface InstalledFont { family: string, style: string, postscript: string }
+
+export async function installedFonts(): Promise<InstalledFont[]> {
+	const entries = await buildIndex() ?? [];
+	return entries.flatMap(e => e.postscript ? [{family: e.family, style: e.subfamily, postscript: e.postscript}] : []);
+}
+
+function loadFont(entry: FontEntry, files: AsyncFiles): Font|Promise<Font|undefined>;
+function loadFont(entry: FontEntry, files?: ScadFiles): Font|undefined;
+function loadFont(entry: FontEntry, files?: ScadFiles | AsyncFiles) {
+	const key	= `${entry.filePath}#${entry.ttcIndex ?? 0}`;
+	const font	= fontCache.get(key);
+	if (font)
+		return font;
+
+	const set = (result: Font | FontGroup | undefined) => {
+		if (result) {
+			const font = result instanceof Font ? result : result.fonts[entry.ttcIndex ?? 0];
+			fontCache.set(key, font);
+			return font;
+		}
+	}
+
+	const result = files?.read(entry.filePath, 'font', bytes => load(bytes));
+	return result instanceof Promise ? result.then(set) : set(result);
 }
 
 // a handful of names near-universally installed (or their common substitutes), tried in order when the requested
@@ -127,17 +157,7 @@ export function findFont(family: string, style: string | undefined, files: ScadF
 		?? candidates.find(e => /^book$/i.test(e.subfamily))
 		?? candidates[0];
 
-	const key = `${entry.filePath}#${entry.ttcIndex ?? 0}`;
-	let font = fontCache.get(key);
-
-	if (!font) {
-		const result = files?.read(entry.filePath, 'font', bytes => load(bytes));
-		if (result) {
-			font = result instanceof Font ? result : result.fonts[entry.ttcIndex ?? 0];
-			fontCache.set(key, font);
-		}
-	}
-	return font;
+	return loadFont(entry, files);
 }
 
 //-----------------------------------------------------------------------------
@@ -217,3 +237,52 @@ export function layoutText(params: TextParams, files: ScadFiles, warn: (message:
 	return result;
 }
 
+
+//-----------------------------------------------------------------------------
+// outlines of laid-out text, for a text layer made into a shape
+//-----------------------------------------------------------------------------
+
+async function fontFor(entries: FontEntry[], run: GlyphRun) {
+	const slanted	= (e: FontEntry) => /italic|oblique/i.test(e.subfamily);
+	const weighty	= (e: FontEntry) => /bold|black|heavy/i.test(e.subfamily) && !/semi|demi/i.test(e.subfamily);
+	const family	= entries.filter(e => e.family.toLowerCase() === run.family.toLowerCase());
+	const entry		= entries.find(e => e.postscript === run.font)
+		?? family.find(e => weighty(e) === run.bold && slanted(e) === run.italic)
+		?? family.find(e => /^(regular|book)$/i.test(e.subfamily))
+		?? family[0];
+	return entry && loadFont(entry, asyncFileReader);
+}
+
+/** The outlines of runs of text as contours of cubics, in the units the runs are in (y down, from the baseline); the characters whose font
+ *  or glyph cannot be read are left out, and `missing` says how many. */
+export async function glyphOutlines(runs: GlyphRun[]) {
+	const entries = await buildIndex() ?? [];
+	const curve: curveVertex[] = [];
+	let missing = 0;
+	for (const run of runs) {
+		const font = await fontFor(entries, run), mapping = font?.getGlyphMapping();
+		if (!font || !mapping) {
+			missing += run.chars.filter(c => c.ch.trim()).length;
+			continue;
+		}
+		const scale = run.size / (font.head?.units_per_em || 1000);
+		for (const {ch, x} of run.chars) {
+			if (!ch.trim())
+				continue;
+			try {
+				const gid	= mapping[ch.codePointAt(0)!] || 0;
+				// (as cubics only: a quadratic, which a TrueType font has, is the cubic with the controls two thirds of the way to its own)
+				const put	= (p: float2, flags: number) => curve.push(curveVertex(p.x, p.y, flags));
+				parseCurve(mapCurve(font.getGlyphCurves(gid), p => float2(run.x + x + p.x * scale * run.hscale, run.y - p.y * scale * run.vscale))).run({
+					Begin:	a => put(a, ON_BEGIN),
+					Line:	(_a, b) => put(b, ON_CURVE),
+					Bezier2: (a, b, c) => { put(a.add(b.sub(a).scale(2 / 3)), OFF_BEZ3); put(c.add(b.sub(c).scale(2 / 3)), OFF_BEZ3); put(c, ON_CURVE); },
+					Bezier3: (_a, b, c, d) => { put(b, OFF_BEZ3); put(c, OFF_BEZ3); put(d, ON_CURVE); },
+				});
+			} catch {
+				missing++;
+			}
+		}
+	}
+	return {curve, missing};
+}

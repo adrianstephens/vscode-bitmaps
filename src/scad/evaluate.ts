@@ -8,7 +8,7 @@ import {
 	ModuleInstantiation as Inst, type UserModule, type FunctionDefinition
 } from './parser';
 import type { Sdf, Support } from './sdf';
-import { compileField, compileColor, FnError, type Resolver } from './fnsurface';
+import { compileField, compileColor, compileDisplacement, FnError, Texture, type Resolver } from './fnsurface';
 import type { ScadFiles } from '../filereader';
 import { findFont, layoutText } from '../fonts';
 import { random, colors } from '@isopodlabs/utilities';
@@ -114,12 +114,13 @@ function segmentCount(d: Discretizer, r: number, angle = 360): number | undefine
 export type Value = number | string | boolean | undefined | Value[] | Closure;
 
 
-// a function value: `function(x, y) ...`, with what it closes over
+// a function value: `function(x, y) ...`, with what it closes over, or a texture() to be looked up as img(u, v)
 export interface Closure {
 	closure:	true;
 	definition:	FunctionDefinition;
 	resolver:	Resolver;
 	call:	(env: Env, args: Assignment[]) => Value;
+	texture?:	Texture;
 }
 
 const isClosure = (v: Value | FunctionDefinition): v is Closure => typeof v === 'object' && v !== null && (v as Closure).closure === true;
@@ -723,6 +724,49 @@ function numerical(args: argGetter, fn: (...a: number[]) => number, what: string
 let sharedRng: random.MT19937 | undefined;
 
 const builtin_functions: Record<string, (args: argGetter) => Value> = {
+	// texture("file.png", repeat = true): an image as a function of (u, v), each 0..1 across it with v up the image, that
+	// gives [r, g, b, a] there between the pixels' centres -- beyond 0..1 the image repeats, or holds its edges. It is called
+	// as any function value is, and inside a colour, surface or displace() function the shader reads the image itself.
+	texture: (args) => {
+		const written = args.get('file', 0);
+		if (typeof written !== 'string') {
+			args.warn('texture() without a file name');
+			return undefined;
+		}
+		const textures = args.ctx.openFile('texture', written, args.filename(), 'texture', async bytes => {
+			let format: {load(a: Uint8Array): bitmap.Image | Promise<bitmap.Image>} | undefined;
+			switch (extension(written)) {
+				case '.png':	format = bitmap.PNG; break;
+				case '.jpg':
+				case '.jpeg':	format = bitmap.JPEG; break;
+				case '.bmp':	format = bitmap.BMP; break;
+				default:		throw new Error('not an image texture() reads (png, jpeg or bmp)');
+			}
+			const {width, height, pixels} = await (await format.load(bytes)).getPixels({plane: 'RGBA', array: Float32Array});
+			// rows from the bottom up, so v runs up the image as y does up a surface()
+			const rgba = new Float32Array(width * height * 4), row = width * 4;
+			for (let j = 0; j < height; j++)
+				rgba.set((pixels as Float32Array).subarray((height - 1 - j) * row, (height - j) * row), j * row);
+			return {repeat: new Texture(width, height, rgba, true), clamp: new Texture(width, height, rgba, false)};
+		});
+		if (!textures)
+			return undefined;
+		const tex = (args.bool('repeat') ?? true) ? textures.repeat : textures.clamp;
+		const ident = (name: string): Expr => ({type: 'identifier', name} as Expr);
+		return {
+			closure:	true,
+			texture:	tex,
+			// what it is as a function, for the compiler: function(u, v) texture(u, v), that name meaning this image
+			definition:	{parameters: [{name: 'u'}, {name: 'v'}], expr: {type: 'call', callee: ident('texture'), arguments: [{name: '', expr: ident('u')}, {name: '', expr: ident('v')}]} as Expr},
+			resolver:	{get: () => undefined, findFunction: name => name === 'texture' ? tex : undefined},
+			call: (env, call) => {
+				const pos = positional(call).map(a => env.evalExpr(a.expr, args.ctx));
+				const uv = pos.length === 1 && isList(pos[0]) ? pos[0] : pos;
+				const u = num(uv[0], args.ctx, 'the u of a texture'), v = num(uv[1], args.ctx, 'the v of a texture');
+				return u === undefined || v === undefined ? undefined : tex.at(u, v);
+			},
+		};
+	},
 	rands:		(args) => {
 		const a = args.raw.map(x => args.eval(x.expr));
 		if (a.length < 3 || a.length > 4 || a.some(v => typeof v !== 'number')) {
@@ -1120,10 +1164,11 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		let colorFn: Material['colorFn'];
 		if (isClosure(written)) {
 			// a colour that is a function of the point, in the frame this color() is written in: its inverse takes a point of
-			// the model to one of that frame (its columns are x, y, z and w, so a row of the map takes one component of each)
+			// the model to one of that frame (its columns are x, y, z and w, so a row of the map takes one component of each),
+			// and the frame's own transpose takes a normal there
 			try {
-				const inv = inverseOrIdentity(frame.m);
-				colorFn = compileColor(written.definition, written.resolver, (['x', 'y', 'z'] as const).map(k => [inv.x[k], inv.y[k], inv.z[k], inv.w[k]]));
+				const inv = inverseOrIdentity(frame.m), m = frame.m, xyz = ['x', 'y', 'z'] as const;
+				colorFn = compileColor(written.definition, written.resolver, xyz.map(k => [inv.x[k], inv.y[k], inv.z[k], inv.w[k]]), xyz.map(k => [m[k].x, m[k].y, m[k].z]));
 			} catch (e) {
 				if (!(e instanceof FnError))
 					throw e;
@@ -1261,7 +1306,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		// a union, a smooth circle) still draws the round approximation, honestly reported.
 		// r is the first positional argument *or* the named 'r'; delta is named only, since OpenSCAD parses the
 		// signature as offset(r) with delta as a separate name
-		const r		= args.num('r') ?? 0;
+		const r		= args.num('r');		// (undefined if it is not given: delta is used then, and neither is 0)
 		const delta = args.num('delta');
 		if (r !== undefined && delta !== undefined)
 			args.warn('an offset() given both r and delta, which OpenSCAD resolves to r');
@@ -1281,7 +1326,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 				return place(frame, {k: 'polygon2', paths: [mitred]});
 			args.warn('an offset(delta), whose mitred corners are drawn round here -- exact mitring only works for a single convex outline (a square, a $fn-sided circle, or a convex polygon())');
 		}
-		return place(frame, {k: 'offset', r: r ?? delta ?? 1, body});
+		return place(frame, {k: 'offset', r: r ?? delta ?? 0, body});
 	},
 
 	linear_extrude: (args, frame) => {
@@ -1955,6 +2000,71 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		return args.child(frame);
 	},
 
+	// displace(function(x, y, z) h), or function(x, y, z, nx, ny, nz) h to be given the surface's unit normal too: what is
+	// inside it with its surface moved out along its normal by h, or in where h is negative, x, y, z and the normal being in
+	// the frame displace() is written in. It is how a height map goes on any shape: h looks the point up in a texture() by
+	// whatever projection suits the shape. h is read at the point of the body's surface that is moved, as a mesh's
+	// displacement is; `base = false` reads it where the moved point is instead, which is the same for a projection that
+	// does not change along the normal (atan2(y, x) and z on a cylinder, say) and cheaper. Being a field rather than a
+	// mesh, a deep displacement cannot fold through itself; it fills in, and where a displaced face meets one that is not,
+	// in a corner, it is cut off half way between them -- displace only what is to move, and union the rest outside.
+	// `slope` bounds how fast h changes, replacing the steepest found by looking.
+	displace: (args, frame) => {
+		const f = args.get('f', 0);
+		const children = args.children(identityFrame);
+		const body = children.length === 1 ? children[0] : children.length === 0 ? empty : {k: 'union' as const, children};
+		if (!isClosure(f)) {
+			args.warn('displace() needs a function: displace(function(x, y, z) ...)');
+			return place(frame, body);
+		}
+		const sdf = new SDF(body), box = sdf.bounds();
+		if (!box || is2d(body)) {
+			args.warn(is2d(body) ? 'displace(): a 2-D shape, which has no surface to move' : 'displace() of nothing');
+			return empty;
+		}
+		try {
+			const fn = compileDisplacement(f.definition, f.resolver);
+			const base = args.bool('base') ?? true;
+			// What h is and how steep it gets where the surface is: on a lattice, at the points within reach of the body's
+			// surface -- first the body's own, then again as far out as h was found to move it. Between lattice points h can
+			// be at most the slope times half a step further out.
+			const size = box.size(), N = 32, eps = Math.max(size.x, size.y, size.z) * 1e-4;
+			let lo = 0, hi = 0, steepest = 0, step = 0;
+			for (let pass = 0; pass < 2; pass++) {
+				const grow = Math.max(-lo, hi) * 1.1, min = box.min.sub(float3(grow, grow, grow)), span = box.size().add(float3(2 * grow, 2 * grow, 2 * grow));
+				step = span.len() / N;
+				for (let i = 0; i <= N; i++)
+					for (let j = 0; j <= N; j++)
+						for (let k = 0; k <= N; k++) {
+							const p = float3(min.x + span.x * i / N, min.y + span.y * j / N, min.z + span.z * k / N);
+							const d = sdf.eval(p);
+							if (Math.abs(d) > step + grow)
+								continue;
+							const n = fn.normal || base ? sdf.normal(p, eps) : float3(0, 0, 0);
+							const q = base ? p.sub(n.scale(d)) : p;
+							const h = fn.value(q.x, q.y, q.z, n.x, n.y, n.z), g = fn.slope(q.x, q.y, q.z, n.x, n.y, n.z);
+							if (Number.isFinite(h)) {
+								lo = Math.min(lo, h);
+								hi = Math.max(hi, h);
+							}
+							if (Number.isFinite(g))
+								steepest = Math.max(steepest, g);
+						}
+			}
+			const slope = args.num('slope') ?? steepest * 1.25;
+			lo -= slope * step / 2;
+			hi += slope * step / 2;
+			const out = Math.max(hi, 0);
+			return place(frame, {k: 'displace', fn, lo, hi, slope, base, eps, body,
+				box: new Box3(box.min.sub(float3(out, out, out)), box.max.add(float3(out, out, out)))});
+		} catch (e) {
+			if (!(e instanceof FnError))
+				throw e;
+			args.warn(`displace(): ${e.message}`);
+			return place(frame, body);
+		}
+	},
+
 	// wrap("cylinder"/"sphere", r = <radius>) bends what is inside it into a revolution about z: its x
 	// becomes an arc of r, its y a height up the axis or a latitude, and its z a thickness standing out
 	// from the surface of radius r. A cylinder can be given the length of its axis too (h) -- r and h being
@@ -1996,19 +2106,23 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 			// is the grid's own arc (see wrappedHeightmapDistance). That is also what keeps a scaled sphere
 			// sane at its poles, where the general bend's stretch falls to nothing.
 
-			let scale = float3(1, 1, 1);
+			// (what the general bend takes is the body with all that is done to it: below, `body` is what is under its scales)
+			const whole = body;
+			let scale = float3(1, 1, 1), turned = false;
 			while (body.k === 'material' || body.k === 'domain') {
 				if (body.k === 'domain') {
 					const m = body.m;
-					if (Math.hypot(m.x.y, m.x.z, m.y.x, m.y.z, m.z.x, m.z.y) > 1e-12)
-						return empty;
-
+					// a turned grid is not the grid it is, which only the general bend can take
+					if (Math.hypot(m.x.y, m.x.z, m.y.x, m.y.z, m.z.x, m.z.y) > 1e-12) {
+						turned = true;
+						break;
+					}
 					scale = float3(scale.x * m.x.x, scale.y * m.y.y, scale.z * m.z.z);
 				}
 				body = body.body;
 			}
 
-			if (body.k === 'heightmap' && !body.wrap) {
+			if (!turned && body.k === 'heightmap' && !body.wrap) {
 				const tiled = body.tiled;
 				// A scaled grid that is not tiled is a piece of the surface its own width asks for: its columns
 				// end where the grid does, of the arc (cols - 1) * sx, and a meridian through each end is a face
@@ -2058,11 +2172,11 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 					return place(frame, heightmap(body.cols, body.rows, heights, scale.z * body.bottom, wrap));
 				}
 			}
-			const box = new SDF(body).bounds();
+			const box = new SDF(whole).bounds();
 			if (box)
-				return place(frame, {k: 'warp', kind: how, r, box, body, axis: how === 'cylinder' ? h : undefined});
+				return place(frame, {k: 'warp', kind: how, r, box, body: whole, axis: how === 'cylinder' ? h : undefined});
 
-			args.warn(is2d(body) ? 'wrap(): a 2-D shape, which wants an extrude before it can be bent' : 'wrap() of nothing');
+			args.warn(is2d(whole) ? 'wrap(): a 2-D shape, which wants an extrude before it can be bent' : 'wrap() of nothing');
 		}
 		return empty;
 	}
@@ -2180,7 +2294,7 @@ class Env {
 						get: (name: string) => this.get(name, ctx),
 						findFunction: (name: string) => {
 							const f = this.findCallable(name, ctx);
-							return f && isClosure(f) ? f.definition : f;
+							return f && isClosure(f) ? f.texture ?? f.definition : f;
 						}
 					},
 					call: (env: Env, args: Assignment[]): Value => {
@@ -2742,7 +2856,7 @@ export function evaluate(file: SourceFile, filename: string, files: ScadFiles, v
 		box		= sdf.bounds();
 	}
 
-	const size		= box ? box.extent().len() : 0;
+	const size		= box ? box.size().len() : 0;
 	const center	= box ? box.centre() : float3(0, 0, 0);
 	const vpf		= env.getT('$vpf', ctx, num) ?? 22.5;
 
@@ -2780,6 +2894,7 @@ const CSG_PARAMS: Record<string, string[]> = {
 	surface:			['file', 'center', 'invert', 'convexity'],
 	surface_fn:			['f', 'x', 'y', 'bottom', 'zmax', 'slope'],
 	implicit_fn:		['f', 'x', 'y', 'z', 'lipschitz'],
+	displace:			['f', 'base', 'slope'],
 	text:				['text', 'size', 'font', 'halign', 'valign', 'spacing', 'direction', 'language', 'script'],
 	wrap:				['kind', 'r', 'd', 'h'],
 	minkowski:			['convexity'],

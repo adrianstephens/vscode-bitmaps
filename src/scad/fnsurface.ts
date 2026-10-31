@@ -18,8 +18,39 @@ import type { Assignment, Expr, FunctionDefinition } from './parser';
 // Closure, lives in evaluate.ts), so this file needs nothing from there at run time.
 export interface Resolver {
 	get(name: string): unknown;							// a variable's value
-	findFunction(name: string): FunctionDefinition | undefined;	// what a call of that name means: a `function name(...) = ...`, or a variable holding a function literal
+	findFunction(name: string): FunctionDefinition | Texture | undefined;	// what a call of that name means: a `function name(...) = ...`, a variable holding a function literal, or one holding a texture()
 }
+
+//-----------------------------------------------------------------------------
+// images
+//-----------------------------------------------------------------------------
+
+// An image a function can look colours up in: texture("file.png") is called as img(u, v), u and v 0..1 across it, and
+// gives [r, g, b, a]. Its pixels are rows of rgba from the bottom up (v = 0 is the image's last row), and it either
+// repeats or holds its edges beyond 0..1. The shader's texSample (sdflib.frag) reads the same layout from the batch texture.
+export class Texture {
+	constructor(readonly width: number, readonly height: number, readonly rgba: Float32Array, readonly repeat: boolean) {}
+
+	// the image at (u, v) between the pixels' centres (which = 0), or its rate of change along u (1) or v (2)
+	at(u: number, v: number, which = 0): number[] {
+		const w = this.width, h = this.height;
+		const x = u * w - 0.5, y = v * h - 0.5, i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j;
+		const wrap = (k: number, n: number) => this.repeat ? ((k % n) + n) % n : Math.min(Math.max(k, 0), n - 1);
+		const at = (di: number, dj: number) => (wrap(j + dj, h) * w + wrap(i + di, w)) * 4;
+		const a = at(0, 0), b = at(1, 0), c = at(0, 1), d = at(1, 1), px = this.rgba;
+		return [0, 1, 2, 3].map(k => {
+			const A = px[a + k], B = px[b + k], C = px[c + k], D = px[d + k];
+			return which === 0 ? (A + (B - A) * fx) * (1 - fy) + (C + (D - C) * fx) * fy
+				: which === 1 ? ((B - A) * (1 - fy) + (D - C) * fy) * w
+				: ((C - A) * (1 - fx) + (D - B) * fx) * h;
+		});
+	}
+}
+
+// Where what is written finds a texture: an index into the array a JS function is made with, or the texel of the batch
+// texture the shader's copy starts at
+export type TexturePlace = (t: Texture) => number;
+const NO_TEXTURES: TexturePlace = () => { throw new Error('a texture with nowhere to be read from'); };
 
 //-----------------------------------------------------------------------------
 // the DAG
@@ -28,8 +59,8 @@ export interface Resolver {
 export class FnError extends Error {}
 
 interface Const	{ t: 'c'; id: number; v: number }
-interface Var	{ t: 'v'; id: number; name: 'x' | 'y' | 'z' }
-interface Op	{ t: 'o'; id: number; op: string; a: Node[] }
+interface Var	{ t: 'v'; id: number; name: 'x' | 'y' | 'z' | 'nx' | 'ny' | 'nz' }
+interface Op	{ t: 'o'; id: number; op: string; a: Node[]; tex?: Texture; ch?: number }	// tex and ch: a lookup's image and channel (see Dag.texture)
 export type Node = Const | Var | Op;
 
 const D = Math.PI / 180;
@@ -109,6 +140,27 @@ class Dag {
 	}
 
 	get size() { return this.count; }
+
+	// a channel of an image at (u, v) -- its value ('tex'), or its rate of change along u or v ('texdu', 'texdv'). Known u
+	// and v are looked up now.
+	texture(tex: Texture, op: 'tex' | 'texdu' | 'texdv', ch: number, u: Node, v: Node): Node {
+		if (u.t === 'c' && v.t === 'c')
+			return this.num(tex.at(u.v, v.v, op === 'tex' ? 0 : op === 'texdu' ? 1 : 2)[ch]);
+		const key = `o:${op}:${this.textureId(tex)}:${ch}:${u.id},${v.id}`;
+		return this.make<Op>(key, id => ({t: 'o', id, op, a: [u, v], tex, ch}));
+	}
+	private textures = new Map<Texture, number>();
+	private textureId(tex: Texture) {
+		let id = this.textures.get(tex);
+		if (id === undefined)
+			this.textures.set(tex, id = this.textures.size);
+		return id;
+	}
+
+	// the surface normal's components, which only a colour or a displacement asks for, so they are made when it does
+	normal(): Var[] {
+		return (['nx', 'ny', 'nz'] as const).map(name => this.make<Var>(`v:${name}`, id => ({t: 'v', id, name})));
+	}
 
 	num(v: number): Node {
 		// -0 and 0 are one constant; an infinity or a NaN is kept out of the shader, where it has no spelling
@@ -230,6 +282,8 @@ class Dag {
 			case 'min':		return op('sel', op('lt', a, b), da(), db());
 			case 'max':		return op('sel', op('gt', a, b), da(), db());
 			case 'sel':		return op('sel', a, this.d(n.a[1], v), this.d(n.a[2], v));
+			// a lookup is bilinear, so its slope is the cell's; the slope's own slope is taken as none
+			case 'tex':		return op('add', op('mul', this.texture(n.tex!, 'texdu', n.ch!, a, b), da()), op('mul', this.texture(n.tex!, 'texdv', n.ch!, a, b), db()));
 			// stepwise, comparisons and logic: no slope
 			default:		return this.zero;
 		}
@@ -273,15 +327,30 @@ function number(v: number, glsl: boolean): string {
 	return v < 0 ? `(${s})` : s;
 }
 
-function write(root: Node | Node[], glsl: boolean): string[] {
+function write(root: Node | Node[], glsl: boolean, place = NO_TEXTURES): string[] {
 	const roots = Array.isArray(root) ? root : [root];
 	const name = (n: Node): string => n.t === 'c' ? number(n.v, glsl) : n.t === 'v' ? n.name : `t${n.id}`;
 	const type = glsl ? 'float ' : 'const ';
 	const seen = new Set<Op>(), lines: string[] = [];
+	// the channels of one lookup are one fetch of all four, written once
+	const fetched = new Map<string, string>();
 	for (const r of roots)
 		for (const n of order(r))
 			if (!seen.has(n)) {
 				seen.add(n);
+				if (n.tex) {
+					const t = n.tex, which = n.op === 'tex' ? 0 : n.op === 'texdu' ? 1 : 2, [u, v] = n.a.map(name);
+					const key = `${place(t)}:${which}:${u}:${v}`;
+					let s = fetched.get(key);
+					if (!s) {
+						fetched.set(key, s = `s${n.id}`);
+						lines.push(glsl
+							? `vec4 ${s} = texSample(${place(t)}, ${t.width}, ${t.height}, ${t.repeat ? 1 : 0}, ${which}, ${u}, ${v});`
+							: `const ${s} = T[${place(t)}].at(${u}, ${v}, ${which});`);
+					}
+					lines.push(`${type}${name(n)} = ${s}[${n.ch}];`);
+					continue;
+				}
 				const def = OPS[n.op];
 				lines.push(`${type}${name(n)} = ${(glsl ? def.glsl : def.js)(n.a.map(name))};`);
 			}
@@ -289,6 +358,14 @@ function write(root: Node | Node[], glsl: boolean): string[] {
 	if (!Array.isArray(root))
 		return lines.concat([`${glsl ? 'float' : 'const'} res = ${name(root)};`]);
 	return lines.concat(roots.map((r, i) => `${glsl ? 'float' : 'const'} r${i} = ${name(r)};`));
+}
+
+// A JS function of the point and the normal, of what `write` makes of root, ending with `ret`; the textures it reads are
+// handed to it as T
+function build<F>(root: Node | Node[], ret: string): F {
+	const textures: Texture[] = [];
+	const body = write(root, false, t => textures.includes(t) ? textures.indexOf(t) : textures.push(t) - 1);
+	return new Function('T', `return function(x, y, z, nx, ny, nz) {\n${body.join('\n')}\n${ret}\n};`)(textures);
 }
 
 //-----------------------------------------------------------------------------
@@ -337,13 +414,12 @@ export class FieldFn {
 	}
 
 	private build(root: Node, guard = true) {
-		const src = write(root, false).join('\n') + `\nreturn ${guard ? 'Number.isNaN(res) ? 1e20 : res' : 'res'};`;
-		return new Function('x', 'y', 'z', src) as (x: number, y: number, z: number) => number;
+		return build<(x: number, y: number, z: number) => number>(root, `return ${guard ? 'Number.isNaN(res) ? 1e20 : res' : 'res'};`);
 	}
 
 	// a glsl function `float name(vec3 p)`, of the distance estimate
-	glsl(name: string): string {
-		const body = write(this.dist, true).map(l => '\t' + l);
+	glsl(name: string, place: TexturePlace): string {
+		const body = write(this.dist, true, place).map(l => '\t' + l);
 		return `float ${name}(vec3 p) {\n\tfloat x = p.x, y = p.y, z = p.z;\n${body.join('\n')}\n\treturn isnan(res) ? 1e20 : res;\n}`;
 	}
 }
@@ -670,6 +746,15 @@ class Compiler {
 
 		// a function of the file's shadows a builtin of the same name, as it does in scad
 		const target = this.resolver.findFunction(name);
+		if (target instanceof Texture) {
+			// img(u, v) or img([u, v]): the four channels there
+			const {pos} = this.args(args, s);
+			const uv = pos.length === 1 && Array.isArray(pos[0]) ? pos[0] : pos;
+			if (uv.length < 2)
+				throw new FnError(`${name}() is a texture, which is looked up at (u, v)`);
+			const u = this.scalar(uv[0], `the u of ${name}()`), v = this.scalar(uv[1], `the v of ${name}()`);
+			return [0, 1, 2, 3].map(ch => this.dag.texture(target, 'tex', ch, u, v));
+		}
 		if (target) {
 			const {pos, named} = this.args(args, s);
 			const inner = new Scope();
@@ -799,36 +884,88 @@ export function compileField(definition: FunctionDefinition, resolver: Resolver,
 	return new FieldFn(field, dag.op('div', field, scale), dag.size, gradient);
 }
 
-// A colour that is a function of the point: function(x, y, z) [r, g, b], in the frame the color() was written in.
-// `local` carries a point of the model's own frame into that one -- three rows of an affine map, each [a, b, c, d]
-// for a x + b y + c z + d -- so a colour that is written on a shape that has been moved, turned or scaled moves with it.
+// A colour that is a function of the point: function(x, y, z) [r, g, b], in the frame the color() was written in, or
+// function(x, y, z, nx, ny, nz) to have the surface's unit normal there too, in that frame as well. `local` carries a
+// point of the model's own frame into that one -- three rows of an affine map, each [a, b, c, d] for a x + b y + c z + d
+// -- and `normal` (three rows [a, b, c]) a normal, so a colour written on a shape that is moved, turned or scaled moves with it.
 export class ColorFn {
-	private js?: (x: number, y: number, z: number) => number[];
+	private js?: (x: number, y: number, z: number, nx: number, ny: number, nz: number) => number[];
 	constructor(private roots: Node[]) {}
 
-	// the colour at a point of the model's frame, each component clamped to 0..1
-	at(x: number, y: number, z: number): [number, number, number] {
-		this.js ??= new Function('x', 'y', 'z', write(this.roots, false).join('\n') + `\nreturn [${this.roots.map((_, i) => `r${i}`).join(', ')}];`) as unknown as typeof this.js;
-		const c = this.js!(x, y, z);
+	// the colour at a point of the model's frame, where the surface's normal is n, each component clamped to 0..1
+	at(x: number, y: number, z: number, nx = 0, ny = 0, nz = 0): [number, number, number] {
+		this.js ??= build(this.roots, `return [${this.roots.map((_, i) => `r${i}`).join(', ')}];`);
+		const c = this.js!(x, y, z, nx, ny, nz);
 		return [0, 1, 2].map(i => Math.min(Math.max(Number.isNaN(c[i]) ? 0 : c[i], 0), 1)) as [number, number, number];
 	}
 
-	// `vec3 name(vec3 p)`, p in the model's frame
-	glsl(name: string): string {
-		const body = write(this.roots, true).map(l => '\t' + l);
+	// `vec3 name(vec3 p, vec3 n)`, p and the unit normal n in the model's frame
+	glsl(name: string, place: TexturePlace): string {
+		const body = write(this.roots, true, place).map(l => '\t' + l);
 		const c = this.roots.map((_, i) => `r${i}`);
-		return `vec3 ${name}(vec3 p) {\n\tfloat x = p.x, y = p.y, z = p.z;\n${body.join('\n')}\n\treturn clamp(vec3(${c.join(', ')}), 0.0, 1.0);\n}`;
+		return `vec3 ${name}(vec3 p, vec3 n) {\n\tfloat x = p.x, y = p.y, z = p.z, nx = n.x, ny = n.y, nz = n.z;\n${body.join('\n')}\n\treturn clamp(vec3(${c.join(', ')}), 0.0, 1.0);\n}`;
 	}
 }
 
-export function compileColor(definition: FunctionDefinition, resolver: Resolver, local: number[][]): ColorFn {
+export function compileColor(definition: FunctionDefinition, resolver: Resolver, local: number[][], normal: number[][]): ColorFn {
 	const c = new Compiler(resolver);
 	const dag = c.dag;
-	const point = local.map(([a, b, cc, d]) => [dag.op('mul', dag.num(a), dag.x), dag.op('mul', dag.num(b), dag.y), dag.op('mul', dag.num(cc), dag.z), dag.num(d)]
-		.reduce((s, n) => dag.op('add', s, n), dag.zero));
-	const scope = c.bindParameters(definition.parameters, 3, point);
-	const result = c.expr(definition.expr, scope);
+	const sum = (terms: Node[]) => terms.reduce((s, n) => dag.op('add', s, n), dag.zero);
+	const point = local.map(([a, b, cc, d]) => sum([dag.op('mul', dag.num(a), dag.x), dag.op('mul', dag.num(b), dag.y), dag.op('mul', dag.num(cc), dag.z), dag.num(d)]));
+	const count = Math.min(Math.max(definition.parameters.length, 3), 6);
+	let vars = point;
+	if (count > 3) {
+		const n = dag.normal();
+		const turned = normal.map(row => sum(row.map((k, i) => dag.op('mul', dag.num(k), n[i]))));
+		// a turn, or a turn and the same scale every way, keeps the normal's length to a constant; anything else is
+		// measured where it is
+		const len2 = normal.map(r => r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+		const dot = (i: number, j: number) => normal[i][0] * normal[j][0] + normal[i][1] * normal[j][1] + normal[i][2] * normal[j][2];
+		const rigid = Math.abs(len2[1] - len2[0]) < 1e-9 * len2[0] && Math.abs(len2[2] - len2[0]) < 1e-9 * len2[0]
+			&& [dot(0, 1), dot(0, 2), dot(1, 2)].every(d => Math.abs(d) < 1e-9 * len2[0]);
+		const len = rigid ? dag.num(Math.sqrt(len2[0])) : dag.op('sqrt', sum(turned.map(t => dag.op('mul', t, t))));
+		vars = [...point, ...turned.map(t => dag.op('div', t, len))];
+	}
+	const result = c.expr(definition.expr, c.bindParameters(definition.parameters, count, vars));
 	if (!Array.isArray(result) || result.length < 3 || result.slice(0, 3).some(n => Array.isArray(n)))
 		throw new FnError('a colour function gives [r, g, b], three numbers');
 	return new ColorFn(result.slice(0, 3) as Node[]);
+}
+
+// displace()'s function: function(x, y, z) h, or function(x, y, z, nx, ny, nz) h to have the body's unit normal there
+// too -- how far the surface moves out along its normal (in, where h is negative), in the frame displace() is written in.
+// The slope of h is what bounds the step a raymarcher can take over the moved surface; it is the slope with the point
+// alone, the normal held still, so it says nothing of how fast a normal-dependent h changes round an edge.
+export class DisplaceFn {
+	private js?:	(x: number, y: number, z: number, nx: number, ny: number, nz: number) => number;
+	private grad?:	(x: number, y: number, z: number, nx: number, ny: number, nz: number) => number;
+	constructor(private h: Node, private gradient: Node, readonly normal: boolean) {}
+
+	value(x: number, y: number, z: number, nx = 0, ny = 0, nz = 0): number {
+		this.js ??= build(this.h, 'return res;');
+		return this.js!(x, y, z, nx, ny, nz);
+	}
+
+	// the length of h's gradient
+	slope(x: number, y: number, z: number, nx = 0, ny = 0, nz = 0): number {
+		this.grad ??= build(this.gradient, 'return res;');
+		return this.grad!(x, y, z, nx, ny, nz);
+	}
+
+	// `float name(vec3 p, vec3 n)`
+	glsl(name: string, place: TexturePlace): string {
+		const body = write(this.h, true, place).map(l => '\t' + l);
+		return `float ${name}(vec3 p, vec3 n) {\n\tfloat x = p.x, y = p.y, z = p.z, nx = n.x, ny = n.y, nz = n.z;\n${body.join('\n')}\n\treturn isnan(res) ? 0.0 : res;\n}`;
+	}
+}
+
+export function compileDisplacement(definition: FunctionDefinition, resolver: Resolver): DisplaceFn {
+	const c = new Compiler(resolver);
+	const dag = c.dag;
+	const count = Math.min(Math.max(definition.parameters.length, 3), 6);
+	const h = c.expr(definition.expr, c.bindParameters(definition.parameters, count, [dag.x, dag.y, dag.z, ...count > 3 ? dag.normal() : []]));
+	if (Array.isArray(h))
+		throw new FnError('a displacement gives a number, how far the surface moves');
+	const g = [dag.x, dag.y, dag.z].map(v => dag.d(h, v as Var));
+	return new DisplaceFn(h, dag.op('sqrt', g.reduce((s, n) => dag.op('add', s, dag.op('mul', n, n)), dag.zero)), count > 3);
 }

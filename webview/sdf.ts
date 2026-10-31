@@ -5,6 +5,7 @@ import { vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shar
 import { Canvas3D, ShaderProgram, Offscreen, rectGeometry } from './opengl.js';
 import { vec, E3, float3, float3x3 } from '@isopodlabs/maths/vector';
 import { Orbit, DEFAULT_FOVY } from './orbit.js';
+import { Input } from './navigate.js';
 import { Gizmo } from './gizmo.js';
 import { Cascade, CascadeItem, svgFace, toggleItem } from './cascade.js';
 
@@ -25,7 +26,7 @@ export type MessageIn =
 	| {command: 'fitToWindow'};
 
 export interface GlyphAtlas {
-	chars: string, width: number, height: number, cellW: number, data: Uint8Array,
+	chars: string, width: number, height: number, cellW: number, data: Uint8Array<ArrayBuffer>,
 	pitch: number, spread: number, cellX0: number, cellY0: number, cellWEm: number, cellHEm: number, capHeight: number,
 }
 
@@ -38,18 +39,14 @@ const infoBox	= $<HTMLElement>('scad-info');
 const errorBox	= $<HTMLElement>('scad-error');
 
 const canvas3d	= new Canvas3D(canvas, {depth: false, onError: message => post({command: 'error', message})});
-// RGBA32F is what the picker reads a hit back through: a plain float format, not the linearly-filtered kind the
-// (now removed) voxel cache wanted, so only the base extension is asked for.
 canvas3d.gl.getExtension('EXT_color_buffer_float');
 
-
-// the file's own $vpt/$vpr/$vpd/$vpf, as of the last model it sent -- homeView()'s to apply, not live: like
-// OpenSCAD's own preview, orbiting the camera never re-evaluates the file, so these only change on an edit
-let scriptCamera: ScriptCamera = {};
+const pickTarget = canvas3d.createOffscreen(1, 1, 'rgba32f');// a single pixel, read back after each of the picker's passes
 
 let program:	ShaderProgram | undefined;
 let pickProgram: ShaderProgram | undefined;			// answers what is under a point instead of drawing the picture
-let pickTarget:	Offscreen | undefined;					// a single pixel, read back after each of the picker's passes
+
+let scriptCamera: ScriptCamera = {};
 let source:		{vert: string, frag: string, lib: string, pick: string} | undefined;
 let modules:	string[] = [];		// the file's own modules, when it draws nothing itself: a menu item runs one
 let running:	string | undefined;
@@ -122,7 +119,7 @@ function moving() {
 function glyphUniforms() {
 	if (!glyphs || !floorOn)
 		return {u_glyphInfo: [0, 0, 0, 0]};
-	canvas3d.bindTexture(canvas3d.gl.TEXTURE_2D, glyphTexture, 0);
+	canvas3d.bindTexture2D(glyphTexture, 0);
 	return {
 		u_glyphs:		0,
 		u_glyphCell:	[glyphs.cellX0, glyphs.cellY0, glyphs.cellWEm, glyphs.cellHEm],
@@ -133,7 +130,7 @@ function glyphUniforms() {
 function batchUniforms() {
 	if (!batchTexture)
 		return {};
-	canvas3d.bindTexture(canvas3d.gl.TEXTURE_2D, batchTexture, BATCH_UNIT);
+	canvas3d.bindTexture2D(batchTexture, BATCH_UNIT);
 	return {u_batch: BATCH_UNIT};
 }
 
@@ -220,6 +217,7 @@ const orbit: Orbit = new Orbit(canvas, {
 	zoomed:		(x, y) => schedulePick(x, y),
 	contextMenu:(x, y) => { hideTooltip(); menu.open(x, y); }
 });
+Input.on(canvas).add(orbit);
 const gizmo = new Gizmo(canvas, orbit.gizmoHooks());
 
 //--- the tooltip ---------------------------------------------------------
@@ -416,9 +414,8 @@ async function setModel(code: string, data: Float32Array) {
 	if (!source)
 		source = await RPC<{vert: string, frag: string, lib: string, pick: string}>({command: 'getShaders'});
 
-	program			= canvas3d.createProgram({vert: source.vert, frag: source.frag.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
-	pickProgram		= canvas3d.createProgram({vert: source.vert, frag: source.pick.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
-	pickTarget 		??= canvas3d.createOffscreen(1, 1, 'rgba32f');
+	program		= canvas3d.createProgram({vert: source.vert, frag: source.frag.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
+	pickProgram	= canvas3d.createProgram({vert: source.vert, frag: source.pick.replace('//@lib', source.lib).replace('//@sdf', code)}, rectGeometry);
 
 	if (data.length === 0) {
 		if (batchTexture)
@@ -442,10 +439,13 @@ window.addEventListener('message', async event => {
 	switch (message.command) {
 		case 'sdf':
 			try {
-				const untouched = !program;// || message.center.some((v, i) => v !== center[i]) || message.half.some((v, i) => v !== half[i]);
+				const newCenter	= float3(message.center.x, message.center.y, message.center.z);
+				const newHalf	= float3(message.half.x, message.half.y, message.half.z);
+
+				const untouched = program && newCenter.eq(center) && newHalf.eq(half);
 				await setModel(message.code, message.data);
-				center			= float3(message.center.x, message.center.y, message.center.z);
-				half			= float3(message.half.x, message.half.y, message.half.z);
+				center			= newCenter;
+				half			= newHalf;
 				scriptCamera	= message.camera;
 				orbit.fovy		= message.camera.vpf !== undefined ? 1 / Math.tan(message.camera.vpf * Math.PI / 360) : DEFAULT_FOVY;
 
@@ -454,7 +454,7 @@ window.addEventListener('message', async event => {
 				showInfo();
 				draw();
 				errorBox.classList.add('hidden');
-				//if (untouched)
+				if (!untouched)
 					homeView();
 				render();
 
@@ -481,10 +481,11 @@ window.addEventListener('message', async event => {
 	}
 });
 
+// (the page is ready with the numbers or without them)
 RPC<GlyphAtlas | undefined>({command: 'getGlyphs'}).then(atlas => {
 	if (atlas) {
 		glyphs			= atlas;
 		glyphTexture	??= canvas3d.createTexture(atlas.width, atlas.height, atlas.data, {format: 'r8', min: 'linear', mag: 'linear'});
-		post({command: 'ready'});
 	}
-}).catch(() => {});		// no numbers on the floor is not worth an error
+}).catch(() => {})		// no numbers on the floor is not worth an error
+	.finally(() => post({command: 'ready'}));

@@ -1,10 +1,11 @@
 // The mesh viewer's page: it draws the meshes the extension read from a file, each where the file places it, over the
 // floor the scad viewer draws, and says what is under the cursor.
 import { vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Canvas3D, Pixels, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
+import { Canvas3D, RGBAPixels, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
 import { Orbit } from './orbit.js';
+import { Input } from './navigate.js';
 import { Gizmo } from './gizmo.js';
-import { Cascade, CascadeItem, svgFace, choiceItem, toggleItem } from './cascade.js';
+import { Cascade, CascadeItem, svgFace, choiceItem, toggleItem, sliderItem, valueFace, icons as commonIcons } from './cascade.js';
 import { float3, float4, float3x3, float3x4, float4x4, matmul, matmulExt} from '@isopodlabs/maths/vector';
 import type { GlyphAtlas } from './sdf.js';
 
@@ -28,12 +29,12 @@ export interface InstanceData {
 	object:		string;
 }
 
-export type TextureData = Pixels;
+export type TextureData = RGBAPixels;
 
-export interface Model {
+export interface RenderData {
 	meshes:		MeshData[],
 	instances:	InstanceData[],
-	textures:	(Pixels | undefined)[],
+	textures:	(RGBAPixels | undefined)[],
 	info:		string,
 	warnings:	string[],
 	unit:		string,
@@ -44,12 +45,14 @@ export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'getShaders'}
-	| {command: 'getGlyphs'};
+	| {command: 'getGlyphs'}
+	| {command: 'simplify', maxError: number};		// replied to with every mesh, as MeshData in the model's order
 
 export type MessageIn =
-	| ({command: 'model'} & Model)
+	| ({command: 'model'} & RenderData)
 	| {command: 'error', message: string}
-	| {command: 'fitToWindow'};
+	| {command: 'fitToWindow'}
+	| {command: 'tolerance', maxError: number};		// the simplification set from outside the page
 
 interface Shaders { vert: string, frag: string, floorVert: string, floorFrag: string }
 
@@ -76,7 +79,7 @@ let program:		ShaderProgram | undefined;
 let floorProgram:	ShaderProgram | undefined;
 let gpuMeshes:		GpuMesh[] = [];
 let gpuTextures:	(WebGLTexture | undefined)[] = [];
-let model:			Model | undefined;
+let model:			RenderData | undefined;
 let up:				'y' | 'z' = 'z';
 let floorOn			= true;
 
@@ -138,7 +141,7 @@ function measure() {
 	}
 	const empty = ext.min.x > ext.max.x;
 	center	= empty ? float3(0, 0, 0) : ext.centre();
-	half	= empty ? float3(1, 1, 1) : ext.extent().scale(0.5).max(float3(1e-6, 1e-6, 1e-6));
+	half	= empty ? float3(1, 1, 1) : ext.size().scale(0.5).max(float3(1e-6, 1e-6, 1e-6));
 }
 
 //--- drawing -----------------------------------------------------------------
@@ -152,6 +155,7 @@ const orbit: Orbit = new Orbit(canvas, {
 	contextMenu:(x, y) => { hideTooltip(); menu.open(x, y); }
 
 });
+Input.on(canvas).add(orbit);
 const gizmo = new Gizmo(canvas, orbit.gizmoHooks());
 
 function home() {
@@ -180,7 +184,7 @@ function drawMeshes(viewProj: float4x4, pick: number) {
 		for (const run of mesh.data.runs) {
 			const texture = run.texture >= 0 ? gpuTextures[run.texture] : undefined;
 			if (texture)
-				canvas3d.bindTexture(gl.TEXTURE_2D, texture, 0);
+				canvas3d.bindTexture2D(texture, 0);
 			p.use({u_textured: texture ? 1 : 0, u_texture: 0});
 			gl.drawArrays(gl.TRIANGLES, run.first, run.count);
 		}
@@ -251,7 +255,7 @@ function setGlyphs(atlas: GlyphAtlas) {
 function glyphUniforms() {
 	if (!glyphs)
 		return {u_glyphInfo: [0, 0, 0, 0]};
-	canvas3d.bindTexture(gl.TEXTURE_2D, glyphTexture, 1);
+	canvas3d.bindTexture2D(glyphTexture, 1);
 	return {
 		u_glyphs:		1,
 		u_glyphCell:	[glyphs.cellX0, glyphs.cellY0, glyphs.cellWEm, glyphs.cellHEm],
@@ -323,7 +327,7 @@ function pick(clientX: number, clientY: number) {
 		return;
 	}
 	const instance	= model.instances[hit.instance];
-	const data		= model.meshes[instance.mesh];
+	const data		= gpuMeshes[instance.mesh].data;
 	const p3		= (v: float3) => `${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)}`;
 	const label		= hit.face >= 0 ? data.labels[data.faceLabels[hit.face]] : '';
 	const c			= hit.colour!;
@@ -377,36 +381,115 @@ const icons = {
 	floor:		'<path d="M2 11l3-5h6l3 5zM6 6l-1 5M10 6l1 5M3.5 8.500h9"/>',
 	up:			'<path d="M8 14V3M4.5 6.500L8 3l3.5 3.5"/>',
 	fit:		'<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>',
+	simplify:	'<path d="M2 12C5 3 11 3 14 12"/><rect x="1" y="11" width="3" height="3"/><rect x="12" y="11" width="3" height="3"/>',
 };
 
+// How far the drawn meshes may stray from the file's, simplified by the extension; 0 draws the file's own. Only one
+// request is out at a time: one set while it is out is asked for when it comes back, so a drag shows each result it can.
+let tolerance	= 0;
+let asking		= false;
+
+function simplifyTo(maxError: number) {
+	tolerance = maxError;
+	if (asking || !model)
+		return;
+	asking = true;
+	showInfo();
+	const asked = model;
+	(maxError ? RPC<MeshData[]>({command: 'simplify', maxError}) : Promise.resolve(model.meshes))
+		.then(meshes => {
+			// a file read again since has replaced what this was made from
+			if (model === asked) {
+				setMeshes(meshes);
+				draw();
+			}
+		})
+		.catch(error => {
+			if (model === asked) {
+				errorBox.textContent = `simplify: ${error?.message ?? error}`;
+				errorBox.classList.remove('hidden');
+			}
+		})
+		.finally(() => {
+			asking = false;
+			showInfo();
+			if (tolerance !== maxError)
+				simplifyTo(tolerance);
+		});
+}
+
+// 1, 2 or 5 times a power of ten, the least not below x
+function niceUp(x: number) {
+	const p = 10 ** Math.floor(Math.log10(x));
+	return [1, 2, 5, 10].map(m => m * p).find(v => v >= x * (1 - 1e-9))!;
+}
+
+// The tolerance, on a slider that is logarithmic across three powers of ten up to a hundredth of the model's diagonal
+// (from hardly changed to a few dozen triangles), with none at its start. What the slider holds is the place along it.
+function simplifyItem(): CascadeItem {
+	const DECADES	= 3;
+	const top		= niceUp(2 * size() / 100);
+	const toleranceAt	= (s: number) => s > 0 ? top * 10 ** (DECADES * (s - 1)) : 0;
+	const placeOf		= (t: number) => t > 0 ? 1 + Math.log10(t / top) / DECADES : 0;
+	const format		= (t: number) => t ? `${+t.toPrecision(2)}${model?.unit ? ` ${model.unit}` : ''}` : 'off';
+	return {
+		...sliderItem({
+			label:		'tol',
+			caption:	'Simplify, staying within',
+			get:		() => placeOf(tolerance),
+			set:		s => simplifyTo(toleranceAt(s)),
+			min:		0,
+			max:		1,
+			// a notch is a quarter more or less, and the last below the slider's start is none
+			step:		(s, steps) => {
+				const next = s + steps / 30;
+				return next < 1 / 60 ? 0 : next;
+			},
+			markers:	[0, 1 / 3, 2 / 3, 1],
+			resolution:	1 / 300,
+			format:		s => format(toleranceAt(s)),
+		}),
+		id:			'simplify',
+		face:		() => tolerance ? valueFace('tol', `${+tolerance.toPrecision(2)}`) : svgFace(icons.simplify),
+	};
+}
+
 const menu = new Cascade($('main'), (): CascadeItem[] => [
-	choiceItem('Display', [
-		{value: 'solid' as const,	face: svgFace(icons.solid),	caption: 'Solid'},
-		{value: 'edges' as const,	face: svgFace(icons.edges),	caption: 'Solid with edges'},
-		{value: 'wire' as const,	face: svgFace(icons.wire),	caption: 'Wireframe'},
-	], () => view.display, v => { view.display = v; render(); }),
-	choiceItem('Shading', [
-		{value: 'smooth' as const,	face: svgFace(icons.smooth),	caption: 'Smooth'},
-		{value: 'flat' as const,	face: svgFace(icons.flat),		caption: 'Flat'},
-		{value: 'unlit' as const,	face: svgFace(icons.unlit),		caption: 'Unlit'},
-	], () => view.shading, v => { view.shading = v; render(); }),
-	toggleItem('File colours and textures', svgFace(icons.colours), () => view.colours, v => { view.colours = v; render(); }),
-	toggleItem('File lines', svgFace(icons.lines), () => view.lines, v => { view.lines = v; render(); }),
-	choiceItem('Back faces', [
-		{value: 'tint' as const,	face: svgFace(icons.tint),	caption: 'Tinted'},
-		{value: 'plain' as const,	face: svgFace(icons.plain),	caption: 'As front faces'},
-		{value: 'hide' as const,	face: svgFace(icons.hide),	caption: 'Hidden'},
-	], () => view.backs, v => { view.backs = v; render(); }),
-	toggleItem('Floor', svgFace(icons.floor), () => floorOn, v => { floorOn = v; render(); }),
-	choiceItem('Up axis', [
-		{value: 'z' as const,	face: svgFace(icons.up) + '<small>Z</small>',	caption: 'Z up'},
-		{value: 'y' as const,	face: svgFace(icons.up) + '<small>Y</small>',	caption: 'Y up'},
-	], () => up, setUp),
 	{
-		face:		() => svgFace(icons.fit),
-		caption:	() => 'Fit to window',
-		select:		() => { home(); render(); },
+		id:			'view',
+		face:		() => svgFace(commonIcons.view),
+		caption:	() => 'View',
+		children:	() => [
+			choiceItem('Display', [
+				{value: 'solid' as const,	face: svgFace(icons.solid),	caption: 'Solid'},
+				{value: 'edges' as const,	face: svgFace(icons.edges),	caption: 'Solid with edges'},
+				{value: 'wire' as const,	face: svgFace(icons.wire),	caption: 'Wireframe'},
+			], () => view.display, v => { view.display = v; render(); }),
+			choiceItem('Shading', [
+				{value: 'smooth' as const,	face: svgFace(icons.smooth),	caption: 'Smooth'},
+				{value: 'flat' as const,	face: svgFace(icons.flat),		caption: 'Flat'},
+				{value: 'unlit' as const,	face: svgFace(icons.unlit),		caption: 'Unlit'},
+			], () => view.shading, v => { view.shading = v; render(); }),
+			toggleItem('File colours and textures', svgFace(icons.colours), () => view.colours, v => { view.colours = v; render(); }),
+			toggleItem('File lines', svgFace(icons.lines), () => view.lines, v => { view.lines = v; render(); }),
+			choiceItem('Back faces', [
+				{value: 'tint' as const,	face: svgFace(icons.tint),	caption: 'Tinted'},
+				{value: 'plain' as const,	face: svgFace(icons.plain),	caption: 'As front faces'},
+				{value: 'hide' as const,	face: svgFace(icons.hide),	caption: 'Hidden'},
+			], () => view.backs, v => { view.backs = v; render(); }),
+			toggleItem('Floor', svgFace(icons.floor), () => floorOn, v => { floorOn = v; render(); }),
+			choiceItem('Up axis', [
+				{value: 'z' as const,	face: svgFace(icons.up) + '<small>Z</small>',	caption: 'Z up'},
+				{value: 'y' as const,	face: svgFace(icons.up) + '<small>Y</small>',	caption: 'Y up'},
+			], () => up, setUp),
+			{
+				face:		() => svgFace(icons.fit),
+				caption:	() => 'Fit to window',
+				select:		() => { home(); render(); },
+			},
+		]
 	},
+	simplifyItem(),
 ]);
 
 function setUp(value: 'y' | 'z') {
@@ -439,8 +522,10 @@ window.addEventListener('keydown', event => {
 });
 
 function showInfo() {
+	const triangles	= gpuMeshes.reduce((n, m) => n + m.data.faces.length / 3, 0);
+	const simplified = asking ? ' · simplifying…' : tolerance ? ` · simplified to ${triangles.toLocaleString()} triangles` : '';
 	if (model)
-		infoBox.textContent = `${model.info} · ${up} up${model.warnings.length ? ` — ${model.warnings.join('; ')}` : ''}`;
+		infoBox.textContent = `${model.info}${simplified} · ${up} up${model.warnings.length ? ` — ${model.warnings.join('; ')}` : ''}`;
 }
 
 //--- messages ----------------------------------------------------------------
@@ -448,30 +533,28 @@ function showInfo() {
 function fixFloat3({x, y, z}: float3) { return float3(x, y, z); }
 function fixFloat3x4({x, y, z, w}: float3x4) { return float3x4(fixFloat3(x), fixFloat3(y), fixFloat3(z), fixFloat3(w)); }
 
-function setModel(m: Model) {
-	const first = !model;
+// what is drawn of each of the model's meshes: the file's own, or simplified
+function setMeshes(meshes: MeshData[]) {
+	for (const m of gpuMeshes) {
+		gl.deleteVertexArray(m.vao);
+		if (m.lines)
+			gl.deleteVertexArray(m.lines.vao);
+	}
+	gpuMeshes = meshes.map(makeGpuMesh);
+	measure();
+}
 
+function setModel(m: RenderData) {
 	for (const i of m.instances) {
 		i.transform = fixFloat3x4(i.transform);
 	}
 
-	model	= m;
-	up		= m.up;
-	
-	for (const m of gpuMeshes)
-		gl.deleteVertexArray(m.vao);
-	gpuTextures.forEach(t => t && gl.deleteTexture(t));
-
-	gpuMeshes	= m.meshes.map(makeGpuMesh);
+	model		= m;
+	up			= m.up;
+	tolerance	= 0;
+	gpuTextures.forEach(t => t && canvas3d.deleteTexture(t));
 	gpuTextures	= m.textures.map(t => t && canvas3d.createTextureFromImage(t, {min: 'linear', mag: 'linear'}));
-
-	measure();
-	if (first)
-		home();
-	errorBox.classList.add('hidden');
-	hideTooltip();
-	showInfo();
-	draw();
+	setMeshes(m.meshes);
 }
 
 window.addEventListener('message', event => {
@@ -480,12 +563,24 @@ window.addEventListener('message', event => {
 	const message = event.data as MessageIn;
 	switch (message.command) {
 		case 'model':
-			if (program)
+			if (program) {
+				const first = !model;
 				setModel(message);
+				menu.refresh();
+				if (first)
+					home();
+				errorBox.classList.add('hidden');
+				hideTooltip();
+				showInfo();
+				draw();
+			}
 			break;
 		case 'error':
 			errorBox.textContent = message.message;
 			errorBox.classList.remove('hidden');
+			break;
+		case 'tolerance':
+			simplifyTo(message.maxError);
 			break;
 		case 'fitToWindow':
 			home();

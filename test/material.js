@@ -9,8 +9,8 @@
 // taken out of the shader the viewer actually ships, and glsl's own refract.
 const fs = require('fs');
 const { makeMap } = require('./glsl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { emitGlsl, materials } = require('../out/src/scad/sdf.js');
 const { float3, approx_equal } = require('@isopodlabs/maths/vector');
 

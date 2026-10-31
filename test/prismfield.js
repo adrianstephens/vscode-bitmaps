@@ -3,8 +3,8 @@
 // took a bite out of every quad side and every cap of more than three sides, and a point near the missing corner was
 // measured to the wrong place -- the field came out further than the real distance, and lit wrongly in the viewer. What
 // is checked is that the field is never further than the true distance to the prism, and has the right sign.
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const evalSdf = (s, p) => new SDF(s).eval(p);
 const { float3 } = require('@isopodlabs/maths/vector');

@@ -4,12 +4,12 @@ import * as fs from 'fs';
 
 import { BitmapViewerProvider } from './BitmapViewer';
 import { GgufViewerProvider } from './GgufViewer';
-import { ScadViewerProvider, exportStl, exportCsg } from './ScadViewer';
+import { ScadViewerProvider, exportMesh, exportCsg } from './ScadViewer';
 import { MeshViewerProvider } from './MeshViewer';
 import { FontViewerProvider } from './FontViewer';
 import { SvgViewerProvider } from './SvgViewer';
 import { SCHEME, embedded } from './embedded';
-import type { MessageIn, EditOp, LayerOp } from '../webview/bitmap';
+import type { MessageIn } from '../webview/bitmap';
 import type { GlyphAtlas } from '../webview/sdf';
 import { findFont, glyphContours } from './fonts';
 import { FileReader } from './filereader';
@@ -127,7 +127,7 @@ export async function readShader(assetPath: vscode.Uri) {
 
 
 const editViewer = () => activeViewer as {postMessage(message: MessageIn): unknown} | undefined;
-const editOps: (EditOp | LayerOp)[]	= ['fill', 'clear', 'invert', 'flipHorizontal', 'flipVertical', 'rotateClockwise', 'rotateAnticlockwise', 'crop', 'selectAll', 'deselect', 'newLayer', 'deleteLayer', 'raiseLayer', 'lowerLayer'];
+const editOps	= ['fill', 'clear', 'invert', 'flipHorizontal', 'flipVertical', 'rotateClockwise', 'rotateAnticlockwise', 'crop', 'selectAll', 'deselect', 'newLayer', 'deleteLayer', 'raiseLayer', 'lowerLayer'];
 
 export function activate(context: vscode.ExtensionContext) {
 	new BitmapViewerProvider(context);
@@ -139,21 +139,17 @@ export function activate(context: vscode.ExtensionContext) {
 	new SvgViewerProvider(context);
 
 	context.subscriptions.push(
-		vscode.commands.registerCommand('scad.exportStl', (uri?: vscode.Uri) => {
+		vscode.commands.registerCommand('scad.openMesh', (uri?: vscode.Uri) => {
 			if (!uri) {
 				const tab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
 				uri = tab instanceof vscode.TabInputCustom || tab instanceof vscode.TabInputText
 					? tab.uri : vscode.window.activeTextEditor?.document.uri;
 			}
 			if (!uri || !uri.fsPath.endsWith('.scad')) {
-				vscode.window.showErrorMessage('Export STL: open a .scad file first.');
+				vscode.window.showErrorMessage('Mesh: open a .scad file first.');
 				return;
 			}
-
-			exportStl(uri,
-				vscode.Uri.file(uri.fsPath.substring(0, uri.fsPath.length - 5) + '.stl'),
-				path.basename(uri.fsPath)
-			);
+			exportMesh(uri);
 		}),
 		vscode.commands.registerCommand('scad.exportCsg', (uri?: vscode.Uri) => {
 			if (!uri) {

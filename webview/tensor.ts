@@ -34,7 +34,7 @@ export type TensorOut =
 
 export type TensorIn =
 	| {command: 'tensorSelected', index: number}
-	| {command: 'volume', values: Float32Array, dims: V3, extent: V3, scale: number, info: string}	// a matrix or stack of slices; dims: voxels per axis, extent: elements they were reduced from, scale: the magnitude with the full colour
+	| {command: 'volume', values: Float32Array<ArrayBuffer>, dims: V3, extent: V3, scale: number, info: string}	// a matrix or stack of slices; dims: voxels per axis, extent: elements they were reduced from, scale: the magnitude with the full colour
 	| {command: 'tensorReduce', token: number, dims: V3, extent: V3, info: string, bandRows: number, quant?: Quant}	// a matrix or stack whose reduction the viewer does; bandRows is the most source rows of a slice one band holds; quant is the band's format when the viewer expands it on the GPU, else the bands are f32
 	| {command: 'stepSlice', delta: number}
 	| {command: 'fitToWindow'}
@@ -111,7 +111,7 @@ function draw() {
 
 	gizmo.show(false);
 	if (mode === 'stack' && volume) {
-		canvas3d.bindTexture(gl.TEXTURE_3D, volumeTex);
+		canvas3d.bindTexture3D(volumeTex);
 		const common = {u_volume: 0, u_dims: volume.dims, u_range: volume.scale};
 		const flatUniforms = {...common, u_viewport: viewport, u_scale: scale, u_offset: [offset.x, offset.y]};
 
@@ -289,8 +289,8 @@ function setVolume(message: Extract<TensorIn, {command: 'volume'}>) {
 	applyVolume(message.values, message.dims, message.extent, message.scale, message.info);
 }
 
-function applyVolume(values: Float32Array, dims: V3, extent: V3, scale: number, info: string) {
-	applyVolumeTexture(canvas3d.create3DTexture(dims, values, {format: 'r32f', min: 'nearest'}), values, dims, extent, scale, info);
+function applyVolume(values: Float32Array<ArrayBuffer>, dims: V3, extent: V3, scale: number, info: string) {
+	applyVolumeTexture(canvas3d.createTexture(dims[0], dims[1], values, {format: 'r32f', min: 'nearest', type: 'volume', depth: dims[2]}), values, dims, extent, scale, info);
 }
 
 // Shows a volume as the given texture, which it takes over; the values are only for the tooltips and the colour scale and
@@ -441,7 +441,7 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 					const bytes = band.data as Uint8Array;
 					const bandHeight = Math.ceil(bytes.length / rawWidth);
 					padded!.set(bytes);
-					gl.bindTexture(gl.TEXTURE_2D, raw!);
+					canvas3d.bindTexture2D(raw!);
 					gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, rawWidth, bandHeight, gl.RED_INTEGER, gl.UNSIGNED_BYTE, padded!.subarray(0, rawWidth * bandHeight));
 				} else if ((band.data as Float32Array).length !== rows * W) {
 					throw new Error(`The extension sent ${(band.data as Float32Array).length} of ${rows * W} values for a band of the tensor`);
@@ -461,8 +461,7 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 						// subtracts firstBlock * block, and firstBlock (from readRaw) is the band's block in the whole tensor.
 						gl.bindFramebuffer(gl.FRAMEBUFFER, staging.framebuffer);
 						gl.viewport(0, 0, cw, rows);
-						gl.activeTexture(gl.TEXTURE0);
-						gl.bindTexture(gl.TEXTURE_2D, raw!);
+						canvas3d.bindTexture2D(raw!);
 						programs.dequant!.draw({
 							u_raw:		0,
 							u_rawWidth:	rawWidth,
@@ -474,7 +473,7 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 							u_origin:	[cx0, slice * H + ry0],
 						});
 					} else {
-						gl.bindTexture(gl.TEXTURE_3D, staging.texture);
+						canvas3d.bindTexture3D(staging.texture);
 						gl.pixelStorei(gl.UNPACK_ROW_LENGTH, W);			// take the group's columns from the band, without copying them
 						gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, cx0);
 						gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, cw, rows, 1, gl.RED, gl.FLOAT, band.data as Float32Array);
@@ -487,7 +486,7 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 					// row would give, since the band holds exactly the rows their footprints close over.
 					gl.bindFramebuffer(gl.FRAMEBUFFER, offscreen.framebuffer);	// draw() may have claimed it for the canvas
 					gl.viewport(ox0, oy0, ox1 - ox0, oy1 - oy0);
-					canvas3d.bindTexture(gl.TEXTURE_3D, staging.texture, 0);
+					canvas3d.bindTexture3D(staging.texture, 0);
 					programs.tensorscale!.draw({
 						u_volume:	0,
 						u_dims:		[cw, rows, 1],

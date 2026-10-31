@@ -4,30 +4,66 @@
 // out of the one before. An icon may answer the wheel (to change a value it shows) as well as a click; one that does nothing
 // when clicked passes the click back to the icon it came out of, so clicking a tool's option chooses the tool. A value with a
 // strip of presets can also be dragged: the left button held on it or on a preset, the pointer's place along the strip is the
-// value.
+// value. An icon with `drag` can be picked up and moved to another place in its strip (opt-in, per icon): it stays under the
+// pointer along the strip while the others slide aside to make room.
+// The icons of the strip under the pointer grow as it passes along them, as the Mac's dock's do (by --cascade-magnify, from the
+// bitmaps.cascadeMagnify setting). The first strip grows both ways about the pointer, so the icon under it stays under it; the
+// others stay against the icon they came out of and stretch away from it, and follow that icon as it moves.
 // It knows nothing of what its items do; an editor describes them as CascadeItems. Styles are in assets/cascade.css.
 
 import { createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
+import { type RGB, toHex, fromHex, sameColour } from './colour.js';
+
+export interface CascadeDrag {
+	begin():			void,
+	to(place: number):	void,
+	drop():				void
+};
 
 export interface CascadeItem {
-	id?:			string;				// the icon's data-id, for finding it from outside
-	face():			string;				// the inside of the icon, as HTML: see svgFace, valueFace, swatchFace
-	caption():		string;				// shown beside the icon while the pointer is on it
-	children?():	CascadeItem[];		// the strip that comes out of this icon
-	active?():		boolean;			// marked, as the current tool or the chosen option is
-	select?():		boolean | void;		// a click on it, or the right button let go on it: true keeps the menu open
-	click?():		boolean | void;	// a click on this icon itself (not on one of its strip's that has no `select`): true if it took the click, which closes the menu
-	wheel?(steps: number): number;		// the wheel turned over it, with up positive; returns how much of steps was used
-	gauge?():		number;				// where a value falls along the strip that comes out of this icon, drawn as a bar through
-										// it: in icons, 0 the middle of the first, 1.5 halfway from the second to the third
-	scrub?(position: number): void;		// the pointer dragged to a place along that strip, in the same terms as gauge
-	// The icon dragged to another place in its strip, among those that can be: it is told at the start, and where it is to
-	// be (a place in the strip) as it is dragged, and at the end. The strip's icons are reordered as it goes.
-	hover?(on: boolean): void;			// the pointer has come to rest on this icon, or gone from it to another
-	drag?:			{begin(): void, to(place: number): void, drop(): void};
+	id?:				string;				// the icon's data-id, for finding it from outside
+	face():				string;				// the inside of the icon, as HTML: see svgFace, valueFace, swatchFace
+	caption():			string;				// shown beside the icon while the pointer is on it
+	children?():		CascadeItem[];		// the strip that comes out of this icon
+	active?():			boolean;			// marked, as the current tool or the chosen option is
+	select?():			boolean | void;		// a click on it, or the right button let go on it: true keeps the menu open
+	click?():			boolean | void;		// a click on this icon itself (not on one of its strip's that has no `select`): true if it took the click, which closes the menu
+	wheel?(steps: number): number;			// the wheel turned over it, with up positive; returns how much of steps was used
+	gauge?():			number;				// where a value falls along the strip that comes out of this icon, drawn as a bar through
+											// it: in icons, 0 the middle of the first, 1.5 halfway from the second to the third
+	scrub?(position: number): void;			// the pointer dragged to a place along that strip, in the same terms as gauge
+	// Having this makes the icon draggable to another place in its strip, among the icons that have it: it is told at the
+	// start, and where it is to be (a place in the strip) as it is dragged, and at the end. The strip's icons are
+	// reordered as it goes.
+	hover?(on: boolean): void;				// the pointer has come to rest on this icon, or gone from it to another
+	track?:				number;				// a button this many pixels long along its strip, standing for the whole range of its owner's scrub (see sliderItem): a press on it sets the value there
+	drag?:			CascadeDrag;
+}
+
+/** Items from different places made one list: of those with the same id, the later ones' strips come after the first's in its, and it
+ *  stands where the last was (so each place can have its View item, and the page has one). Of two without strips the first is kept. */
+export function mergeItems(items: CascadeItem[]): CascadeItem[] {
+	const out: CascadeItem[] = [];
+	for (const item of items) {
+		const i = item.id === undefined ? -1 : out.findIndex(o => o.id === item.id);
+		if (i < 0) {
+			out.push(item);
+			continue;
+		}
+		const [first] = out.splice(i, 1);
+		const a = first.children, b = item.children;
+		out.push(a && b ? {...first, children: () => mergeItems([...a.call(first), ...b.call(item)])} : first);
+	}
+	return out;
 }
 
 // faces
+
+export const icons = {
+	view:		'<path d="M1 8 C4 3 12 3 15 8 C12 13 4 13 1 8Z"/><circle cx="8" cy="8" r="2"/>',
+	grid:		'<path d="M2 2H14V14H2ZM6 2V14M10 2V14M2 6H14M2 10H14"/>',
+};
+
 export const svgFace = (body: string) =>
 	`<svg viewBox="0 0 16 16" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">${body}</svg>`;
 
@@ -38,18 +74,28 @@ export const swatchFace = (colour: string, second?: string) => second
 	? `<span class="cascade-swatch2"><span style="background:${second}"></span><span style="background:${colour}"></span></span>`
 	: `<span class="cascade-swatch" style="background:${colour}"></span>`;
 
+export function opItem(icon: string, caption: string, run: () => void, id?: string): CascadeItem {
+	return {
+		id,
+		face:		() => svgFace(icon),
+		caption:	() => caption,
+		select:		() => { run(); },
+	};
+}
+
 // a number that the wheel changes, and that a strip of presets can set
 export interface ValueOptions {
-	label:		string;					// short, to fit on the icon
-	caption:	string;
-	get():		number;
+	id?:			string;				// the icon's data-id, for finding it from outside
+	label:			string;				// short, to fit on the icon
+	caption:		string;
+	get():			number;
 	set(v: number): void;
-	min:		number;
-	max:		number;
-	step?:		(value: number, steps: number) => number;	// the value after turning the wheel; by default up or down by one
-	presets?:	number[];				// increasing
-	resolution?: number;				// what a value dragged along the presets is rounded to; by default 1
-	format?:	(value: number) => string;
+	min:			number;
+	max:			number;
+	step?(value: number, steps: number): number;	// the value after turning the wheel; by default up or down by one
+	presets?:		number[];				// increasing
+	resolution?:	number;				// what a value dragged along the presets is rounded to; by default 1
+	format?(value: number): string;
 }
 
 export function valueItem(o: ValueOptions): CascadeItem {
@@ -81,6 +127,37 @@ export function valueItem(o: ValueOptions): CascadeItem {
 			active:		() => o.get() === v,
 			select:		() => { o.set(v); return true; },
 		}))),
+	};
+}
+
+export interface SliderOptions extends Omit<ValueOptions, 'presets'> {
+	length?:	number;					// of the slider, in pixels; by default 160
+	markers?:	number[] | number;		// values to mark with a tick along the bar
+}
+
+// a value like valueItem's, but whose strip is one bar and not a row of presets: the pointer's place along it is the value, linearly
+// from min to max (the same wheel, and a drag as well as a press)
+export function sliderItem(o: SliderOptions): CascadeItem {
+	const format = o.format ?? (v => String(Math.round(v)));
+	const item = valueItem(o);
+	const resolution = o.resolution;
+	const quant: (v: number) => number = resolution === undefined ? v => Math.round(v) : resolution === 0 ? v => v : v => Math.round(v / resolution) * resolution;
+	const clamp		= (v: number) => Math.min(o.max, Math.max(o.min, v));
+	const markers	= Array.isArray(o.markers) ? o.markers : o.markers ? Array.from({length: o.markers }, (_, i) => i * (o.max - o.min) / (o.markers as number - 1) + o.min) : [];
+	const marks		= markers.map(v => `<span class="cascade-mark" style="--at:${(v - o.min) / (o.max - o.min) * 100}%"><small>${format(v)}</small></span>`).join('');
+	
+	return {
+		...item,
+		caption:	() => `${o.caption} ${format(o.get())} (scroll or drag)`,
+		// one button, so its position is -0.5 at its start and 0.5 at its end
+		gauge:		() => (clamp(o.get()) - o.min) / (o.max - o.min) - 0.5,
+		scrub:		p => o.set(clamp(quant(o.min + (p + 0.5) * (o.max - o.min)))),
+		children:	() => [{
+			id:			'slider',
+			track:		o.length ?? 160,
+			face:		() => marks,
+			caption:	() => `${o.caption} ${format(o.get())}`,
+		}],
 	};
 }
 
@@ -149,16 +226,53 @@ export function toggleItem(caption: string, face: string, get: () => boolean, se
 	};
 }
 
+export const COLOURS = ['#000000', '#ffffff', '#808080', '#e53935', '#fb8c00', '#fdd835', '#43a047', '#1e88e5', '#8e24aa'].map(fromHex);
+
+/** A red, a green and a blue for a colour (#rrggbb) that `put` takes, with swatches to choose from before them, under a custom colour
+ *  (none, and they come first). `final` is false for a step of a value being turned or dragged (which the steps of are one edit,
+ *  see history.ts), and true for a swatch chosen. */
+export function colourItems(idp: string, get: () => RGB, put: (colour: RGB, final: boolean) => void, known = () => true, swatches: RGB[] = COLOURS): CascadeItem[] {
+	const channels: CascadeItem[] = (['r', 'g', 'b'] as const).map((channel, i) => ({
+		...sliderItem({
+			length:		128,
+			markers:	[0, 64, 128, 192, 255],
+/*		...valueItem({
+			presets:	[0, 64, 128, 192, 255],
+*/
+			label:		channel.toUpperCase(),
+			caption:	['Red', 'Green', 'Blue'][i],
+			get:		() => Math.round(get()[channel]),
+			set:		v => put({...get(), [channel]: Math.round(Math.min(255, Math.max(0, v)))}, false),
+			min:		0,
+			max:		255,
+			step:		(v, steps) => v + 4 * steps,
+		}),
+		id:			`${idp}-${channel}`,
+	}));
+	if (!swatches.length)
+		return channels;
+	return [
+		...swatches.map(c => ({id: `${idp}-${toHex(c).slice(1)}`, face: () => swatchFace(toHex(c)), caption: () => toHex(c), active: () => known() && sameColour(get(), c), select: () => { put(c, true); }})),
+		{id: `${idp}-custom`, face: () => swatchFace(toHex(get())), caption: () => `Custom colour ${toHex(get())}`, children: () => channels},
+	];
+}
+
 interface Strip {
 	element:	HTMLElement;
 	items:		CascadeItem[];
 	buttons:	HTMLElement[];
 	vertical:	boolean;
+	reverse:	boolean;		// turned back, so it runs left or up from the icon it came out of
+	length:		number;			// along it, as laid out
 	x:			number;			// where it is in the stage, which the buttons' places are measured from
 	y:			number;
 	open:		number;			// the button whose strip is out, or -1
 	owner?:		CascadeItem;	// the icon it came out of
+	base:		{cx: number, cy: number};	// the middle of that icon, as it was when this strip was placed beside it
 	gauge?:		HTMLElement;
+	reach:		number;			// how far either side of the pointer its icons are magnified (0 if they are not)
+	room:		number;			// how far it can stretch back past its start (the rest of the stretch pushes it on)
+	mag?:		{scale: number, shift: number}[];	// each button's magnification, and how far that moves it along the strip
 }
 
 const GAP = 3;				// between the icons of a strip, and between a strip and the icon it came out of
@@ -166,6 +280,11 @@ const WHEEL_STEP = 50;		// pixels of a smooth wheel (a trackpad) to a step
 const WHEEL_PAUSE = 250;		// ms without the wheel after which the next movement is a new gesture
 const RELEASE_DELAY = 300;	// the right button let go this long after the menu opened chooses the icon under it
 const DRAG_START = 4;		// pixels the pointer moves with the button down before it is a drag and not a click
+const MAGNIFY = 1.6;		// the most an icon grows under the pointer, without --cascade-magnify
+
+// the magnification around the pointer, as a fraction of the most, is a bump of (1 + cos(πt)) / 2 out to t = ±1 (the strip's reach):
+// how much of the bump's area is before t
+const bumpArea	= (t: number) => t <= -1 ? 0 : t >= 1 ? 1 : (t + 1) / 2 + Math.sin(Math.PI * t) / (2 * Math.PI);
 
 export class Cascade {
 	private root		= createElement('div', {className: 'cascade hidden'});
@@ -178,7 +297,9 @@ export class Cascade {
 	private drag?:		{strip: Strip, owner: CascadeItem, x: number, y: number, moved: boolean};
 	private lit?:		CascadeItem;	// the icon last rested on
 	private dragged		= false;	// the click that ends a drag is not a click
-	private reorder?:	{strip: Strip, item: CascadeItem, x: number, y: number, moved: boolean};	// an icon being dragged to another place in its strip
+	private reorder?:	{strip: Strip, item: CascadeItem, button: HTMLElement, x: number, y: number, grab: number, moved: boolean};	// an icon being dragged to another place in its strip
+	private magnify		= MAGNIFY;
+	private captioned?:	{level: number, index: number};	// the icon the caption is beside
 
 	constructor(private stage: HTMLElement, private items: () => CascadeItem[]) {
 		this.root.append(this.caption);
@@ -193,6 +314,7 @@ export class Cascade {
 				this.reorderTo(e);
 				return;
 			}
+			this.track(e);
 			const hit = this.hit(e);
 			if (hit)
 				this.hover(hit.level, hit.index);
@@ -205,8 +327,9 @@ export class Cascade {
 				return;
 			const item = this.strips[hit.level].items[hit.index];
 			if (item.drag) {
-				this.reorder = {strip: this.strips[hit.level], item, x: e.clientX, y: e.clientY, moved: false};
-				this.strips[hit.level].buttons[hit.index].setPointerCapture(e.pointerId);
+				const strip = this.strips[hit.level], button = strip.buttons[hit.index];
+				this.reorder = {strip, item, button, x: e.clientX, y: e.clientY, grab: this.along(strip, e) - this.start(strip, button), moved: false};
+				button.setPointerCapture(e.pointerId);
 				return;
 			}
 			const strip = item.scrub ? this.strips[hit.level + 1] : this.strips[hit.level];
@@ -214,6 +337,8 @@ export class Cascade {
 			if (owner?.scrub && (!item.scrub || owner === item)) {
 				this.drag = {strip, owner, x: e.clientX, y: e.clientY, moved: false};
 				this.strips[hit.level].buttons[hit.index].setPointerCapture(e.pointerId);
+				if (item.track)
+					this.dragTo(e, true);
 			}
 		});
 		window.addEventListener('pointerdown', e => {
@@ -226,7 +351,7 @@ export class Cascade {
 				this.reorder = undefined;
 				this.dragged = r.moved;
 				if (r.moved) {
-					r.strip.buttons.forEach(b => b.classList.remove('dragging'));
+					this.settle(r.button);
 					r.item.drag!.drop();
 					this.refresh();
 				}
@@ -290,21 +415,28 @@ export class Cascade {
 	}
 
 	// the first strip, running down from a point on the screen
-	open(clientX: number, clientY: number, items = this.items()) {
+	open(x: number, y: number, items = this.items()) {
 		this.closeFrom(0, false);
 		this.root.classList.remove('hidden');
 		this.openedAt = performance.now();
 		const stage = this.stage.getBoundingClientRect();
-		const x = clientX - stage.left, y = clientY - stage.top;
-		this.addStrip(items, true, {x: x - 16, y, w: 32, h: 0, cx: x, cy: y});
+		x -= stage.left, y -= stage.top;
+		const style = getComputedStyle(this.root);
+		const size = parseFloat(style.getPropertyValue('--cascade-size')) || 32;
+		this.magnify = Math.max(1, parseFloat(style.getPropertyValue('--cascade-magnify')) || MAGNIFY);
+		this.addStrip(items, true, {x: x - size / 2, y, w: size, h: 0, cx: x, cy: y});
 	}
 
 	close() {
 		if (!this.isOpen)
 			return;
 		this.drag = undefined;
+		if (this.reorder?.moved)
+			this.settle(this.reorder.button, false);
+		this.reorder = undefined;
 		this.light(undefined);
 		this.closeFrom(0, false);
+		this.captioned = undefined;
 		this.caption.classList.remove('shown');
 		this.root.classList.add('hidden');
 	}
@@ -346,11 +478,17 @@ export class Cascade {
 	private addStrip(items: CascadeItem[], vertical: boolean, from: {x: number, y: number, w: number, h: number, cx: number, cy: number}, owner?: CascadeItem) {
 		const element = createElement('div', {className: 'cascade-strip'});
 		element.style.flexDirection = vertical ? 'column' : 'row';
+		element.classList.toggle('vertical', vertical);
+		element.classList.toggle('tape', items.some(i => i.track));		// (before it is first laid out, or its icons would start from their scaled down selves)
 		element.style.gap = `${GAP}px`;
 		const buttons = items.map((item, i) => {
 			const b = createElement('div', {className: 'cascade-button'});
 			if (item.id)
 				b.dataset.id = item.id;
+			if (item.track) {
+				b.classList.add('track');
+				b.style[vertical ? 'height' : 'width'] = `${item.track}px`;
+			}
 			b.style.setProperty('--i', String(i));
 			this.paint(b, item, false);
 			return b;
@@ -360,34 +498,53 @@ export class Cascade {
 
 		const w = element.offsetWidth, h = element.offsetHeight;
 		const W = this.stage.clientWidth, H = this.stage.clientHeight;
-		let x: number, y: number;
+		// room for its icons to be magnified: it stretches by up to grow away from where it came out, and bulges by up to bulge either side
+		// (it goes the other way if that is short of room for its stretch and the other has more, but is only moved across for its bulge)
+		const tape	= element.classList.contains('tape');
+		const reach	= this.magnify > 1 && !tape ? 2 * ((vertical ? buttons[0].offsetHeight : buttons[0].offsetWidth) + GAP) : 0;
+		const grow	= (this.magnify - 1) * reach, bulge = reach && (this.magnify - 1) * (vertical ? buttons[0].offsetWidth : buttons[0].offsetHeight) / 2;
+		let x: number, y: number, reverse = false;
 		if (vertical) {
 			x = from.x + (from.w - buttons[0].offsetWidth) / 2;
 			y = from.y + from.h + GAP;
-			if (y + h > H && from.y - GAP - h >= 0) {
+			if (H - y - h < grow && from.y - GAP - h > H - y - h) {
 				// upwards, the first icon still next to where it came from
 				y = from.y - GAP - h;
 				element.style.flexDirection = 'column-reverse';
+				reverse = true;
 			}
 		} else {
 			x = from.x + from.w + GAP;
 			y = from.y;
-			if (x + w > W && from.x - GAP - w >= 0) {
+			if (W - x - w < grow && from.x - GAP - w > W - x - w) {
 				x = from.x - GAP - w;
 				element.style.flexDirection = 'row-reverse';
+				reverse = true;
 			}
 		}
-		x = Math.max(0, Math.min(x, W - w));
-		y = Math.max(0, Math.min(y, H - h));
+		const [bx, by] = vertical ? [bulge, 0] : [0, bulge];
+		x = Math.max(bx, Math.min(x, W - w - bx));
+		y = Math.max(by, Math.min(y, H - h - by));
 		element.style.left	= `${x}px`;
 		element.style.top	= `${y}px`;
+
+		// a slider's bar comes out of its owner like a tape measure's tape: slid along from behind the owner's edge, cut off there
+		if (tape) {
+			const near = `-${GAP}px`, far = '-100vmax';		// (the far sides open, for the shadow and the ticks' numbers)
+			element.style.setProperty(vertical ? '--ty' : '--tx', `${(reverse ? 1 : -1) * ((vertical ? h : w) + GAP)}px`);
+			element.style.clipPath = `inset(${(vertical
+				? reverse ? [far, far, near, far] : [near, far, far, far]
+				: reverse ? [far, near, far, far] : [far, far, far, near]
+			).join(' ')})`;
+		}
 
 		// each icon comes out from the one it belongs to
 		for (const b of buttons) {
 			b.style.setProperty('--dx', `${from.cx - (x + b.offsetLeft + b.offsetWidth / 2)}px`);
 			b.style.setProperty('--dy', `${from.cy - (y + b.offsetTop + b.offsetHeight / 2)}px`);
 		}
-		const strip: Strip = {element, items, buttons, vertical, x, y, open: -1, owner};
+		const strip: Strip = {element, items, buttons, vertical, reverse, length: vertical ? h : w, x, y, open: -1, owner, base: {cx: from.cx, cy: from.cy}, reach,
+			room: owner ? 0 : vertical ? (reverse ? H - y - h : y) : (reverse ? W - x - w : x)};
 		if (owner?.gauge) {
 			strip.gauge = createElement('div', {className: 'cascade-gauge', innerHTML: '<div></div>'});
 			strip.gauge.style.setProperty('--n', String(buttons.length));
@@ -432,6 +589,8 @@ export class Cascade {
 				s.element.remove();
 			}
 		}
+		if (this.captioned && this.captioned.level >= level)
+			this.captioned = undefined;
 		const parent = this.strips[level - 1];
 		if (parent && parent.open >= 0) {
 			parent.buttons[parent.open].classList.remove('open');
@@ -450,24 +609,25 @@ export class Cascade {
 		button.classList.add('open');
 		this.stepAccum = 0;
 
-		const r = this.place(s, index);
+		// (beside the icon as big as it can get, so it does not grow into its strip)
 		const children = item.children?.();
 		if (children?.length)
-			this.addStrip(children, !s.vertical, r, item);
-		this.showCaption(item, s.vertical, r);
+			this.addStrip(children, !s.vertical, this.place(s, index, true), item);
+		this.captioned = {level, index};
+		this.showCaption();
 	}
 
 	// the middles of a strip's icons along it, from the strip's start, and how far apart they are (negative in a turned back strip)
 	private centres(s: Strip) {
-		const centres = s.buttons.map(b => s.vertical ? b.offsetTop + b.offsetHeight / 2 : b.offsetLeft + b.offsetWidth / 2);
+		const centres = s.buttons.map((b, i) => (s.vertical ? b.offsetTop + b.offsetHeight / 2 : b.offsetLeft + b.offsetWidth / 2) + (s.mag?.[i].shift ?? 0));
 		const size = s.vertical ? s.buttons[0].offsetHeight : s.buttons[0].offsetWidth;
 		return {centres, spacing: centres.length > 1 ? centres[1] - centres[0] : size};
 	}
 
 	// the value of a drag, from the pointer's place along the strip of presets, in icons as gauge has it
-	private dragTo(e: PointerEvent) {
+	private dragTo(e: PointerEvent, now = false) {
 		const d = this.drag!;
-		if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < DRAG_START)
+		if (!now && !d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < DRAG_START)
 			return;
 		d.moved = true;
 		const stage	= this.stage.getBoundingClientRect();
@@ -486,35 +646,80 @@ export class Cascade {
 		this.caption.textContent = d.owner.caption();
 	}
 
-	// the icon dragged to where the pointer is among those of its strip which can be dragged, the others making way
+	// where the pointer is along a strip, from its start
+	private along(s: Strip, e: MouseEvent) {
+		const stage = this.stage.getBoundingClientRect();
+		return s.vertical ? e.clientY - stage.top - s.y : e.clientX - stage.left - s.x;
+	}
+
+	// where a button's layout puts it along its strip
+	private start(s: Strip, b: HTMLElement) {
+		return s.vertical ? b.offsetTop : b.offsetLeft;
+	}
+
+	// the icon dragged with the pointer along its strip, and the others making way for it by sliding to the places it leaves
 	private reorderTo(e: PointerEvent) {
-		const r = this.reorder!, s = r.strip;
+		const r = this.reorder!, s = r.strip, button = r.button;
 		if (!r.moved) {
 			if (Math.hypot(e.clientX - r.x, e.clientY - r.y) < DRAG_START)
 				return;
 			r.moved = true;
 			this.closeFrom(this.strips.indexOf(s) + 1, false);
-			s.buttons[s.items.indexOf(r.item)].classList.add('dragging');
+			// (all at their own size while it is, as the places they are dragged between are worked out from their layout)
+			s.mag = undefined;
+			this.magnified(this.strips.indexOf(s));
+			button.classList.add('dragging');
 			r.item.drag!.begin();
 		}
-		const stage	= this.stage.getBoundingClientRect();
-		const c		= s.vertical ? e.clientY - stage.top - s.y : e.clientX - stage.left - s.x;
+		const size	= s.vertical ? button.offsetHeight : button.offsetWidth;
 		const {centres} = this.centres(s);
+		const slots	= s.items.flatMap((item, i) => item.drag ? [i] : []);
+		const first	= Math.min(...slots.map(i => centres[i])) - size / 2, last = Math.max(...slots.map(i => centres[i])) - size / 2;
+		const at	= Math.max(first, Math.min(last, this.along(s, e) - r.grab));	// where the dragged icon starts along the strip
+
 		let to = -1;
-		s.items.forEach((item, i) => {
-			if (item.drag && (to < 0 || Math.abs(centres[i] - c) < Math.abs(centres[to] - c)))
+		for (const i of slots) {
+			if (to < 0 || Math.abs(centres[i] - (at + size / 2)) < Math.abs(centres[to] - (at + size / 2)))
 				to = i;
-		});
+		}
 		const from = s.items.indexOf(r.item);
-		if (to < 0 || to === from)
+		if (to >= 0 && to !== from) {
+			// the others slide from where they are seen to where they are now (an animation still running is taken from where it is)
+			const others = s.buttons.filter(b => b !== button);
+			const seen = others.map(b => b.getBoundingClientRect());
+			r.item.drag!.to(to);
+			const [item] = s.items.splice(from, 1), [b] = s.buttons.splice(from, 1);
+			s.items.splice(to, 0, item);
+			s.buttons.splice(to, 0, b);
+			s.element.append(...s.buttons);
+			s.open = -1;
+			this.refresh();
+			others.forEach((o, i) => {
+				o.getAnimations().forEach(a => a.cancel());
+				const now = o.getBoundingClientRect();
+				const dx = seen[i].left - now.left, dy = seen[i].top - now.top;
+				if (dx || dy)
+					o.animate([{transform: `translate(${dx}px, ${dy}px)`}, {transform: 'none'}], {duration: 140, easing: 'ease-out'});
+			});
+		}
+		const d = at - this.start(s, button);
+		button.style.transform = s.vertical ? `translate(0, ${d}px)` : `translate(${d}px, 0)`;
+	}
+
+	// the dragged icon let go: it slides from where the pointer left it into its place
+	private settle(button: HTMLElement, animate = true) {
+		const from = button.getBoundingClientRect();
+		button.classList.remove('dragging');
+		button.style.transform = '';
+		if (!animate)
 			return;
-		r.item.drag!.to(to);
-		const [item] = s.items.splice(from, 1), [button] = s.buttons.splice(from, 1);
-		s.items.splice(to, 0, item);
-		s.buttons.splice(to, 0, button);
-		s.element.append(...s.buttons);
-		s.open = -1;
-		this.refresh();
+		const to = button.getBoundingClientRect();
+		const dx = from.left - to.left, dy = from.top - to.top;
+		if (!dx && !dy)
+			return;
+		button.style.transition = 'none';		// (or the css transition would play against this)
+		const a = button.animate([{transform: `translate(${dx}px, ${dy}px)`}, {transform: 'none'}], {duration: 140, easing: 'ease-out'});
+		a.onfinish = a.oncancel = () => { button.style.transition = ''; };
 	}
 
 	// a click on an icon, or on the nearest one it came out of that does something
@@ -530,14 +735,24 @@ export class Cascade {
 			this.hover(level, index);
 			return;
 		}
-		if (item.select())
-			this.refresh();
-		else
+		if (!item.select()) {
 			this.close();
+			return;
+		}
+		// (an icon whose click brings its strip into being, or takes it away, as an effect switched on or off, shows or loses it now)
+		const own = this.strips[level], opened = this.strips.length > level + 1;
+		if (own.items[index] === item && own.open === index && opened !== !!item.children?.().length) {
+			own.open = -1;
+			this.hover(level, index);
+		}
+		this.refresh();
 	}
 
 	// beside the icon, on the side away from where its strip comes out, and moved on past any icons in the way
-	private showCaption(item: CascadeItem, vertical: boolean, r: {x: number, y: number, w: number, h: number}) {
+	private showCaption() {
+		if (!this.captioned)
+			return;
+		const {level, index} = this.captioned, s = this.strips[level], item = s.items[index], vertical = s.vertical, r = this.place(s, index);
 		const c = this.caption;
 		c.textContent = item.caption();
 		c.classList.add('shown');
@@ -562,11 +777,110 @@ export class Cascade {
 		c.style.top		= `${Math.max(0, Math.min(y, H - ch))}px`;
 	}
 
-	// an icon's rectangle in the stage, where it ends up (not where its animation has it now)
-	private place(s: Strip, index: number) {
-		const b = s.buttons[index];
-		const x = s.x + b.offsetLeft, y = s.y + b.offsetTop, w = b.offsetWidth, h = b.offsetHeight;
-		return {x, y, w, h, cx: x + w / 2, cy: y + h / 2};
+	// an icon's rectangle in the stage, where it ends up (not where its animation has it now), magnified as it is, or as much as it can be
+	private place(s: Strip, index: number, full = false) {
+		const b = s.buttons[index], m = s.mag?.[index];
+		const scale = full && s.reach ? this.magnify : m?.scale ?? 1, shift = m?.shift ?? 0;
+		const cx = s.x + b.offsetLeft + b.offsetWidth / 2 + (s.vertical ? 0 : shift), cy = s.y + b.offsetTop + b.offsetHeight / 2 + (s.vertical ? shift : 0);
+		const w = b.offsetWidth * scale, h = b.offsetHeight * scale;
+		return {x: cx - w / 2, y: cy - h / 2, w, h, cx, cy};
+	}
+
+	//-------------------------------------------------------------------------
+	// magnification: a strip's icons are stretched along it by a bump centred on the place in its layout that the stretching puts
+	// under the pointer (so the icon drawn under the pointer is the one under it in the layout): about that place as far back as the
+	// strip has room, and pushed on from its start beyond that
+
+	// the buttons' extents along a strip, from the end it came out at, as laid out
+	private extents(s: Strip) {
+		return s.buttons.map(b => {
+			const o = s.vertical ? b.offsetTop : b.offsetLeft, n = s.vertical ? b.offsetHeight : b.offsetWidth;
+			return s.reverse ? [s.length - o - n, s.length - o] : [o, o + n];
+		});
+	}
+
+	// each button's magnification and move along the strip, for the bump at a place in the layout
+	private stretch(s: Strip, at: number) {
+		const area	= (x: number) => (this.magnify - 1) * s.reach * bumpArea((x - at) / s.reach);
+		const back	= Math.min(s.room, area(at) - area(0));
+		const v		= (x: number) => x + area(x) - area(0) - back;
+		return this.extents(s).map(([a, b]) => {
+			const va = v(a), vb = v(b);
+			return {scale: (vb - va) / (b - a), shift: (va + vb - a - b) / 2 * (s.reverse ? -1 : 1)};
+		});
+	}
+
+	// the place in the layout that the stretching puts p along the strip: where v(at) = p, which only grows with at (and is p
+	// itself while the strip has room behind it)
+	private bumpFor(s: Strip, p: number) {
+		const extra = (this.magnify - 1) * s.reach;
+		let lo = Math.max(0, p - extra / 2), hi = Math.max(0, p);
+		for (let i = 0; i < 24; i++) {
+			const at = (lo + hi) / 2;
+			if (at + Math.max(0, extra * (0.5 - bumpArea(-at / s.reach)) - s.room) < p)
+				lo = at;
+			else
+				hi = at;
+		}
+		return (lo + hi) / 2;
+	}
+
+	// the strip under the pointer magnified about it (the deepest, for where they overlap)
+	private track(e: MouseEvent) {
+		if (!this.isOpen || this.magnify <= 1)
+			return;
+		const stage = this.stage.getBoundingClientRect();
+		const px = e.clientX - stage.left, py = e.clientY - stage.top;
+		for (let level = this.strips.length; level--;) {
+			const s = this.strips[level];
+			const along = s.vertical ? py - s.y : px - s.x, across = s.vertical ? px - s.x : py - s.y;
+			const p = s.reverse ? s.length - along : along;
+			if (!s.reach) {
+				if (p >= 0 && p < s.length && across >= 0 && across < (s.vertical ? s.element.offsetWidth : s.element.offsetHeight))
+					return;
+				continue;
+			}
+			if (p < -GAP)
+				continue;
+			const at = this.bumpFor(s, p);
+			const i = this.extents(s).findIndex(([a, b]) => at >= a - GAP && at < b);
+			if (i < 0)
+				continue;
+			const mag = this.stretch(s, at), b = s.buttons[i];
+			const [mid, size] = s.vertical ? [b.offsetLeft + b.offsetWidth / 2, b.offsetWidth] : [b.offsetTop + b.offsetHeight / 2, b.offsetHeight];
+			if (Math.abs(across - mid) > mag[i].scale * size / 2)
+				continue;
+			s.mag = mag;
+			this.magnified(level);
+			return;
+		}
+	}
+
+	// a strip's buttons drawn as magnified, with the strips that came out of it following the icon they came out of
+	private magnified(level: number) {
+		const s = this.strips[level];
+		s.buttons.forEach((b, i) => {
+			const {scale, shift} = s.mag?.[i] ?? {scale: 1, shift: 0};
+			b.style.scale		= scale === 1 ? '' : `${scale}`;
+			b.style.translate	= shift ? (s.vertical ? `0 ${shift}px` : `${shift}px 0`) : '';
+		});
+		this.placeGauge(s);
+		const next = this.strips[level + 1];
+		if (next && s.open >= 0) {
+			const r = this.place(s, s.open), dx = r.cx - next.base.cx, dy = r.cy - next.base.cy;
+			if (dx || dy) {
+				for (const n of this.strips.slice(level + 1)) {
+					n.x += dx;
+					n.y += dy;
+					n.base.cx += dx;
+					n.base.cy += dy;
+					n.element.style.left	= `${n.x}px`;
+					n.element.style.top		= `${n.y}px`;
+				}
+			}
+		}
+		if (this.captioned && this.captioned.level >= level)
+			this.showCaption();
 	}
 
 	// the icon under the pointer, by where the icons end up: one sliding out must not be taken for under it

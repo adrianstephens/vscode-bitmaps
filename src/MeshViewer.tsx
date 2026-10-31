@@ -5,9 +5,9 @@ import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
-import { Model, Mesh, Material, Attribute, placed, faceTriangles, formatOf } from '@isopodlabs/binary_meshes';
+import { Model, Mesh, Material, Attribute, placed, transform, faceTriangles, formatOf, STL, OBJ, PLY, GLB, GLTF, ThreeMF, smoothNormals, progressive, type Progression } from '@isopodlabs/binary_meshes';
 import { buildIndex } from './fonts';
-import type { MeshData, InstanceData, TextureData, MessageIn, MessageOut } from '../webview/mesh';
+import type { RenderData, MeshData, InstanceData, TextureData, MessageIn, MessageOut } from '../webview/mesh';
 
 import { setActiveViewer, readShader, digitAtlas } from './extension';
 import { webviewPage } from './BitmapViewer';
@@ -61,7 +61,8 @@ function meshData(mesh: Mesh, materials: Material[], textures: (TextureData | un
 	const n			= corners.length;
 	const positions	= new Float32Array(n * 3);
 	// a normal per face is what the page works out from the face itself; only one that varies across a face is sent
-	const smooth	= mesh.normals?.per === 'face' ? undefined : mesh.normals;
+	// (a file without normals gets them worked out, smooth except across sharp edges)
+	const smooth	= mesh.normals ? (mesh.normals.per === 'face' ? undefined : mesh.normals) : smoothNormals(mesh);
 	const normals	= smooth && new Float32Array(n * 3);
 	const colors	= new Uint8Array(n * 4);
 	const textured	= order.some(f => textureOf(f) >= 0);
@@ -110,7 +111,7 @@ async function decode(data: Uint8Array): Promise<TextureData> {
 }
 
 // the model as the page takes it; y up for the formats whose files are usually drawn so
-export async function renderData(model: Model, format: string): Promise<Extract<MessageIn, {command: 'model'}>> {
+export async function renderData(model: Model, format: string): Promise<RenderData> {
 	const warnings: string[] = [];
 	const textures = await Promise.all(model.textures.map(async (t, i) => {
 		if (!t.data) {
@@ -146,12 +147,11 @@ export async function renderData(model: Model, format: string): Promise<Extract<
 	const segments	= data.reduce((n, d) => n + d.lines.length / 6, 0);
 	const drawn		= instances.reduce((n, i) => n + data[i.mesh].faces.length / 3, 0);
 	return {
-		command:	'model',
 		meshes:		data,
 		instances,
 		textures,
 		unit:		model.unit ?? '',
-		up:			format === '.obj' || format === '.ply' ? 'y' : 'z',
+		up:			format === '.obj' || format === '.ply' || format === '.gltf' || format === '.glb' ? 'y' : 'z',
 		info:		[
 			format.slice(1).toUpperCase(),
 			`${data.length} mesh${data.length === 1 ? '' : 'es'}${instances.length !== data.length ? `, ${instances.length} placed` : ''}`,
@@ -164,15 +164,55 @@ export async function renderData(model: Model, format: string): Promise<Extract<
 	};
 }
 
+// Models made by the extension rather than read from a file (a .scad's mesh), waiting for their editor to take them: the
+// editor opens on an untitled document, so that Save As is what chooses the file and so the format
+const pending = new Map<string, {model: Model, scad: boolean}>();
+const viewers = new Map<string, MeshViewer>();
+
+export async function openModel(name: string, model: Model) {
+	const uri = vscode.Uri.from({scheme: 'untitled', path: name}), key = uri.toString();
+	pending.set(key, {model, scad: true});
+	// already open from an earlier run: it shows the new one
+	await viewers.get(key)?.reload();
+	await vscode.commands.executeCommand('vscode.openWith', uri, 'mesh.viewer', {viewColumn: vscode.ViewColumn.Beside, preview: false});
+}
+
+// the meshes placed, as one: their points where they are placed, and the materials of their faces
+function combine(parts: Mesh[]): Mesh {
+	const points: Mesh['points'] = [], faces: number[][] = [], faceMaterials: number[] = [];
+	// (pushed one at a time: a spread of a large mesh's points is more arguments than the stack holds)
+	for (const m of parts) {
+		const base = points.length;
+		for (const p of m.points)
+			points.push(p);
+		m.faces.forEach((f, i) => {
+			faces.push(base ? f.map(v => v + base) : f);
+			faceMaterials.push(m.faceMaterials?.[i] ?? -1);
+		});
+	}
+	return faceMaterials.some(m => m >= 0) ? {points, faces, faceMaterials} : {points, faces};
+}
+
 class MeshDocument implements vscode.CustomDocument {
+	// how far the meshes may stray from the file's; 0 is the file as it is. Changing it is what makes the document unsaved.
+	tolerance = 0;
+	announced = false;
+	// not read from a file: there is no file until it is saved
+	get untitled() { return this.uri.scheme === 'untitled'; }
 	constructor(public readonly uri: vscode.Uri) {}
 	dispose() {}
 }
 
 class MeshViewer extends webview.Panel<MessageOut, MessageIn> {
 	private watch: vscode.FileSystemWatcher;
+	private model?: Model;
+	// each mesh's collapses, found on the first simplify and kept until the file is read again, so a tolerance is a replay
+	private progressions?: Promise<Progression[]>;
 
-	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, public document: MeshDocument) {
+	// set while this writes the file, so that the watcher does not read back what was just written
+	private writing = false;
+
+	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, public document: MeshDocument, private changed: (label: string, undo: () => void, redo: () => void) => void) {
 		super(webviewPanel, assets);
 		webviewPanel.webview.options = {enableScripts: true, localResourceRoots: assets.localRoots()};
 		webviewPanel.webview.html = webviewPage(webviewPanel, assets, name => this.webviewUri(name), 'out/webview/mesh.js', `Mesh · ${path.basename(document.uri.fsPath)}`, [
@@ -185,32 +225,101 @@ class MeshViewer extends webview.Panel<MessageOut, MessageIn> {
 		], 'tensors', ['assets/scad.css']);
 
 		const file = document.uri.fsPath;
-		this.watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
-		this.watch.onDidChange(() => this.load());
-		this.watch.onDidCreate(() => this.load());
+		// (nothing to watch for what is not in a file yet)
+		this.watch = vscode.workspace.createFileSystemWatcher(document.untitled ? '**/.mesh-untitled' : new vscode.RelativePattern(path.dirname(file), path.basename(file)));
+		this.watch.onDidChange(() => !this.writing && this.load());
+		this.watch.onDidCreate(() => !this.writing && this.load());
 	}
 
 	dispose() {
 		this.watch.dispose();
 	}
 
+	// the meshes of the model, simplified to the document's tolerance, placed and made one
+	private async mesh(): Promise<Mesh> {
+		const model = this.model;
+		if (!model)
+			throw new Error('the file has not been read');
+		const originals = [...new Set(placed(model.build).map(p => p.mesh))];
+		const simplified = this.document.tolerance && this.progressions ? (await this.progressions).map(p => p.within(this.document.tolerance)) : originals;
+		return combine(placed(model.build).map(({mesh, transform: m}) => ({...transform(simplified[originals.indexOf(mesh)], m), faceMaterials: simplified[originals.indexOf(mesh)].faceMaterials})));
+	}
+
+	// the file as it would be saved, by the extension of where it goes (and the .mtl beside an OBJ, when it has materials)
+	async encode(destination: vscode.Uri): Promise<{main: Uint8Array, mtl?: Uint8Array}> {
+		const model = this.model!, ext = path.extname(destination.fsPath).toLowerCase(), mesh = await this.mesh();
+		// from a .scad: millimetres, Z up, where glTF is metres and Y up
+		const scad = pending.get(this.document.uri.toString())?.scad;
+		const materials = model.materials, name = path.basename(destination.fsPath, ext);
+		switch (ext) {
+			case '.stl':	return {main: STL.save(mesh, name)};
+			case '.obj':	return {main: OBJ.save(mesh, materials, materials.length ? name + '.mtl' : undefined), mtl: materials.length ? OBJ.saveMtl(materials) : undefined};
+			case '.ply':	return {main: PLY.save(mesh, materials)};
+			case '.glb':	return {main: GLB.save(mesh, materials, scad ? {metresPerUnit: 0.001, yUp: true} : undefined)};
+			case '.gltf':	return {main: GLTF.saveText(mesh, materials, scad ? {metresPerUnit: 0.001, yUp: true} : undefined)};
+			case '.3mf':	return {main: await ThreeMF.save(mesh, scad ? 'millimeter' : undefined, materials)};
+		}
+		const format = formatOf(ext);
+		if (!format?.save)
+			throw new Error(`${ext} files cannot be written; use Save As to write another format`);
+		return {main: await format.save(mesh)};
+	}
+
+	async write(destination: vscode.Uri) {
+		const {main, mtl} = await this.encode(destination);
+		this.writing = true;
+		try {
+			await vscode.workspace.fs.writeFile(destination, main);
+			if (mtl)
+				await vscode.workspace.fs.writeFile(vscode.Uri.file(destination.fsPath.replace(/\.obj$/i, '.mtl')), mtl);
+		} finally {
+			// the watcher's event can come after the write returns
+			setTimeout(() => this.writing = false, 500);
+		}
+	}
+
+	// a backup is an STL: geometry only, which is all that has to be kept of the work
+	async backup(destination: vscode.Uri) {
+		await vscode.workspace.fs.writeFile(destination, (await this.encode(vscode.Uri.file('backup.stl'))).main);
+	}
+
+	reload() {
+		return this.load();
+	}
+
+	// the tolerance set from outside the page (undo, redo, revert)
+	setTolerance(maxError: number) {
+		this.document.tolerance = maxError;
+		this.postMessage({command: 'tolerance', maxError});
+	}
+
 	private async load() {
 		const uri = this.document.uri, ext = path.extname(uri.fsPath).toLowerCase();
 		try {
+			const made = pending.get(uri.toString());
+			if (made) {
+				this.model = made.model;
+				this.progressions = undefined;
+				this.document.tolerance = 0;
+				this.postMessage({command: 'model', ...await renderData(this.model, ext)});
+				return;
+			}
 			const format = formatOf(ext);
 			if (!format)
 				throw new Error(`${ext} is not a mesh format this reads`);
 			const bytes = await vscode.workspace.fs.readFile(uri);
 			// the files it names (an OBJ's .mtl, the images of its textures), beside it
 			const dir = path.dirname(uri.fsPath);
-			const model = await format.read(bytes, {file: async name => {
+			this.model = await format.read(bytes, {file: async name => {
 				try {
 					return await fs.promises.readFile(path.resolve(dir, name));
 				} catch {
 					return undefined;
 				}
 			}});
-			this.postMessage(await renderData(model, ext));
+			this.progressions = undefined;
+			this.document.tolerance = 0;
+			this.postMessage({command: 'model', ...await renderData(this.model, ext)});
 		} catch (error: any) {
 			this.postMessage({command: 'error', message: `${path.basename(uri.fsPath)}: ${error?.message ?? error}`});
 		}
@@ -229,6 +338,22 @@ class MeshViewer extends webview.Panel<MessageOut, MessageIn> {
 			}
 			case 'getGlyphs':
 				return digitAtlas();
+			case 'simplify': {
+				// what renderData sends, in its order: each mesh the build places, once
+				const model = this.model;
+				if (!model)
+					return [];
+				// built a little at a time, so the editor stays alive; given up if the file is read again meanwhile
+				const yielding = bitmap.Yielder(15, () => this.model !== model);
+				this.progressions ??= Promise.all([...new Set(placed(model.build).map(p => p.mesh))].map(m => progressive(m, {}, yielding)));
+				const meshes = (await this.progressions).map(p => meshData(p.within(message.maxError), model.materials, []));
+				const before = this.document.tolerance, after = message.maxError;
+				if (this.model === model && before !== after) {
+					this.document.tolerance = after;
+					this.changed('Simplify', () => this.setTolerance(before), () => this.setTolerance(after));
+				}
+				return meshes;
+			}
 			case 'ready':
 				this.load();
 				break;
@@ -239,13 +364,16 @@ class MeshViewer extends webview.Panel<MessageOut, MessageIn> {
 	}
 }
 
-export class MeshViewerProvider implements vscode.CustomReadonlyEditorProvider<MeshDocument> {
+export class MeshViewerProvider implements vscode.CustomEditorProvider<MeshDocument> {
 	private readonly assets: webview.Assets;
+	private readonly editors = new Map<MeshDocument, MeshViewer>();
+	private readonly changeEmitter = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<MeshDocument>>();
+	readonly onDidChangeCustomDocument = this.changeEmitter.event;
 
 	constructor(context: vscode.ExtensionContext) {
 		this.assets = new webview.Assets(context.extensionUri);
 		context.subscriptions.push(
-			vscode.window.registerCustomEditorProvider('mesh.viewer', this, {webviewOptions: {retainContextWhenHidden: true}, supportsMultipleEditorsPerDocument: true}),
+			vscode.window.registerCustomEditorProvider('mesh.viewer', this, {webviewOptions: {retainContextWhenHidden: true}}),
 		);
 	}
 
@@ -253,12 +381,43 @@ export class MeshViewerProvider implements vscode.CustomReadonlyEditorProvider<M
 		return new MeshDocument(uri);
 	}
 
+	async saveCustomDocument(document: MeshDocument) {
+		await this.editors.get(document)?.write(document.uri);
+	}
+
+	async saveCustomDocumentAs(document: MeshDocument, destination: vscode.Uri) {
+		await this.editors.get(document)?.write(destination);
+	}
+
+	async revertCustomDocument(document: MeshDocument) {
+		this.editors.get(document)?.setTolerance(0);
+	}
+
+	async backupCustomDocument(document: MeshDocument, context: vscode.CustomDocumentBackupContext) {
+		await this.editors.get(document)?.backup(context.destination);
+		return {
+			id: context.destination.toString(),
+			delete: async () => { try { await vscode.workspace.fs.delete(context.destination); } catch {} },
+		};
+	}
+
 	async resolveCustomEditor(document: MeshDocument, webviewPanel: vscode.WebviewPanel) {
 		// the floor's numbers are drawn in a font found among those installed
 		await buildIndex();
-		const editor = new MeshViewer(webviewPanel, this.assets, document);
+		const editor = new MeshViewer(webviewPanel, this.assets, document, (label, undo, redo) => this.changeEmitter.fire({document, label, undo, redo}));
+		this.editors.set(document, editor);
+		viewers.set(document.uri.toString(), editor);
+		// a mesh that is only in memory is unsaved from the start, so closing it asks
+		if (document.untitled && !document.announced) {
+			document.announced = true;
+			this.changeEmitter.fire({document, label: 'Generate', undo() {}, redo() {}});
+		}
 		setActiveViewer(editor);
-		webviewPanel.onDidDispose(() => editor.dispose());
+		webviewPanel.onDidDispose(() => {
+			this.editors.delete(document);
+			viewers.delete(document.uri.toString());
+			editor.dispose();
+		});
 		webviewPanel.onDidChangeViewState(event => {
 			if (event.webviewPanel.active)
 				setActiveViewer(editor);

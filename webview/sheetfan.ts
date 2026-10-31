@@ -12,6 +12,7 @@
 import { createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
 import { Canvas3D } from './opengl.js';
 import { Orbit } from './orbit.js';
+import { Input, Place } from './navigate.js';
 import { float2, float3, float3x3, float4, float4x4, lerp, normalise, matmulExt } from '@isopodlabs/maths/vector';
 
 // where a sheet is, and how it is to be drawn, as the fan lays it out
@@ -47,6 +48,7 @@ export interface SheetFanHost {
 }
 
 const OPEN_MS		= 260;
+const SLIDE_MS		= 140;		// a sheet making way for one being moved takes this long to go one place
 // The camera the fan starts from, as it was posed by hand and read off. All in
 // the model's own measure (the picture's longest side is 1), with x across, y down, the front sheet's top left corner at
 // the origin and the layers behind it along +z.
@@ -80,7 +82,7 @@ function inside(convex: float2[], p: float2) {
 			sign = cross;
 		}
 	}
-	return true;
+	return sign !== 0;		// (a polygon with no area, as of a layer with no pixels, holds nothing)
 }
 
 export class SheetFan {
@@ -95,39 +97,33 @@ export class SheetFan {
 	private handle: HTMLElement | undefined;	// what the sheet under the pointer is taken hold of by to move it in the order
 	private grab: number | undefined;			// that sheet
 	private dragIndex = -1;				// where the one being moved is
-	private cursor 				= '';
+	private pos:	number[]	= [];		// where each sheet is drawn, in places from the back (fractional while it slides or is carried)
+	private slotFrames: float2[][] = [];	// the places in the stack, as the sheets lie in them at rest
+	private slotPts: float2[]	= [];		// the handle at each
+	private order:	number[]	= [];		// the sheets from the back, as they are drawn
+	private slideFrame			= 0;
+	private slideTime			= 0;
+	private off:	(() => void) | undefined;	// it has the pointer, over everything, while it is up: how it gives it back
 	private orbit:	Orbit;		// the camera, which the user moves about the stack
 	private dims = {u: 1, v: 1, n: 1};	// the stack as the model has it: each sheet u across and v down, n of them
 
-	private readonly listeners = new AbortController();
-
 	constructor(private host: SheetFanHost) {
-		const signal = this.listeners.signal;
-		host.canvas.addEventListener('pointermove', e => this.pointerMove(e), {signal});
-		host.canvas.addEventListener('pointerdown', e => this.pointerDown(e), {signal});
-		window.addEventListener('keydown', e => {
-			if (e.key === 'Escape' && this.target)
-				this.show(false);
-		}, {signal});
 		this.orbit = new Orbit(host.canvas, {
 			anchor:	(x, y) => this.pick(x, y) ?? this.orbit.along(x, y, this.centre(), this.size()),
 			size:	() => this.size(),
 			redraw: () => host.redraw(),
 			home:	() => this.resetCamera(),
+			click:	(x, y) => {
+				const i = this.layerAt(host.canvas3d.toCanvas(x, y));
+				if (i >= 0)
+					this.choose(i);
+			},
 			contextMenu: (x, y) => {
 				const i = this.layerAt(host.canvas3d.toCanvas(x, y));
 				this.host.sheetMenu(i >= 0 ? i : undefined, x, y);
 			},
 		});
 		this.orbit.enabled = false;
-		// the browser's context menu comes with the press or the release of the right button, whether it is a click or a
-		// drag: while the stack is up it is not to reach the tools, which the camera's hook brings up for a real click
-		host.canvas.parentElement!.addEventListener('contextmenu', e => {
-			if (this.t > 0) {
-				e.preventDefault();
-				e.stopPropagation();
-			}
-		}, {capture: true, signal});
 	}
 
 	// shown, or on its way to be
@@ -147,29 +143,29 @@ export class SheetFan {
 	// The layer under the point: the one drawn last which has drawn there, or whose sheet covers it. The layers are
 	// drawn in the order they are stacked in the picture, so the top layer of the picture is the one in front.
 	private layerAt(p: float2) {
-		for (let i = this.quads.length - 1; i >= 0; i--)
+		for (let k = this.order.length - 1; k >= 0; k--) {
+			const i = this.order[k];
 			if ((this.quads[i].length && inside(this.quads[i], p)) || (this.frames[i]?.length && inside(this.frames[i], p)))
 				return i;
+		}
 		return -1;
 	}
 
+	// the sheet the pointer is over, picked out and named beside it (a click chooses it); and the cursor for that
 	private pointerMove(e: PointerEvent) {
 		if (!this.t || e.buttons)
-			return;
-		const source = this.host;
-		if (!source)
-			return;
+			return '';
 		const at = this.layerAt(this.host.canvas3d.toCanvas(e.clientX, e.clientY)), hover = at >= 0 ? at : undefined;
 		const moved = this.grab !== hover;
 		this.grab = hover;
 		if (hover !== this.hover) {
 			this.hover = hover;
-			this.host.canvas.style.cursor = hover ? 'pointer' : '';
 			this.host.redraw();
 		} else if (moved) {
 			this.host.redraw();	// (the handle goes to the sheet)
 		}
-		this.host.tip(hover !== undefined ? source.sheetName(hover) : undefined, e.clientX, e.clientY);
+		this.host.tip(hover !== undefined ? this.host.sheetName(hover) : undefined, e.clientX, e.clientY);
+		return hover !== undefined ? 'pointer' : '';
 	}
 
 	// the stack comes up from the flat picture, or goes back to it
@@ -180,8 +176,17 @@ export class SheetFan {
 			const source = this.host;
 			if (!source)
 				return;
-			this.cursor = this.host.canvas.style.cursor;
 			this.home();
+			// (what is dragged is the camera's: the left button pans and the right turns, and a click is on a sheet; while it closes the
+			// camera is still, and nothing under it has the pointer either)
+			this.off ??= Input.on(this.host.canvas).add({
+				holds:	true,
+				press:	e => this.orbit.press(e) ?? true,
+				hover:	e => this.pointerMove(e),
+				wheel:	e => (this.orbit.wheel(e), true),
+				menu:	() => true,
+				key:	e => e.key === 'Escape' && (this.show(false), true),
+			}, Place.fan);
 			this.host.opened(true);
 		}
 		this.target = on ? 1 : 0;
@@ -211,10 +216,11 @@ export class SheetFan {
 	// way the stack is seen from.
 	private handlePoint(i: number): float2 | undefined {
 		const f = this.frames[i];
-		if (!f?.length)
-			return undefined;
+		return f?.length ? this.handleCorner(f, this.slotFrames[0], this.slotFrames[this.slotFrames.length - 1]) : undefined;
+	}
+
+	private handleCorner(f: float2[], first?: float2[], last?: float2[]): float2 {
 		const centre = (q: float2[]) => float2((q[0].x + q[2].x) / 2, (q[0].y + q[2].y) / 2);
-		const first = this.frames[0], last = this.frames[this.frames.length - 1];
 		const d = first?.length && last?.length ? centre(first).sub(centre(last)) : float2(0, 0);
 		if (d.x * d.x + d.y * d.y < 1)
 			return f[0];
@@ -230,13 +236,24 @@ export class SheetFan {
 		return best;
 	}
 
-	// a sheet's handle taken hold of: it goes to the place whose handle is nearest the pointer
+	// a sheet's handle taken hold of: the sheet is carried along the stack with the pointer, and goes to the place it is nearest,
+	// the sheets between sliding up to make room
 	private startDrag(handle: HTMLElement, down: PointerEvent) {
 		const index = this.grab ?? -1;
 		const mover = index >= 0 ? this.host.reorderer(index) : undefined;
 		if (!mover)
 			return;
 		handle.setPointerCapture(down.pointerId);
+		const n = this.host.count;
+		// where the pointer is along the stack, in places: the line through the handles of the first and last place
+		const along = (e: PointerEvent) => {
+			const a = this.slotPts[0], b = this.slotPts[n - 1];
+			if (!a || !b)
+				return index;
+			const d = b.sub(a), len2 = d.dot(d);
+			return len2 < 1 ? index : this.host.canvas3d.toCanvas(e.clientX, e.clientY).sub(a).dot(d) / len2 * (n - 1);
+		};
+		const grab = along(down) - index;
 		let moved = false;
 		const move = (e: PointerEvent) => {
 			if (!moved) {
@@ -246,20 +263,15 @@ export class SheetFan {
 				this.dragIndex = index;
 				mover.begin();
 			}
-			const p = this.host.canvas3d.toCanvas(e.clientX, e.clientY);
-			let best = this.dragIndex, bestD = Infinity;
-			this.frames.forEach((f, i) => {
-				const q = this.handlePoint(i);
-				const d = q ? Math.hypot(q.x - p.x, q.y - p.y) : Infinity;
-				if (d < bestD) {
-					bestD = d;
-					best = i;
-				}
-			});
+			const at = Math.max(0, Math.min(n - 1, along(e) - grab)), best = Math.round(at);
 			if (best !== this.dragIndex) {
+				const [p] = this.pos.splice(this.dragIndex, 1);
+				this.pos.splice(best, 0, p);
 				this.dragIndex = best;
 				mover.to(best);
 			}
+			this.hover = this.grab = this.dragIndex;	// (the pointed-at outline stays with the sheet, not the place)
+			this.pos[this.dragIndex] = at;
 			this.host.redraw();
 		};
 		const up = () => {
@@ -286,7 +298,7 @@ export class SheetFan {
 			return;
 		}
 		if (!this.handle) {
-			const h = this.handle = createElement('div', {className: 'fan-handle', title: 'Drag to move this layer in the stack'});
+			const h = this.handle = createElement('div', {className: 'fan-handle', title: 'Drag to move this layer in the stack', innerHTML: '<svg viewBox="0 0 28 14"><path d="M1 7 8 1.5V5H20V1.5L27 7 20 12.5V9H8V12.5Z"/></svg>'});
 			h.addEventListener('pointerdown', e => {
 				if (e.button === 0) {
 					e.preventDefault();
@@ -294,12 +306,19 @@ export class SheetFan {
 					this.startDrag(h, e);
 				}
 			});
+			// the pointer on the handle is still over the stack: it goes on to whatever sheet it moves over
+			h.addEventListener('pointermove', e => this.pointerMove(e));
 			this.host.canvas.parentElement!.append(h);
 		}
-		const dpr = window.devicePixelRatio || 1;
-		this.handle.style.left = `${p.x / dpr}px`;
-		this.handle.style.top = `${p.y / dpr}px`;
+		const dpr = window.devicePixelRatio || 1, canvas = this.host.canvas;
+		const margin = 16;	// (kept within the window, where a sheet reaches past it)
+		this.handle.style.left = `${Math.max(margin, Math.min(canvas.width / dpr - margin, p.x / dpr))}px`;
+		this.handle.style.top = `${Math.max(margin, Math.min(canvas.height / dpr - margin, p.y / dpr))}px`;
 		this.handle.style.opacity = String(this.t);
+		// along the stack: the way the sheets lie one behind another on the window
+		const a = this.slotPts[0], b = this.slotPts[this.slotPts.length - 1];
+		if (a && b && a.sub(b).dot(a.sub(b)) >= 1)
+			this.handle.style.setProperty('--angle', `${Math.atan2(b.y - a.y, b.x - a.x)}rad`);
 		this.handle.classList.toggle('dragging', this.dragIndex >= 0);
 	}
 
@@ -307,11 +326,9 @@ export class SheetFan {
 	dispose() {
 		cancelAnimationFrame(this.frame);
 		this.frame = 0;
-		if (this.target || this.t > 0)
-			this.host.canvas.style.cursor = this.cursor;
+		this.off?.();
+		this.off = undefined;
 		this.handle?.remove();
-		this.orbit.dispose();
-		this.listeners.abort();
 	}
 
 	// the stack is gone, at once
@@ -346,35 +363,20 @@ export class SheetFan {
 	private release() {
 		this.quads = [];
 		this.frames = [];
+		this.pos = [];
+		this.order = [];
+		cancelAnimationFrame(this.slideFrame);
+		this.slideFrame = 0;
 		this.hover = undefined;
 		this.handle?.remove();
 		this.handle = undefined;
 		this.grab = undefined;
 		this.dragIndex = -1;
 		this.host.tip(undefined, 0, 0);
-		this.host.canvas.style.cursor = this.cursor;
+		this.off?.();
+		this.off = undefined;
 		this.host.opened(false);
 	}
-
-	// A click on a layer chooses it; what is dragged is the camera's (orbit.ts): the left button pans and the right turns
-	pointerDown(event: PointerEvent) {
-		if (!this.t)
-			return false;
-		if (event.button === 0) {
-			const canvas = this.host.canvas;
-			const onUp = (e: PointerEvent) => {
-				canvas.removeEventListener('pointerup', onUp);
-				if (Math.hypot(e.clientX - event.clientX, e.clientY - event.clientY) < 4) {
-					const i = this.layerAt(this.host.canvas3d.toCanvas(e.clientX, e.clientY));
-					if (i >= 0)
-						this.choose(i);
-				}
-			};
-			canvas.addEventListener('pointerup', onUp);
-		}
-		return true;
-	}
-
 
 	//-------------------------------------------------------------------------
 	// the camera
@@ -480,10 +482,31 @@ export class SheetFan {
 		this.frames		= [];
 		const sheet		= new float2.extent(float2(0, 0), float2(u, v));
 
+		// the places in the stack, and where each sheet is drawn: in its place, or on its way there from the one it left
+		this.slotFrames	= Array.from({length: n}, (_, k) => corners(sheet, (n - 1 - k) * gap, mvp, size));
+		this.slotPts	= this.slotFrames.map(f => this.handleCorner(f, this.slotFrames[0], this.slotFrames[n - 1]));
+		if (this.pos.length !== n)
+			this.pos = Array.from({length: n}, (_, i) => i);
+		const now = performance.now(), dt = Math.min(50, now - this.slideTime);
+		this.slideTime = now;
+		let sliding = this.dragIndex >= 0;
+		this.pos = this.pos.map((p, i) => {
+			if (i === this.dragIndex)
+				return p;
+			const step = dt / SLIDE_MS;
+			if (Math.abs(i - p) <= step)
+				return i;
+			sliding = true;
+			return p + Math.sign(i - p) * step;
+		});
+		if (sliding && !this.slideFrame)
+			this.slideFrame = requestAnimationFrame(() => { this.slideFrame = 0; this.host.redraw(); });
+		this.order = this.pos.map((_, i) => i).sort((a, b) => this.pos[a] - this.pos[b]);
+
 		// in the order they are stacked in the picture: the bottom sheet first, so the top one -- the nearest -- is the
 		// one drawn over the rest
-		for (let i = 0; i < n; i++) {
-			const depth = (n - 1 - i) * gap;
+		for (const i of this.order) {
+			const depth = (n - 1 - this.pos[i]) * gap;
 			this.frames[i] = corners(sheet, depth, mvp, size);
 			const b = sheets.bounds(i);
 			this.quads[i] = !b ? this.frames[i] : corners(b.scale(1 / longest), depth, mvp, size);

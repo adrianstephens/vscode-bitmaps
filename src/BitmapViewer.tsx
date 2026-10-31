@@ -6,9 +6,12 @@ import { JSX, CSP, CSPdefault, ImportMap, Nonce } from '@isopodlabs/vscode_utils
 import type { MessageIn, MessageOut, MessageRpc, RawImage, LayerData, shaderType } from "../webview/bitmap"
 import { setActiveViewer, readShader } from './extension';
 import { SCHEME, embedded } from './embedded';
+import { simplifyPoints, fitStroke } from './FontViewer';
+import { installedFonts, glyphOutlines } from './fonts';
 
 
 class RawImage2 extends bitmap.LayerImage {
+	blocks?: bitmap.psd.LayerBlocks;
 	private layers: RawImage2[] | undefined;
 
 	constructor(raw: RawImage) {
@@ -28,6 +31,9 @@ class RawImage2 extends bitmap.LayerImage {
 			layer.visible	= l.visible;
 			layer.blendMode	= l.blend;
 			layer.clipped	= l.clipped;
+			layer.blocks	= l.blocks;
+			layer.vectorMaskDensity = l.vectorMaskDensity;
+			layer.vectorMaskFeather = l.vectorMaskFeather;
 			if (l.mask) {
 				const {data, ...mask} = l.mask;
 				layer.mask = {...mask, getPixels: async () => new Uint8Array(data)};
@@ -46,11 +52,11 @@ class RawImage2 extends bitmap.LayerImage {
 // How an edited image is written, by file extension: a type the webview's canvas can encode, or its raw pixels for us to encode here
 interface SaveFormat {
 	type:		string;
-	encode?:	(image: RawImage) => Promise<Uint8Array>;
+	encode?:	(image: RawImage, yielder: bitmap.Yielder) => Promise<Uint8Array>;
 }
 const extension = (uri: {path: string}) => path.posix.extname(uri.path).toLowerCase();
-function savefromRaw<T extends {save: (image: bitmap.Image) => Promise<Uint8Array>}>(type: T): SaveFormat {
-	return {type: 'image/x-rgba', encode: image => type.save(new RawImage2(image))};
+function savefromRaw<T extends {save: (image: bitmap.Image, yielder: bitmap.Yielder) => Promise<Uint8Array>}>(type: T): SaveFormat {
+	return {type: 'image/x-rgba', encode: (image, yielder) => type.save(new RawImage2(image), yielder)};
 }
 const saveFormats: Record<string, SaveFormat> = {
 	'.png':		{type: 'image/png'},
@@ -91,11 +97,20 @@ const shaders: Record<shaderType, ShaderSource> = {
 	'composite':{ vert: 'bitmap.vert',	frag: 'composite.frag'	},
 	'planes':	{ vert: 'planes.vert',	frag: 'planes.frag'		},
 	'warp':		{ vert: 'bitmap.vert',	frag: 'warp.frag'		},
+	'blur':		{ vert: 'bitmap.vert',	frag: 'blur.frag'		},
+	'levels':	{ vert: 'bitmap.vert',	frag: 'levels.frag'		},
+	'gradient':	{ vert: 'bitmap.vert',	frag: 'gradient.frag'	},
+	'convolve':	{ vert: 'bitmap.vert',	frag: 'convolve.frag'	},
+	'effect':	{ vert: 'bitmap.vert',	frag: 'effect.frag'		},
+	'textwarp':	{ vert: 'textwarp.vert',	frag: 'textwarp.frag'	},
 };
 
 // the page of a webview: the shared styles, an import map for the utilities, the body and the script which runs it
 export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.Assets, uri: (name: string) => vscode.Uri, script: string, title: string, body: JSX.Element[], bodyClass?: string, stylesheets: string[] = []) {
 	const nonce = Nonce();
+	const config	= vscode.workspace.getConfiguration('bitmaps');
+	const size		= Math.max(16, Math.min(96, config.get<number>('cascadeIconSize') ?? 32));
+	const magnify	= Math.max(1, Math.min(3, config.get<number>('cascadeMagnify') ?? 1.6));
 	return '<!DOCTYPE html>' + JSX.render(
 		<html lang="en">
 			<head>
@@ -111,7 +126,10 @@ export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.A
 					"@isopodlabs/maths/vector": assets.uri('node_modules/@isopodlabs/maths/esm/vector.js'),
 					"@isopodlabs/maths/quaternion": assets.uri('node_modules/@isopodlabs/maths/esm/quaternion.js'),
 					"@isopodlabs/maths/geometry": assets.uri('node_modules/@isopodlabs/maths/esm/geometry.js'),
-					"@isopodlabs/binary_fonts": assets.uri('node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'),
+					"@isopodlabs/maths/linear": assets.uri('node_modules/@isopodlabs/maths/esm/linear.js'),
+					"@isopodlabs/binary": assets.uri('node_modules/@isopodlabs/binary/esm/index.js'),
+					"@isopodlabs/xml": assets.uri('node_modules/@isopodlabs/xml/esm/xml.js'),
+					"@isopodlabs/binary_fonts": assets.uri('node_modules/@isopodlabs/binary_fonts/esm/browser.js'),
 				}} />
 				<link rel="stylesheet" type="text/css" href={uri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
 				{stylesheets.map(name => <link rel="stylesheet" type="text/css" href={uri(name)}/>)}
@@ -120,7 +138,7 @@ export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.A
 
 				<title>{title}</title>
 			</head>
-			<body class={bodyClass}>
+			<body class={bodyClass} style={`--cascade-size:${size}px;--cascade-scale:${size / 32};--cascade-magnify:${magnify}`}>
 				{body}
 				<script type="module" nonce={nonce} src={uri(script)} />
 			</body>
@@ -145,10 +163,11 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 					<div id="bitmap-stage">
 						<canvas id="viewport" />
 						<canvas id="overlay" class="hidden" />
+						<canvas id="transform-overlay" class="hidden" />
 					</div>
 				</div>
 			</div>,
-		]);
+		], undefined, ['assets/pathedit.css']);
 	}
 
 	async command(message: MessageOut) {
@@ -159,6 +178,18 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 					frag: await readShader(this.localUri('assets/' + shaders[message.type].frag)),
 				};
 			}
+
+			case 'installedFonts':
+				return installedFonts();
+
+			case 'glyphOutlines':
+				return glyphOutlines(message.runs);
+				
+			case 'simplifyPoints':
+				return simplifyPoints(message.points, message.tol, message.cubic);
+
+			case 'fitStroke':
+				return fitStroke(message.stroke, message.tol);
 
 			case 'ready':
 				this.loadImage();
@@ -192,7 +223,7 @@ class BitmapViewer extends ViewerPanel {
 	}
 
 	async loadImage() {
-		const toImage = (result: bitmap.Result) => ({width: result.width, height: result.height, data: result.pixels as Uint8ClampedArray<ArrayBuffer>});
+		const toImage = (result: bitmap.Result): {width: number, height: number, data: Uint8ClampedArray<ArrayBuffer>, channels: 4} => ({width: result.width, height: result.height, data: result.pixels as Uint8ClampedArray<ArrayBuffer>, channels: 4});
 		const toBuffer = (data: bitmap.Result['pixels']) => new Uint8Array(data).buffer;
 
 		try {
@@ -232,13 +263,14 @@ class BitmapViewer extends ViewerPanel {
 					this.document.layersNotEditable = count > 0 && !editable;
 					if (count && editable) {
 						layers = [];
-						for (let i = 0, layer: bitmap.LayerImage | undefined; (layer = psd.getLayer(i)); i++) {
-							const {name, left, top, opacity, visible, blendMode, clipped} = layer;
+						for (let i = 0, layer: bitmap.psd.PSDLayerImage | undefined; (layer = psd.getLayer(i)); i++) {
+							const {name, left, top, opacity, visible, blendMode, clipped, blocks} = layer;
 							layers.push({
-								name: name!, left: left!, top: top!, opacity: opacity!, visible: visible!, blend: blendMode!, clipped,
+								name: name!, left: left!, top: top!, opacity: opacity!, visible: visible!, blend: blendMode!, clipped, blocks,
 								width: layer.width, height: layer.height,
 								data: toBuffer((await layer.getPixels({plane: 'RGBA'})).pixels),
 								mask: layer.mask && {...layer.mask, data: toBuffer(await layer.mask.getPixels())},
+								vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather,
 							});
 						}
 					}
@@ -345,33 +377,33 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 	}
 
 	// the image as the webview has it, encoded as a file
-	private async encode(document: BitmapDocument, format: SaveFormat) {
+	private async encode(document: BitmapDocument, format: SaveFormat, cancellation: vscode.CancellationToken) {
 		const ed = this.getEditor(document);
 		const result = ed && await ed.RPC({ command: 'getTexture', type: format.type });
 		if (!result)
 			throw new Error('The image could not be read back from the editor.');
 		if ('data' in result)
-			return format.encode!(result);
+			return format.encode!(result, bitmap.Yielder(15, ()=>cancellation.isCancellationRequested));
 		return new Uint8Array(result);
 	}
 
-	private async write(document: BitmapDocument, destination: vscode.Uri) {
+	private async write(document: BitmapDocument, destination: vscode.Uri, cancellation: vscode.CancellationToken) {
 		const format = saveFormats[extension(destination)];
 		if (!format)
 			throw new Error(`Bitmap Explorer can't save ${extension(destination) || 'this'} files; use Save As to choose another type.`);
 		if (extension(destination) === '.psd' && document.layersNotEditable)
 			throw new Error('The layers of this PSD cannot be edited (only 8-bit RGB layers can), so saving would flatten it; use Save As to write it under another name.');
-		const bytes = await this.encode(document, format);
+		const bytes = await this.encode(document, format, cancellation);
 		await vscode.workspace.fs.writeFile(destination, bytes);
 		return bytes;
 	}
 
 	async saveCustomDocument(document: BitmapDocument, cancellation: vscode.CancellationToken) {
-		document.data = await this.write(document, document.uri);
+		document.data = await this.write(document, document.uri, cancellation);
 	}
 
 	async saveCustomDocumentAs(document: BitmapDocument, destination: vscode.Uri, cancellation: vscode.CancellationToken) {
-		await this.write(document, destination);
+		await this.write(document, destination, cancellation);
 	}
 
 	async revertCustomDocument(document: BitmapDocument, cancellation: vscode.CancellationToken) {
@@ -390,7 +422,7 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 			if (ext === '.psd' ? !document.layersNotEditable : structured)
 				format = own;
 		}
-		await vscode.workspace.fs.writeFile(context.destination, await this.encode(document, format));
+		await vscode.workspace.fs.writeFile(context.destination, await this.encode(document, format, cancellation));
 		return {
 			id: context.destination.toString(),
 			delete: async () => {

@@ -33,6 +33,19 @@ export interface ScadFiles {
 	read<T>(full: string, key?: string, reader?: Reader<T>): T | undefined;
 }
 
+export interface AsyncFiles {
+//	resolve(written: string, fromDir: string): string | undefined;
+	read<T>(full: string, key?: string, reader?: Reader<T>): Promise<T | undefined>;
+}
+
+
+export const asyncFileReader: AsyncFiles = {
+	async read<T>(full: string, _key?: string, reader?: (bytes: Uint8Array) => T | Promise<T>): Promise<T | undefined> {
+		const bytes = await fs.promises.readFile(full);
+		return reader ? reader(bytes) : bytes as T;
+	}
+};
+
 const KEEP_RUNS = 32;
 
 export class FileReader implements ScadFiles {

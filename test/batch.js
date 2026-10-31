@@ -7,7 +7,7 @@
 //
 // "Wherever a ray can meet the surface" is a band around it, not everywhere: far from a union the field is only a
 // lower bound, and the shader and the mirror cull differently there and return different (both valid) bounds3.
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, countPrimitives, union, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();
@@ -26,10 +26,12 @@ const LETTER_O = [
 	{start: P(395, -20), segs: [quad(240, -20, 159, 64), quad(49, 167, 49, 361), quad(49, 559, 159, 658), quad(240, 742, 395, 742), quad(549, 742, 630, 658), quad(739, 559, 739, 361), quad(739, 167, 630, 64), quad(549, -20, 395, -20)]},
 	{start: P(537, 173), segs: [quad(589, 239, 589, 361), quad(589, 482, 536, 548), quad(484, 614, 395, 614), quad(305, 614, 252, 548), quad(199, 482, 199, 361), quad(199, 239, 252, 173), quad(305, 107, 395, 107), quad(484, 107, 537, 173)]},
 ];
-const shifted = (paths, dx, dy) => paths.map(p => ({
-	start: float2(p.start.x + dx, p.start.y + dy),
-	segs: p.segs.map(s => ({...s, ...(s.c ? {c: float2(s.c.x + dx, s.c.y + dy)} : {}), b: float2(s.b.x + dx, s.b.y + dy)})),
-}));
+// (as a font's curve, which a curvepath2 holds: each contour's start, then each quadratic segment's control point and end)
+const { curveVertex, ON_BEGIN, ON_CURVE, OFF_BEZ2 } = require('@isopodlabs/binary_fonts');
+const shifted = (paths, dx, dy) => paths.flatMap(p => [
+	curveVertex(p.start.x + dx, p.start.y + dy, ON_BEGIN),
+	...p.segs.flatMap(s => [curveVertex(s.c.x + dx, s.c.y + dy, OFF_BEZ2), curveVertex(s.b.x + dx, s.b.y + dy, ON_CURVE)]),
+]);
 const glyphs = (n) => ({k: 'extrude', h: 2, center: false, body: union(Array.from({length: n}, (_, i) => ({k: 'curvepath2', paths: shifted(LETTER_O, i * 32, (i % 3) * 5)})))});
 
 const BAND = 3;

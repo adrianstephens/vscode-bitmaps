@@ -6,13 +6,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();
 const { compileField } = require('../out/src/scad/fnsurface.js');
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { float3 } = require('@isopodlabs/maths/vector');
 
 const evalSdf = (sdf, p) => evalSdf3(sdf, float3(p[0], p[1], p[2]));
@@ -171,7 +171,7 @@ const shaderOf = async (sdf) => {
 		check(got.every((v, i) => Math.abs(v - want[i]) < 1e-9), `colour at (12, 3, 2): ${got} for ${want}`);
 		// the shader's, at points of the model
 		const g = emitGlsl(r.sdf);
-		const code = ['vec3 g_hit;', ...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}',
+		const code = ['vec3 g_hit;', 'vec3 g_normal;', ...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}',
 			'vec2 probe(vec3 p) { g_hit = p; vec3 c = matColor(1.0); return vec2(c.x + 4.0 * c.y, c.z); }'].join('\n');
 		const shader = await makeShader(code, 'probe', g.data);
 		const pts = Array.from({length: 200}, () => [rand() * 14 + 4, rand() * 8 - 4, rand() * 8 - 2]);
@@ -180,6 +180,41 @@ const shaderOf = async (sdf) => {
 		pts.forEach((p, i) => { const c = fn.at(...p); worst = Math.max(worst, Math.abs(out[i][0] - (c[0] + 4 * c[1])), Math.abs(out[i][1] - c[2])); });
 		check(worst < 1e-4, `the shader's colour and the mirror's differ by ${worst}`);
 		console.log(`colour function: follows its frame, shader agrees to ${worst.toExponential(1)}`);
+		// with the normal too: a normal of the model is carried into the color()'s frame (turned, and under a scale that is not
+		// the same every way, by the frame's transpose and made unit again), and the shader agrees given the same one
+		const normalFn = async src => {
+			const r = await run(src), fns = [];
+			check(r.warnings.length === 0, `${r.warnings}`);
+			(function w(s) { if (s.k === 'material' && s.mat.colorFn) fns.push(s.mat.colorFn); for (const c of s.children ?? []) w(c); if (s.body) w(s.body); })(r.sdf);
+			return {sdf: r.sdf, fn: fns[0]};
+		};
+		const unit = ns => ns.map(v => (v * 0.5 + 0.5));
+		{
+			const {sdf, fn} = await normalFn('translate([10, 0, 0]) rotate([0, 0, 90]) color(function(x, y, z, nx, ny, nz) [nx * 0.5 + 0.5, ny * 0.5 + 0.5, nz * 0.5 + 0.5]) cube(5);');
+			const got = fn.at(12, 3, 2, 1, 0, 0), want = unit([0, -1, 0]);
+			check(got.every((v, i) => Math.abs(v - want[i]) < 1e-9), `turned normal: ${got} for ${want}`);
+			const g = emitGlsl(sdf);
+			const code = ['vec3 g_hit;', 'vec3 g_normal;', ...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}',
+				'vec2 probe(vec3 p) { g_hit = p; g_normal = normalize(p - vec3(10.0, 0.0, 0.0)); vec3 c = matColor(1.0); return vec2(c.x + 4.0 * c.y, c.z); }'].join('\n');
+			const shader = await makeShader(code, 'probe', g.data);
+			const pts = Array.from({length: 200}, () => [rand() * 14 + 4, rand() * 8 - 4, rand() * 8 - 2]);
+			const out = await shader.at(pts);
+			let worst = 0;
+			pts.forEach((p, i) => {
+				const d = [p[0] - 10, p[1], p[2]], l = Math.hypot(...d), c = fn.at(...p, ...d.map(v => v / l));
+				worst = Math.max(worst, Math.abs(out[i][0] - (c[0] + 4 * c[1])), Math.abs(out[i][1] - c[2]));
+			});
+			check(worst < 1e-4, `the shader's colour from the normal and the mirror's differ by ${worst}`);
+			console.log(`colour function of the normal: turns with its frame, shader agrees to ${worst.toExponential(1)}`);
+		}
+		{
+			const {fn} = await normalFn('scale([2, 1, 1]) color(function(x, y, z, nx, ny, nz) [nx * 0.5 + 0.5, ny * 0.5 + 0.5, nz * 0.5 + 0.5]) sphere(1);');
+			const got = fn.at(Math.SQRT2, Math.SQRT1_2, 0, Math.SQRT1_2, Math.SQRT1_2, 0), want = unit([2 / Math.sqrt(5), 1 / Math.sqrt(5), 0]);
+			check(got.every((v, i) => Math.abs(v - want[i]) < 1e-9), `scaled normal: ${got} for ${want}`);
+			// fewer parameters than six take only what they name
+			const {fn: fn4} = await normalFn('color(function(x, y, z, nx) [nx, 0, 0]) cube(1);');
+			check(Math.abs(fn4.at(0, 0, 0, 0.25, 0, 0)[0] - 0.25) < 1e-9, 'four parameters: x, y, z and nx');
+		}
 		for (const [src, what] of [['color(function(x, y, z) x) cube(1);', 'a number'], ['color(function(x, y, z) [x, y]) cube(1);', 'two components'], ['color(function(x, y, z) [q, 0, 0]) cube(1);', 'an unbound name']]) {
 			const e = await run(src);
 			check(e.warnings.length > 0, `${what} should be reported`);

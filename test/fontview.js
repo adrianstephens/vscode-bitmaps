@@ -43,7 +43,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 			res.writeHead(200, {'content-type': 'text/html'});
 			res.end(`<!DOCTYPE html><html><head>
 				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'}})}</script>
-				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
+				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/pathedit.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
 				<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 			</head><body class="tensors">
 				<div id="font-toolbar"><select id="font-face" class="hidden"></select><label>Size <input id="font-size" type="number" min="6" max="1000" value="56"> px</label><label><input id="font-unicode" type="checkbox"> Mapped only</label></div>
@@ -261,17 +261,23 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 		check((await page.$$('#insp-view .insp-pt')).length === n0 - 1 && edits.at(-1).label === 'Delete point', 'point deleted');
 		const c = await pt(3);
 		await page.mouse.click(c.x, c.y);
-		await menu(['edit', 'insert'], c.x, c.y);
-		await pause(300);
-		check(edits.at(-1).label === 'Insert point' || /insert between/.test(status), 'insert acted or said why not');
+		await pause(200);
 		await page.keyboard.press('ArrowRight');
 		await pause(300);
 		check(edits.at(-1).label === 'Move point', 'arrow nudged the picked point');
+		// a contour is added by drawing a rectangle, which leaves it selected; Escape then puts the tool down
 		const n1 = (await page.$$('#insp-view .insp-pt')).length;
 		const vb = await (await page.$('#insp-view')).boundingBox();
-		await menu(['edit', 'new-contour'], vb.x + 60, vb.y + 60);
+		await menu(['tool', 'rect'], vb.x + 60, vb.y + 60);
+		await pause(200);
+		await page.mouse.move(vb.x + 60, vb.y + 60);
+		await page.mouse.down();
+		await page.mouse.move(vb.x + 120, vb.y + 100, {steps: 4});
+		await page.mouse.up();
 		await pause(300);
-		check(edits.at(-1).label === 'Add contour' && (await page.$$('#insp-view .insp-pt')).length === n1 + 4, 'a contour was added');
+		check(edits.at(-1).label === 'Draw rect' && (await page.$$('#insp-view .insp-pt')).length === n1 + 4, `a contour was added: ${edits.at(-1).label}`);
+		await page.keyboard.press('Escape');
+		await pause(200);
 		const last = edits.at(-1).points;
 		check(font.getGlyph(edits.at(-1).id).curve.length >= 4 && last.slice(-4).map(v => v.flags).join() === '0,1,1,1', 'the new contour is in the font');
 

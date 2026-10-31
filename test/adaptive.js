@@ -5,8 +5,8 @@
 // contouring puts a vertex on every edge and corner, and the rounded solids -- a polyhedron grown by a ball or by a flat
 // disc, which the mesher takes apart into planes, cylinders and balls -- are compared with their volumes worked out by
 // hand. What is being tested besides is the lowering itself: if a piece were missing or misplaced the volume would say.
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { checkMesh, meshAdaptive } = require('../out/src/scad/mesher.js');
+const { evaluate } = require('./scadhost.js');
+const { checkMesh, meshAdaptive } = require('./scadhost.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
 

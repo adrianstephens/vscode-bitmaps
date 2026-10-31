@@ -2,8 +2,8 @@
 // keyword, a function used before it is defined, or unbalanced brackets. Runs every mode, since each emits its own
 // code path, and checks declared names as well as bare words.
 const fs = require('fs');
-const { evaluate } = require('/Volumes/DevSSD/dev/vscode-extensions/bitmaps/out/src/scad/evaluate.js');
-const { emitGlsl } = require('/Volumes/DevSSD/dev/vscode-extensions/bitmaps/out/src/scad/sdf.js');
+const { evaluate } = require('./scadhost.js');
+const { emitGlsl } = require('../out/src/scad/sdf.js');
 
 const PATH = '/Volumes/DevSSD/dev/packages/rhombic_dodecahedron_system.scad';
 const TEMPLATE = fs.readFileSync('/Volumes/DevSSD/dev/vscode-extensions/bitmaps/assets/sdf.frag', 'utf8').replace('//@floor', fs.readFileSync('/Volumes/DevSSD/dev/vscode-extensions/bitmaps/assets/floor.frag', 'utf8'));

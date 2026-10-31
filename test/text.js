@@ -13,11 +13,15 @@
 // which checks curvepath2 against a very finely flattened independent reference specifically through a glyph this
 // bug affected.
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { emitGlsl, polygonDistance2, SDF } = require('../out/src/scad/sdf.js');
+const scad = require('./scadhost.js');
+// (text() finds its fonts through the files, which are read between runs: a run is made again until nothing it needed is missing)
+const { FileReader } = require('../out/src/filereader.js');
+const files = new FileReader();
+const evaluate = (source, name) => files.with(() => scad.evaluate(source, name, files));
+const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { load, parseCurve } = require('@isopodlabs/binary_fonts');
 const fs = require('fs');
 const { float3 } = require('@isopodlabs/maths/vector');
@@ -31,11 +35,11 @@ const FLAT = (shape) => `linear_extrude(height = 2) ${shape}`;
 
 // fonts.ts scans the system's font directories once, asynchronously, the same as a real extension host does before
 // its first render (see ScadViewer.tsx's own await of this) -- every text() below depends on it having finished.
-await require('../out/src/scad/fonts.js').buildIndex();
+await require('../out/src/fonts.js').buildIndex();
 
 //--- a plain string draws clean, closed, manifold geometry --------------------------------------------------
 {
-	const { sdf, warnings } = evaluate(FLAT('text("Hi", size = 10, font = "Helvetica");'), 'text.js');
+	const { sdf, warnings } = await evaluate(FLAT('text("Hi", size = 10, font = "Helvetica");'), 'text.js');
 	check(warnings.length === 0, `a plain text() warned: ${JSON.stringify(warnings)}`);
 	const stats = checkMesh(await meshUniform(sdf, {cells: 96}));
 	check(stats.open === 0 && stats.nonManifold === 0, `text() mesh has ${stats.open} open and ${stats.nonManifold} non-manifold edges`);
@@ -45,7 +49,7 @@ await require('../out/src/scad/fonts.js').buildIndex();
 
 //--- a letter with a counter (a hole) really has one: even-odd across that glyph's own two paths -------------
 {
-	const { sdf, warnings } = evaluate(FLAT('text("O", size = 20, font = "Helvetica", halign = "center", valign = "center");'), 'text.js');
+	const { sdf, warnings } = await evaluate(FLAT('text("O", size = 20, font = "Helvetica", halign = "center", valign = "center");'), 'text.js');
 	check(warnings.length === 0, `text("O") warned: ${JSON.stringify(warnings)}`);
 	check(evalSdf(sdf, [0, 0, 1]) > 0, 'the centre of an "O" should be outside it -- in the hole');
 	check(evalSdf(sdf, [5.5, 0, 1]) < 0, 'a point in the stroke of an "O" should be inside it');
@@ -54,8 +58,8 @@ await require('../out/src/scad/fonts.js').buildIndex();
 
 //--- halign/valign move the whole string relative to its own origin, not just clip it -------------------------
 {
-	const left = bounds3(evaluate(FLAT('text("A", size = 10);'), 'text.js').sdf);
-	const centred = bounds3(evaluate(FLAT('text("A", size = 10, halign = "center", valign = "center");'), 'text.js').sdf);
+	const left = bounds3((await evaluate(FLAT('text("A", size = 10);'), 'text.js')).sdf);
+	const centred = bounds3((await evaluate(FLAT('text("A", size = 10, halign = "center", valign = "center");'), 'text.js')).sdf);
 	check(left.min.x > -1e-6, `left-aligned text should start at x = 0, starts at ${left.min.x}`);
 	check(centred.min.x < -1e-6 && centred.max.x > 1e-6, 'centre-aligned text should straddle x = 0');
 	check(centred.min.y < -1e-6 && centred.max.y > 1e-6, 'centre-aligned text should straddle y = 0');
@@ -64,24 +68,24 @@ await require('../out/src/scad/fonts.js').buildIndex();
 
 //--- spacing widens the whole string, not just the last character's advance -----------------------------------
 {
-	const normal = bounds3(evaluate(FLAT('text("mmmm", size = 10);'), 'text.js').sdf);
-	const wide = bounds3(evaluate(FLAT('text("mmmm", size = 10, spacing = 2);'), 'text.js').sdf);
+	const normal = bounds3((await evaluate(FLAT('text("mmmm", size = 10);'), 'text.js')).sdf);
+	const wide = bounds3((await evaluate(FLAT('text("mmmm", size = 10, spacing = 2);'), 'text.js')).sdf);
 	check(wide.max.x > normal.max.x * 1.5, `spacing = 2 should roughly double the width (${normal.max.x.toFixed(2)} -> ${wide.max.x.toFixed(2)})`);
 	console.log(`spacing: normal width ${normal.max.x.toFixed(2)}, spacing = 2 width ${wide.max.x.toFixed(2)}`);
 }
 
 //--- an unknown font name falls back to a real one, and says so ------------------------------------------------
 {
-	const { warnings } = evaluate(FLAT('text("x", font = "Definitely Not A Real Font Name");'), 'text.js');
+	const { warnings } = await evaluate(FLAT('text("x", font = "Definitely Not A Real Font Name");'), 'text.js');
 	check(warnings.some(w => /font .* not found/.test(w)), `an unknown font should warn, got ${JSON.stringify(warnings)}`);
 	console.log(`unknown font: ${warnings.join(' | ')}`);
 }
 
 //--- empty text and an unreadable text= argument both draw nothing, not an error --------------------------------
 {
-	const { sdf: sdfEmpty } = evaluate(FLAT('text("");'), 'text.js');
+	const { sdf: sdfEmpty } = await evaluate(FLAT('text("");'), 'text.js');
 	check(bounds3(sdfEmpty) === undefined, 'an empty string should draw nothing');
-	const { sdf: sdfUndef, warnings } = evaluate(FLAT('text(dir_nothing);'), 'text.js');
+	const { sdf: sdfUndef, warnings } = await evaluate(FLAT('text(dir_nothing);'), 'text.js');
 	check(bounds3(sdfUndef) === undefined, 'a text() with an unreadable text= should draw nothing');
 	check(warnings.some(w => /dir_nothing/.test(w)), `it should name the undef, got ${JSON.stringify(warnings)}`);
 }
@@ -107,17 +111,19 @@ await require('../out/src/scad/fonts.js').buildIndex();
 	const advance = font.hmtx.metrics[Math.min(gid, font.hmtx.metrics.length - 1)].advance;
 	const offsetX = -advance / 2, offsetY = -(font.hhea.ascent + font.hhea.descent) / 2;
 	const scaled = refPaths.map(p => p.map(pt => ({x: (pt.x + offsetX) * scale, y: (pt.y + offsetY) * scale})));
+	// (the polygon's own distance, as the mirror has it for a polygon)
+	const reference = {k: 'polygon2', paths: scaled};
 
 	// a tall centred extrusion, so that at z = 0 the slab term is far below and the shape's own field is what is
 	// measured everywhere in the 40x40 sample area -- FLAT()'s height = 2 would let the slab clamp answers deep
 	// inside a stroke, which a random-point sweep (unlike the boundary-only checks elsewhere in this file) reaches
-	const { sdf } = evaluate('linear_extrude(height = 200, center = true) text("@", size = 30, font = "Helvetica", halign = "center", valign = "center");', 'text.js');
+	const { sdf } = await evaluate('linear_extrude(height = 200, center = true) text("@", size = 30, font = "Helvetica", halign = "center", valign = "center");', 'text.js');
 	let seed = 7;
 	const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
 	let worst = 0, at = null;
 	for (let i = 0; i < 20000; i++) {
 		const px = (rand() - 0.5) * 40, py = (rand() - 0.5) * 40;
-		const diff = Math.abs(polygonDistance2(px, py, scaled) - evalSdf(sdf, [px, py, 0]));
+		const diff = Math.abs(evalSdf(reference, [px, py, 0]) - evalSdf(sdf, [px, py, 0]));
 		if (diff > worst) { worst = diff; at = [px, py]; }
 	}
 	check(worst < 1e-3, `curvepath2's "@" differs from a finely flattened reference by ${worst.toExponential(3)} at [${at}]`);
@@ -127,7 +133,7 @@ await require('../out/src/scad/fonts.js').buildIndex();
 //--- the shader (compiled and run for real in headless Chrome) agrees with evalSdf() for a union of glyph
 //    curvepath2s, the one construct this feature actually adds to what twod.js already covers --------------------
 {
-	const { sdf } = evaluate(FLAT('text("Bo8@", size = 12, font = "Helvetica");'), 'text.js');
+	const { sdf } = await evaluate(FLAT('text("Bo8@", size = 12, font = "Helvetica");'), 'text.js');
 	const g = emitGlsl(sdf);
 	const shader = await makeShader([...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}'].join('\n'), 'map', g.data);
 	let seed = 3;
@@ -152,22 +158,27 @@ await require('../out/src/scad/fonts.js').buildIndex();
 // round letters of any face have no straight side at all, so a straight segment in one is that bug. Faces and
 // families are tried in whatever this machine has.
 {
-	// findFont() is fonts.ts's own business (layoutText is the public surface that reaches it), so whether a face
-	// is actually installed -- rather than substituted for another -- is read off layoutText's own warn callback
-	const { layoutText } = require('../out/src/scad/fonts.js');
+	// whether a face is installed, rather than substituted for another, is read off findFont's warn callback; the fonts are read
+	// through the files, as text() reads them
+	const { findFont, layoutText } = require('../out/src/fonts.js');
+	const { ON_BEGIN, OFF_BEZ2, OFF_BEZ3 } = require('@isopodlabs/binary_fonts');
+	// a glyph's outline as a font has it: its contours (each begun by an ON_BEGIN), and its straight segments (a point on the curve
+	// straight after another)
+	const contoursOf = curve => curve.filter(v => v.flags === ON_BEGIN).length;
+	const linesOf = curve => curve.filter((v, i) => i > 0 && v.flags !== ON_BEGIN && v.flags !== OFF_BEZ2 && v.flags !== OFF_BEZ3 && curve[i - 1].flags !== OFF_BEZ2 && curve[i - 1].flags !== OFF_BEZ3).length;
 	const families = ['Helvetica', 'Arial', 'Times New Roman', 'Times', 'Georgia', 'Verdana', 'Courier New', 'DejaVu Sans', 'Liberation Sans', 'Menlo'];
 	let faces = 0;
-	for (const family of families) for (const style of ['', ':style=Bold', ':style=Italic']) {
-		const spec = family + style;
+	for (const family of families) for (const style of [undefined, 'Bold', 'Italic']) {
+		const spec = family + (style ? `:style=${style}` : '');
 		let warned = false;
-		const contours0 = layoutText({text: 'O', size: 1000, font: spec, halign: 'left', valign: 'baseline', spacing: 1, fn: 16}, () => { warned = true; })[0] ?? [];
-		if (warned)		// not installed: findFont substituted another, which some other spec in this list covers
+		const font = await files.with(() => findFont(family, style, files, () => { warned = true; }));
+		if (warned || !font)		// not installed: findFont substituted another, which some other spec in this list covers
 			continue;
 		faces++;
-		for (const [ch, contours] of [['O', contours0], ['o', layoutText({text: 'o', size: 1000, font: spec, halign: 'left', valign: 'baseline', spacing: 1, fn: 16}, () => {})[0] ?? []]]) {
-			const lines = contours.flatMap(c => c.segs.filter(seg => seg.t === 'line'));
-			check(contours.length === 2, `${spec}: '${ch}' should be an outline and its counter, it has ${contours.length} contours`);
-			check(lines.length === 0, `${spec}: '${ch}' has ${lines.length} straight segments, where a round letter has none`);
+		for (const ch of ['O', 'o']) {
+			const curve = (await files.with(() => layoutText({font, text: ch, size: 1000, halign: 'left', valign: 'baseline', spacing: 1}, files, () => {})))[0] ?? [];
+			check(contoursOf(curve) === 2, `${spec}: '${ch}' should be an outline and its counter, it has ${contoursOf(curve)} contours`);
+			check(linesOf(curve) === 0, `${spec}: '${ch}' has ${linesOf(curve)} straight segments, where a round letter has none`);
 		}
 	}
 	console.log(`round letters: ${faces} installed faces checked for straight sides`);
@@ -178,8 +189,8 @@ await require('../out/src/scad/fonts.js').buildIndex();
 // str() once quoted its string arguments as echo does, so str("Helvetica", ":style=Bold") named a font that has
 // quote marks in it and the wrong face was drawn, silently, with only a "font not found" warning to show for it.
 {
-	const built = evaluate('linear_extrude(height = 1) text("Ag", size = 20, font = str("Helvetica", ":style=Bold"));', 'str.scad');
-	const literal = evaluate('linear_extrude(height = 1) text("Ag", size = 20, font = "Helvetica:style=Bold");', 'str.scad');
+	const built = await evaluate('linear_extrude(height = 1) text("Ag", size = 20, font = str("Helvetica", ":style=Bold"));', 'str.scad');
+	const literal = await evaluate('linear_extrude(height = 1) text("Ag", size = 20, font = "Helvetica:style=Bold");', 'str.scad');
 	check(JSON.stringify(built.sdf) === JSON.stringify(literal.sdf), 'a font built with str() should draw the same glyphs as the same name written out');
 	check(built.warnings.join() === literal.warnings.join(), `str() should not change what is warned about (${built.warnings} against ${literal.warnings})`);
 	console.log('str(): a font name built from strings selects the same face as the literal');

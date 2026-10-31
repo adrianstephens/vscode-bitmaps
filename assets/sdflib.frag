@@ -90,6 +90,27 @@ vec4 batchTexel(int i) {
 	return texelFetch(u_batch, ivec2(i & 1023, i >> 10), 0);
 }
 
+// A texture() a function looks colours up in, a pixel to a texel from `base`, rows from the bottom up: its value at (u, v)
+// between the pixels' centres (which = 0), or its rate of change along u (1) or v (2), repeating or holding its edges.
+// Texture.at in fnsurface.ts is the same.
+vec4 texSample(int base, int w, int h, int repeat, int which, float u, float v) {
+	float	x = u * float(w) - 0.5, y = v * float(h) - 0.5;
+	float	fi = floor(x), fj = floor(y), fx = x - fi, fy = y - fj;
+	ivec2	lo = ivec2(int(fi), int(fj)), hi = lo + 1, size = ivec2(w, h);
+	if (repeat != 0) {
+		lo = ((lo % size) + size) % size;
+		hi = ((hi % size) + size) % size;
+	} else {
+		lo = clamp(lo, ivec2(0), size - 1);
+		hi = clamp(hi, ivec2(0), size - 1);
+	}
+	vec4	a = batchTexel(base + lo.y * w + lo.x), b = batchTexel(base + lo.y * w + hi.x);
+	vec4	c = batchTexel(base + hi.y * w + lo.x), d = batchTexel(base + hi.y * w + hi.x);
+	return which == 0 ? mix(mix(a, b, fx), mix(c, d, fx), fy)
+		: which == 1 ? mix(b - a, d - c, fy) * float(w)
+		: mix(c - a, d - b, fx) * float(h);
+}
+
 // A heightmap's field (surface(): heightmap() and heightmapDistance() in sdf.ts, which say why it is this bound and
 // which this must agree with). Its heights start at texel `heights`, four to a texel, and its tiles at `tiles`, two
 // floats each: the highest point near the tile, and 1 / sqrt(1 + L^2) for the steepest slope near it.

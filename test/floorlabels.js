@@ -8,10 +8,15 @@
 // Pass an output directory as the first argument to keep the two pictures (labels.png, plain.png).
 const fs = require('fs');
 const path = require('path');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
-const { digitAtlas } = require('../out/src/scad/fonts.js');
+// (the atlas is the extension's, which needs vscode only to be loaded: anything stands in for it)
+const Module = require('module');
+const loadModule = Module._load;
+const anything = new Proxy(function () {}, {get: (_, k) => k === '__esModule' ? true : anything, apply: () => anything, construct: () => anything});
+Module._load = function (request, ...rest) { return request === 'vscode' ? anything : loadModule.call(this, request, ...rest); };
+const { digitAtlas } = require('../out/src/extension.js');
 
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const asset = name => fs.readFileSync(path.join(__dirname, '..', 'assets', name), 'utf8');

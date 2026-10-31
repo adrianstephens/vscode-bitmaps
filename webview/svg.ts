@@ -9,7 +9,7 @@ export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'status', text: string}
-	| {command: 'edit', text: string, label: string}
+	| {command: 'edit', text: string, label: string, continues?: boolean}
 	| {command: 'shapePoints', name: string, attributes: Record<string, string>}
 	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean}
 	| {command: 'fitStroke', stroke: number[], tol: number}
@@ -27,7 +27,7 @@ const post	= (message: MessageOut) => vscode.postMessage(message);
 const errorBox	= $('scad-error');
 
 const session = createSession({view: $('insp-view'), tree: $('svg-tree'), props: $('svg-props')}, {
-	save:		(text, label) => post({command: 'edit', text, label}),
+	save:		(text, label, continues) => post({command: 'edit', text, label, continues}),
 	shapePoints: (name, attributes) => RPC<curveVertex[]>({command: 'shapePoints', name, attributes}),
 	simplifyPoints: (points, tol) => RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}),
 	fitStroke:	(stroke, tol) => RPC<curveVertex[]>({command: 'fitStroke', stroke, tol}),

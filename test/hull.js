@@ -5,8 +5,8 @@
 // union-with-a-warning everywhere else (a curved side that is not a sphere, a cut shape among the children). See
 // src/scad/sdf.ts's convexHull2/convexHull3/hullVertices2/hullVertices3/sameRadiusSpheres/sameRadiusCircles, and
 // evaluate.ts's 'hull'.
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { evaluate } = require('./scadhost.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();

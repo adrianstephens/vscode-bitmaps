@@ -1,6 +1,5 @@
-// The bitmap editor's layers (webview/layers.ts) on their own: the blend modes' numbers, how a layer is brought to the whole
-// canvas for drawing, and that the bitmap package writes layers a PSD reader gets back (the files of a real PSD are tried by
-// MY_PSDS=a.psd:b.psd). Carrying layers with the canvas (flip, rotate, crop) is in bitmappage.js, and cutting a layer down to
+// The bitmap editor's layers as files: that the bitmap package writes layers a PSD reader gets back (the files of a real PSD are
+// tried by MY_PSDS=a.psd:b.psd). (layers.ts itself is the page's, which runs only in a page: bitmappage.js has it) Carrying layers with the canvas (flip, rotate, crop) is in bitmappage.js, and cutting a layer down to
 // what is not transparent for writing is in raster.js.
 const bitmap = require('@isopodlabs/binary_bitmaps');
 const fs = require('fs');
@@ -19,29 +18,7 @@ const layer = (name, left, top, w, h, rgba, extra = {}) => ({name, left, top, op
 const px = (im, x, y) => Array.from(im.data.subarray((y * im.width + x) * 4, (y * im.width + x) * 4 + 4));
 
 (async () => {
-	const L = await import('../out/webview/layers.js');
 	const RED = [255, 0, 0, 255], BLUE = [0, 0, 255, 255];
-
-	// blend modes: the keys PSD has, each a number of its own
-	{
-		const keys = ['norm', 'diss', 'dark', 'mul ', 'idiv', 'lbrn', 'dkCl', 'lite', 'scrn', 'div ', 'lddg', 'lgCl', 'over', 'sLit', 'hLit', 'vLit', 'lLit', 'pLit', 'hMix', 'diff', 'smud', 'fsub', 'fdiv', 'hue ', 'sat ', 'colr', 'lum '];
-		check(new Set(keys.map(L.blendModeNumber)).size === keys.length && keys.every((k, i) => L.blendModeNumber(k) === i), 'every PSD blend mode has a number of its own');
-		check(L.blendModeNumber('pass') === 0 && L.blendModeNumber('nonsense') === 0, 'and a pass through, or what is not known, is normal');
-	}
-
-	// expand: to the whole canvas, keeping what is inside
-	{
-		const l = layer('small', 3, 2, 2, 2, RED);
-		L.expand(l, 8, 6);
-		check(l.left === 0 && l.top === 0 && l.image.width === 8 && l.image.height === 6, 'a layer is brought to the whole canvas');
-		check(same(px(l.image, 3, 2), RED) && same(px(l.image, 4, 3), RED) && px(l.image, 2, 2)[3] === 0, 'with its pixels where they were');
-		const again = l.image;
-		L.expand(l, 8, 6);
-		check(l.image === again, 'and not again once it is');
-		const spill = layer('spill', -1, -1, 3, 3, RED);
-		L.expand(spill, 4, 4);
-		check(same(px(spill.image, 0, 0), RED) && same(px(spill.image, 1, 1), RED) && px(spill.image, 2, 2)[3] === 0, 'what lay outside the canvas is cut off');
-	}
 
 	// the package saves an image's layers, and reads them back
 	{
@@ -49,7 +26,7 @@ const px = (im, x, y) => Array.from(im.data.subarray((y * im.width + x) * 4, (y 
 		const imageOf = (w, h, pixels, layer) => Object.assign(new bitmap.LayerImage('2d', w, h, {RGBA: rgba(w, h, pixels)}), layer);
 		const layers = [
 			{name: 'Background', left: 0, top: 0, width: 8, height: 6, opacity: 1, visible: true, blendMode: 'norm', pixels: Uint8Array.from({length: 8 * 6 * 4}, (_, i) => i % 4 === 3 ? 255 : (i * 7) & 255)},
-			{name: 'Wide name for a layer, with a long label', left: -2, top: 3, width: 5, height: 2, opacity: 0.5, visible: false, blendMode: 'mul ', pixels: Uint8Array.from({length: 5 * 2 * 4}, (_, i) => i % 4 === 3 ? (i * 5) & 255 : (i * 11) & 255)},
+			{name: 'Wide name for a layer, with a long label', left: -2, top: 3, width: 5, height: 2, opacity: 0.5, visible: false, blendMode: 'mul', pixels: Uint8Array.from({length: 5 * 2 * 4}, (_, i) => i % 4 === 3 ? (i * 5) & 255 : (i * 11) & 255)},
 			{name: 'clipped', left: 0, top: 0, width: 2, height: 2, opacity: 1, visible: true, blendMode: 'norm', clipped: true, pixels: Uint8Array.from({length: 16}, (_, i) => i % 4 === 3 ? 255 : i * 5)},
 			{name: 'masked', left: 1, top: 1, width: 4, height: 3, opacity: 1, visible: true, blendMode: 'norm', pixels: Uint8Array.from({length: 4 * 3 * 4}, (_, i) => i % 4 === 3 ? 255 : (i * 13) & 255),
 				mask: {left: 2, top: 0, width: 3, height: 2, default: 255, disabled: false, inverted: true, pixels: Uint8Array.from([0, 64, 128, 192, 255, 7])}},

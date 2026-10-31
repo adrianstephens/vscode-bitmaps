@@ -2,8 +2,8 @@
 // the seed hash against Python's (whose scheme OpenSCAD's hash_floating_point copies -- an integer-valued float hashes
 // to the integer), and rands() itself for the properties a file relies on: a seed always gives the same numbers,
 // values stay in range, and the degenerate arguments behave as OpenSCAD's do.
-const { MT19937, seedOf } = require('../out/src/scad/random.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { MT19937, seedOf } = require('@isopodlabs/utilities').random;
+const { evaluate } = require('./scadhost.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
 

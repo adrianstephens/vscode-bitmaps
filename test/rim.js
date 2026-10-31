@@ -22,7 +22,7 @@
 // What actually discriminates is z above the cap plane: a *rolled* rim would bulge to z = r/2 above it, which is
 // not what the sharp-edged closed form above says is there, and not what the field measures either.
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const { float3 } = require('@isopodlabs/maths/vector');

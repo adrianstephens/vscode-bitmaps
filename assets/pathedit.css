@@ -1,0 +1,38 @@
+/* the point editor (pathedit.ts): the grid and its labels, the outline and its points, the transform box, and the cursors of the
+   shapes it draws. Shared by the pages that hold one: the font inspector, the SVG editor and the bitmap editor's shape layers. */
+.insp-minor { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.12; fill: none; }
+.insp-major { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.3; fill: none; }
+.insp-labels text { font-size: 9px; fill: var(--vscode-editorLineNumber-foreground); }
+.insp-labels text.right { text-anchor: end; }
+.insp-base { stroke: var(--vscode-charts-blue); }
+.insp-metric-line { stroke: var(--vscode-charts-purple); stroke-dasharray: 4 3; stroke-opacity: 0.8; }
+.insp-metric { font-size: 10px; fill: var(--vscode-charts-purple); }
+.insp-fill { color: var(--vscode-editor-foreground); opacity: 0.28; }
+.insp-outline { fill: none; stroke: var(--vscode-editor-foreground); stroke-width: 1.5; }
+.insp-polygon { fill: none; stroke: var(--vscode-charts-orange); stroke-width: 1; stroke-opacity: 0.7; stroke-dasharray: 3 2; }
+.insp-pt { stroke: var(--vscode-editor-background); stroke-width: 1; }
+.insp-pt.k0, .insp-pt.k1 { fill: var(--vscode-charts-green); }
+.insp-pt.k0, .insp-pt.k4 { fill: var(--vscode-charts-red); }
+.insp-pt.k2, .insp-pt.k3 { fill: var(--vscode-charts-orange); }
+.insp-pt.hover, .insp-pt.picked { stroke: var(--vscode-editor-foreground); stroke-width: 1.5; }
+.insp-num { font-size: 9px; fill: var(--vscode-editor-foreground); opacity: 0.8; pointer-events: none; }
+.insp-hit { fill: none; stroke: transparent; stroke-width: 10; pointer-events: stroke; cursor: inherit; }
+.insp-pt { cursor: inherit; }
+.insp-xf-box { fill: var(--vscode-focusBorder); fill-opacity: 0.05; stroke: var(--vscode-focusBorder); stroke-width: 1; pointer-events: none; }
+.insp-xf-grid { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 1; stroke-opacity: 0.4; pointer-events: none; }
+.insp-xf-handle { fill: var(--vscode-editor-background); stroke: var(--vscode-focusBorder); stroke-width: 1.5; pointer-events: none; }
+.insp-selected { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 3; opacity: 0.8; pointer-events: none; }
+.insp-pt.in-contour { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
+.insp-fill.colored { opacity: 0.9; }
+
+.insp-view svg.drawing, svg.drawing { cursor: crosshair !important; }
+svg.drawing[data-tool="rect"] { cursor: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2232%22 height=%2232%22 viewBox=%220 0 32 32%22%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3C/g%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Crect x=%2217%22 y=%2218%22 width=%2210%22 height=%227%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Crect x=%2217%22 y=%2218%22 width=%2210%22 height=%227%22/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") 8 8, crosshair !important; }
+svg.drawing[data-tool="ellipse"] { cursor: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2232%22 height=%2232%22 viewBox=%220 0 32 32%22%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3C/g%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cellipse cx=%2222%22 cy=%2221.5%22 rx=%225%22 ry=%223.5%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cellipse cx=%2222%22 cy=%2221.5%22 rx=%225%22 ry=%223.5%22/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") 8 8, crosshair !important; }
+svg.drawing[data-tool="line"] { cursor: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2232%22 height=%2232%22 viewBox=%220 0 32 32%22%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3C/g%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M17 26L27 17%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M17 26L27 17%22/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") 8 8, crosshair !important; }
+svg.drawing[data-tool="freehand"] { cursor: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2232%22 height=%2232%22 viewBox=%220 0 32 32%22%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M8 1V15M1 8H15%22/%3E%3C/g%3E%3C/g%3E%3Cg fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cg stroke=%22%23fff%22 stroke-width=%223%22%3E%3Cpath d=%22M17 26C18 18 22 18 22 22S26 26 28 17%22/%3E%3C/g%3E%3Cg stroke=%22%23000%22 stroke-width=%221.2%22%3E%3Cpath d=%22M17 26C18 18 22 18 22 22S26 26 28 17%22/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") 8 8, crosshair !important; }
+.insp-draw { stroke: var(--vscode-charts-blue); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+
+/* where a page puts the editor's svg when it has no #insp-view of its own */
+.pathedit-host { position: relative; overflow: hidden; }
+.pathedit-host > svg { position: absolute; inset: 0; display: block; cursor: grab; touch-action: none; user-select: none; }
+.pathedit-host > svg:active { cursor: grabbing; }

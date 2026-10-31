@@ -3,37 +3,43 @@
 // finds -- with soft (antialiased) edges, and can be added to, taken from, intersected and inverted.
 // Nothing here touches the DOM, so it can be run (and tested) outside a webview.
 
-import { float2, lerp } from '@isopodlabs/maths/vector';
-import { parseCurve, bezier3Curve, curveVertex } from '@isopodlabs/binary_fonts';
-import type { Pixels } from './raster.js';
+import { float2 } from '@isopodlabs/maths/vector';
+import { curveVertex, curveFlatten, ON_BEGIN, ON_CURVE, OFF_ARC, ON_ARC } from '@isopodlabs/binary_fonts';
+import { type RGBAPixels } from './opengl.ts';
+import { signedDistance } from './raster.ts';
+import { clamp01 } from './colour.ts';
+
+// how a mask is blurred in place (width, height and sigma given), which the caller does (on the GPU: see Painter.maskBlur)
+export type MaskBlur = (f: Float32Array, width: number, height: number, sigma: number) => void;
 
 // how a new selection joins the one there is
 export type SelectMode = 'replace' | 'add' | 'subtract' | 'intersect';
 
 const SUB = 4;	// sub-scanlines a pixel row is sampled at, for antialiasing
 
-export class Selection {
+export class Selection extends float2.extent {
 	private loops?: number[][];
 
 	// `mask` is the coverage of each pixel of the box, row by row; without one the whole box is selected
-	constructor(readonly l: number, readonly t: number, readonly r: number, readonly b: number, readonly mask?: Uint8Array) {}
+	constructor(area: float2.extent, readonly mask?: Uint8Array) {
+		super(area.min, area.max);
+	}
 
-	get width()		{ return this.r - this.l; }
-	get height()	{ return this.b - this.t; }
-	get empty()		{ return this.r <= this.l || this.b <= this.t; }
+	get width()		{ return this.max.x - this.min.x; }
+	get height()	{ return this.max.y - this.min.y; }
 
 	bounds() {
-		return new float2.extent(float2(this.l, this.t), float2(this.r, this.b));
+		return this;
 	}
 
-	// how much of a pixel is selected, 0..255
+	// how much of a pixel is selected, 0..255 (the pixels are those of the box without its far edges, which `contains` has)
 	at(x: number, y: number) {
-		if (x < this.l || y < this.t || x >= this.r || y >= this.b)
-			return 0;
-		return this.mask ? this.mask[(y - this.t) * this.width + (x - this.l)] : 255;
+		if (x >= this.min.x && y >= this.min.y && x < this.max.x && y < this.max.y)
+			return this.mask ? this.mask[(y - this.min.y) * this.width + (x - this.min.x)] : 255;
+		return 0;
 	}
 	clippedAt(x: number, y: number) {
-		return this.mask ? this.mask[(y - this.t) * this.width + (x - this.l)] : 255;
+		return this.mask ? this.mask[(y - this.min.y) * this.width + (x - this.min.x)] : 255;
 	}
 
 	//-------------------------------------------------------------------------
@@ -41,11 +47,11 @@ export class Selection {
 	//-------------------------------------------------------------------------
 
 	static rect(area: float2.extent) {
-		return new Selection(area.min.x, area.min.y, area.max.x, area.max.y);
+		return new Selection(area);
 	}
 
 	static all(size: float2) {
-		return new Selection(0, 0, size.x, size.y);
+		return new Selection(new float2.extent(float2(0, 0), size));
 	}
 
 	// the inside of closed polygons (a pixel is inside where the winding number is not zero, so holes need the opposite
@@ -115,7 +121,7 @@ export class Selection {
 				mask[row + x] = Math.min(255, Math.round((acc[x] + run) * 255 / SUB));
 			}
 		}
-		return new Selection(l, t, r, b, mask).trimmed();
+		return new Selection(new float2.extent(float2(l, t), float2(r, b)), mask).trimmed();
 	}
 
 	static ellipse(area: float2.extent, size: float2) {
@@ -124,12 +130,12 @@ export class Selection {
 
 	// a closed curve (each contour of it), as curve vertices; arcs and beziers are flattened to within `tolerance` pixels
 	static curve(curve: curveVertex[], size: float2, tolerance = 0.1) {
-		return Selection.fromPolygons(flatten(curve, tolerance), size);
+		return Selection.fromPolygons(curveFlatten(curve, tolerance), size);
 	}
 
 	// the pixels within `tolerance` of the one at (sx, sy) in each channel: those connected to it, or all of them
-	static wand(image: Pixels, sx: number, sy: number, tolerance: number, contiguous: boolean) {
-		const {data, width, height} = image;
+	static wand(image: RGBAPixels, sx: number, sy: number, tolerance: number, contiguous: boolean) {
+		const {data: data, width, height} = image;
 		if (sx < 0 || sy < 0 || sx >= width || sy >= height)
 			return undefined;
 
@@ -185,7 +191,7 @@ export class Selection {
 		const w = r - l, mask = new Uint8Array(w * (b - t));
 		for (let y = t; y < b; y++)
 			mask.set(found.subarray(y * width + l, y * width + r), (y - t) * w);
-		return new Selection(l, t, r, b, mask);
+		return new Selection(new float2.extent(float2(l, t), float2(r, b)), mask);
 	}
 
 	//-------------------------------------------------------------------------
@@ -199,26 +205,21 @@ export class Selection {
 		if (!other)
 			return mode === 'intersect' ? undefined : current;
 
-		let l: number, t: number, r: number, b: number;
-		if (mode === 'add') {
-			l = Math.min(current.l, other.l); t = Math.min(current.t, other.t);
-			r = Math.max(current.r, other.r); b = Math.max(current.b, other.b);
-		} else if (mode === 'subtract') {
-			({l, t, r, b} = current);
-		} else {
-			l = Math.max(current.l, other.l); t = Math.max(current.t, other.t);
-			r = Math.min(current.r, other.r); b = Math.min(current.b, other.b);
-		}
-		if (r <= l || b <= t)
+		let ext	= mode === 'add' ? current.union(other) : mode === 'intersect' ? current.intersect(other) : current;
+		if (ext.empty())
 			return undefined;
 
-		const w = r - l, mask = new Uint8Array(w * (b - t));
-		for (let y = t; y < b; y++)
-			for (let x = l; x < r; x++) {
-				const a = current.at(x, y), c = other.at(x, y);
-				mask[(y - t) * w + (x - l)] = mode === 'add' ? Math.max(a, c) : mode === 'subtract' ? Math.round(a * (255 - c) / 255) : Math.min(a, c);
+		const {x: w, y: h} = ext.size();
+		const mask = new Uint8Array(w * h);
+		for (let y = 0; y < h; y++) {
+			const y1 = y + ext.min.y;
+			for (let x = 0; x < w; x++) {
+				const x1 = x + ext.min.x;
+				const a = current.at(x1, y1), c = other.at(x1, y1);
+				mask[y * w + x] = mode === 'add' ? Math.max(a, c) : mode === 'subtract' ? Math.round(a * (255 - c) / 255) : Math.min(a, c);
 			}
-		return new Selection(l, t, r, b, mask).trimmed();
+		}
+		return new Selection(ext, mask).trimmed();
 	}
 
 	// everything in a width x height image that this is not
@@ -228,14 +229,79 @@ export class Selection {
 		for (let y = 0; y < height; y++)
 			for (let x = 0; x < width; x++)
 				mask[y * width + x] = 255 - this.at(x, y);
-		return new Selection(0, 0, width, height, mask).trimmed();
+		return new Selection(new float2.extent(float2(0, 0), float2(width, height)), mask).trimmed();
+	}
+
+	// The selection with its edge moved out by `r` pixels (in by -r), the new edge antialiased; the image's own edges do not
+	// pull a selection in. r is in pixels, of the box's image `size`.
+	growClamp(r: number, size: float2) {
+		return this.reshape(r, size, (s, r) => clamp01(r - s + 0.5));
+	}
+
+	// a band `width` pixels wide centred on the edge
+	border(width: number, size: float2) {
+		return this.reshape(Math.ceil(width / 2), size, (s) => clamp01(width / 2 - Math.abs(s) + 0.5));
+	}
+
+	// the edge blurred over about `r` pixels either side of it
+	feather(r: number, size: float2, blur: MaskBlur) {
+		if (r <= 0)
+			return this;
+		const sigma = r / 2, pad = Math.ceil(r * 1.5) + 1;
+		const box = this.padded(pad, size);
+		const {w, h} = box, f = new Float32Array(w * h);
+		for (let i = 0; i < f.length; i++)
+			f[i] = box.mask[i];
+		blur(f, w, h, sigma);
+		return box.make(f, v => v);
+	}
+
+	// rough edges rounded off: the selection blurred over `r` pixels, then cut back to a clean edge
+	smooth(r: number, size: float2, blur: MaskBlur) {
+		if (r <= 0)
+			return this;
+		const pad = Math.ceil(r * 2) + 1;
+		const box = this.padded(pad, size);
+		const {w, h} = box, f = new Float32Array(w * h);
+		for (let i = 0; i < f.length; i++)
+			f[i] = box.mask[i];
+		blur(f, w, h, r / 2);
+		return box.make(f, v => clamp01((v - 127.5) / 255 * 4 + 0.5) * 255);
+	}
+
+	// this in a box `pad` pixels bigger each way (within the image), as a full mask
+	private padded(pad: number, size: float2) {
+		const l = Math.max(0, this.min.x - pad), t = Math.max(0, this.min.y - pad);
+		const r = Math.min(size.x, this.max.x + pad), b = Math.min(size.y, this.max.y + pad);
+		const w = r - l, h = b - t, mask = new Uint8Array(w * h);
+		for (let y = t; y < b; y++)
+			for (let x = l; x < r; x++)
+				mask[(y - t) * w + (x - l)] = this.at(x, y);
+		return {l, t, w, h, mask, make: (f: Float32Array, fn: (v: number) => number) => {
+			const out = new Uint8Array(w * h);
+			for (let i = 0; i < out.length; i++)
+				out[i] = Math.round(Math.min(255, Math.max(0, fn(f[i]))));
+			return new Selection(new float2.extent(float2(l, t), float2(r, b)), out).trimmed();
+		}};
+	}
+
+	// the coverage of each pixel as `cover` makes it from the signed distance of its centre from the edge (negative inside)
+	private reshape(r: number, size: float2, cover: (signed: number, r: number) => number) {
+		const reach = Math.ceil(Math.abs(r)) + 2;
+		const box = this.padded(reach, size);
+		const {w, h, mask} = box;
+		const signed = signedDistance(i => mask[i] >= 128, w, h), out = new Float32Array(w * h);
+		for (let i = 0; i < out.length; i++)
+			out[i] = cover(signed[i], r) * 255;
+		return box.make(out, v => v);
 	}
 
 	// the same selection in the smallest box that holds it; undefined if it holds nothing
 	trimmed(): Selection | undefined {
-		const {mask, l, t} = this, w = this.width, h = this.height;
+		const mask = this.mask;
 		if (!mask)
-			return this.empty ? undefined : this;
+			return this.empty() ? undefined : this;
+		const w = this.width, h = this.height;
 		let x0 = w, y0 = h, x1 = 0, y1 = 0;
 		for (let y = 0; y < h; y++)
 			for (let x = 0; x < w; x++)
@@ -250,7 +316,7 @@ export class Selection {
 		const nw = x1 - x0, out = new Uint8Array(nw * (y1 - y0));
 		for (let y = y0; y < y1; y++)
 			out.set(mask.subarray(y * w + x0, y * w + x1), (y - y0) * nw);
-		return new Selection(l + x0, t + y0, l + x1, t + y1, out);
+		return new Selection(new float2.extent(this.min.add(float2(x0, y0)), this.min.add(float2(x1, y1))), out);
 	}
 
 	// A selection that is a whole box (no pixel of it partly selected)
@@ -263,9 +329,9 @@ export class Selection {
 		if (this.loops)
 			return this.loops;
 		if (!this.mask)
-			return this.loops = [[this.l, this.t, this.r, this.t, this.r, this.b, this.l, this.b]];
+			return this.loops = [[this.min.x, this.min.y, this.max.x, this.min.y, this.max.x, this.max.y, this.min.x, this.max.y]];
 
-		const {l, t} = this, w = this.width, h = this.height, mask = this.mask;
+		const {x: l, y: t} = this.min, w = this.width, h = this.height, mask = this.mask;
 		const inside = (x: number, y: number) => x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] >= 128;
 		const stride = w + 1;
 		// edges run clockwise (on screen) around inside pixels: right = 1, down = 2, left = 4, up = 8, from each corner
@@ -311,32 +377,30 @@ export class Selection {
 //-----------------------------------------------------------------------------
 // shapes
 //-----------------------------------------------------------------------------
-
+/*
 export function ellipsePoints(area: float2.extent) {
 	const {x: cx, y: cy} = area.centre(), {x: rx, y: ry} = area.size().scale(0.5);
 	const n = Math.min(720, Math.max(24, Math.ceil(Math.PI * Math.max(rx, ry))));
 	return Array.from({length: n}, (_, i) => float2(cx + rx * Math.cos(2 * Math.PI * i / n), cy + ry * Math.sin(2 * Math.PI * i / n)));
 }
+*/
 
-// each contour of a curve as a polygon, within `tolerance` of the curve
-export function flatten(curve: curveVertex[], tolerance: number) {
-	const contours: float2[][] = [];
-	let out: float2[] = [];
-	const bez3 = (a: float2, b: float2, c: float2, d: float2) => {
-		const len	= b.sub(a).len() + c.sub(b).len() + d.sub(c).len();
-		const n		= Math.max(2, Math.min(256, Math.ceil(Math.sqrt(len / tolerance) / 2)));
-		for (let i = 1; i <= n; i++) {
-			const u		= i / n, v = 1 - u;
-			const wa	= v * v * v, wb = 3 * v * v * u, wc = 3 * v * u * u, wd = u * u * u;
-			out.push(float2(a.x * wa + b.x * wb + c.x * wc + d.x * wd, a.y * wa + b.y * wb + c.y * wc + d.y * wd));
-		}
-	};
-	parseCurve(bezier3Curve(curve, tolerance)).run({
-		Begin(a)			{ out = [a]; },
-		Line(_a, b)			{ out.push(b); },
-		Bezier2(a, b, c)	{ bez3(a, lerp(a, b, 2 / 3), lerp(c, b, 2 / 3), c); },
-		Bezier3(a, b, c, d) { bez3(a, b, c, d); },
-		End()				{ if (out.length > 2) contours.push(out); out = []; },
-	});
-	return contours;
+export function ellipsePoints(area: float2.extent) {
+	const c = area.centre(), ry = area.max.y - c.y, x0 = area.min.x, x1 = area.max.x;
+
+	const ellipse: curveVertex[] = [
+		curveVertex(x0, c.y, ON_BEGIN),
+		curveVertex(x0, c.y - ry * 2, OFF_ARC),   // on the tangent line at the start, 2*ry away
+		curveVertex(x1, c.y - ry * 2, OFF_ARC),   // on the tangent line at the end,area.max.y away
+		curveVertex(x1, c.y, ON_CURVE),
+		curveVertex(x1, c.y + ry * 2, OFF_ARC),
+		curveVertex(x0, c.y + ry * 2, OFF_ARC),
+	];
+	return curveFlatten(ellipse, 0.1)[0];
 }
+
+//-----------------------------------------------------------------------------
+// image processing for the modifiers
+//-----------------------------------------------------------------------------
+
+

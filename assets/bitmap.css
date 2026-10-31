@@ -28,7 +28,7 @@ html, body {
   min-height: 0;
 }
 
-#overlay {
+#overlay, #transform-overlay {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -265,24 +265,40 @@ body.tensors {
   display: none;
 }
 
-/* what a sheet of the 3D stack is taken hold of by, at its top left corner */
+/* what a sheet of the 3D stack is taken hold of by, at its top left corner: a double arrow turned along the stack */
 .fan-handle {
   position: absolute;
-  width: 14px;
+  width: 28px;
   height: 14px;
-  margin: -7px 0 0 -7px;
-  box-sizing: border-box;
-  border-radius: 50%;
-  border: 2px solid #fff;
-  background: var(--vscode-focusBorder, #0078d4);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  margin: -7px 0 0 -14px;
+  color: #fff;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.8));
+  pointer-events: none;
+  transform: rotate(var(--angle, 0rad)) scale(var(--scale, 1));
+}
+
+.fan-handle path {
+  pointer-events: auto;
   cursor: grab;
   touch-action: none;
 }
 
+.fan-handle svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: var(--vscode-focusBorder, #0078d4);
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+}
+
 .fan-handle.dragging {
+  --scale: 1.3;
+}
+
+.fan-handle.dragging path {
   cursor: grabbing;
-  transform: scale(1.4);
 }
 
 /* images being dragged over the picture, to be added to it */

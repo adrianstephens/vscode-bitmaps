@@ -7,8 +7,9 @@
 // A page subclasses it for what it draws under the points and what its edits do.
 
 import { createSVGElement } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Cascade, CascadeItem, svgFace, valueFace, valueItem, toggleItem, choiceItem } from './cascade.js';
-import { TransformMode, partAt, transformCursor, dragMode, dragQuad, boxHandles, transformIcons, HANDLE, rectToQuad, rectCorners, applyH } from './transformbox.js';
+import { Cascade, CascadeItem, icons as cascadeIcons, svgFace, valueFace, valueItem, toggleItem, choiceItem } from './cascade.js';
+import { Input, type InputLayer, type Drag } from './navigate.js';
+import { TransformMode, BoxTransform, modeChoices, transformIcons, HANDLE, carryPoint } from './transformbox.js';
 import { float2, float2x3, float3x3, lerp, mid } from '@isopodlabs/maths/vector';
 import { bezier2, bezier3, bezierClosest } from '@isopodlabs/maths/geometry';
 import { parseCurve, curveVertex, ON_BEGIN, ON_CURVE, ON_END, OFF_BEZ2, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
@@ -29,6 +30,9 @@ const affineOf = (h: float3x3) => float2x3(float2(h.x.x / h.z.z, h.x.y / h.z.z),
 
 const num	= (n: number) => +n.toFixed(2);
 const clean	= (n: number) => +n.toFixed(4);
+const xy	= (p: float2) => `${num(p.x)},${num(p.y)}`;
+const vec	= (v: {x: number, y: number}) => float2(v.x, v.y);
+const roundTo = (p: float2, step: number) => step ? float2(Math.round(p.x / step) * step, Math.round(p.y / step) * step) : p;
 
 const KIND = ['begin', 'on-curve', 'quadratic control', 'cubic control', 'end (open)'];
 
@@ -76,7 +80,7 @@ function pieces(curves: Iterable<curveVertex>) {
 	function on_curve(pt: taggedVert) {
 		switch (prev_flags) {
 			case ON_BEGIN:
-			case ON_CURVE:
+			case ON_CURVE:	add([prev, pt]); break;
 			case OFF_BEZ2:	add([prev2, prev, pt]); break;
 			case OFF_BEZ3:	add([prev3, prev2, prev, pt]); break;
 		}
@@ -143,7 +147,7 @@ function pieces(curves: Iterable<curveVertex>) {
 // function was made: shown as it is carried, or (with a label) done for good. Such a matrix can only be affine.
 export type ElementTransform = (m: float2x3, label?: string) => void;
 
-export interface DragHandler { move(dx: number, dy: number, e: PointerEvent): void; end(moved: boolean): void; raw?: boolean }
+export interface DragHandler { move(d: float2, e: PointerEvent): void; end(moved: boolean): void; raw?: boolean }
 
 // a line, a quadratic or a cubic of the outline: the points that define it, and where each is in the outline (-1 if implied)
 export interface Piece { points: float2[], at: number[] }
@@ -152,12 +156,22 @@ const curveOf = ({points}: Piece) => points.length === 4 ? new bezier3(points[0]
 	: new bezier2(points[0], points.length === 2 ? lerp(points[0], points[1], 0.5) : points[1], points[points.length - 1]);
 
 // what is drawn and how points land, which a page may share between the editors it has over the same place
+// (the grid is one only if it is given: an editor over a picture that has its own has none)
 export class ViewOptions {
 	constructor(private values: Record<string, boolean> = {}) {}
+	has(name: string) { return name in this.values || name !== 'grid'; }
 	get(name: string) { return this.values[name] ?? DEFAULT_OPTIONS[name] ?? true; }
 	set(name: string, on: boolean) { this.values[name] = on; }
 }
 const DEFAULT_OPTIONS: Record<string, boolean> = {numbers: false, snap: false};
+
+/** The grid's spacing at a scale (screen pixels to a unit): round numbers, 1, 2, 5 or 10 of a power of ten, at least `gap` pixels apart
+ *  (and no finer than `least`), with every `every`th line major. */
+export function gridSpacing(scale: number, gap = 12, least = 0) {
+	const raw = gap / scale, pow = 10 ** Math.floor(Math.log10(raw));
+	const step = Math.max(least, [1, 2, 5, 10].map(k => k * pow).find(v => v >= raw)!);
+	return {step, every: Math.round(step / 10 ** Math.floor(Math.log10(step))) === 5 ? 2 : 5};
+}
 
 export const icons = {
 	...transformIcons,
@@ -173,7 +187,7 @@ export const icons = {
 	align:		'<path d="M2 13L14 3"/><rect x="6" y="6" width="4" height="4"/><circle cx="3" cy="12" r="1.5"/><circle cx="13" cy="4" r="1.5"/>',
 	insertControl:'<path d="M2 13C2 5 8 3 14 3"/><circle cx="8" cy="4.5" r="1.6"/><rect x="1" y="12" width="3" height="3"/><rect x="12" y="1" width="3" height="3"/>',
 	fit:		'<path d="M2 6V2H6M10 2H14V6M14 10V14H10M6 14H2V10"/>',
-	grid:		'<path d="M2 2H14V14H2ZM6 2V14M10 2V14M2 6H14M2 10H14"/>',
+	grid:		cascadeIcons.grid,
 	outline:	'<path d="M3 13C3 4 8 2 13 3C14 8 12 13 3 13Z"/>',
 	polygon:	'<path d="M3 13L5 3L13 5L12 13Z" stroke-dasharray="2 1.5"/>',
 	points:		'<rect x="2" y="9" width="4" height="4"/><circle cx="11" cy="4.5" r="2"/><rect x="10" y="10" width="4" height="4"/>',
@@ -184,17 +198,21 @@ export const icons = {
 };
 
 const VIEW_TOGGLES: Record<string, string> = {
-	grid:		'Grid',
 	outline:	'Outline', 
 	polygon:	'Polygon', 
 	points:		'Points',
 	numbers:	'Point numbers', 
+	grid:		'Grid',
 	snap:		'Snap to the grid', 
 	metrics:	'Metrics', 
 	fill:		'Fill',
 };
 
-interface TransformSet {box: float2.extent, quad: float2[], s: number, orig: curveVertex[], mode: TransformMode, element?: ElementTransform};
+// a transform under way: the box, and what it carries (the points from s on, as they were, or the element by a transform of its own);
+// for a warp, the points were cut finer first, and `before` is what they were
+interface TransformSet {box: BoxTransform, s: number, orig: curveVertex[], before?: curveVertex[], element?: ElementTransform};
+
+const WARP_CUTS = 4;	// what each piece of an outline is cut into for a warp, so that it bends as the warp does
 
 export abstract class PathEditor {
 	readonly svg	= createSVGElement('svg');
@@ -202,20 +220,20 @@ export abstract class PathEditor {
 	protected readonly content	= createSVGElement('g');
 	protected readonly front	= createSVGElement('g');
 
-	view			= {x: 0, y: 0, s: 1};		// screen = world * s + (x, y), the world being the page's, y down
+	view			= {t: float2(0, 0), s: 1};	// screen = world * s + t, the world being the page's, y down
 	matrix			= float2x3.identity();		// the points' own space to the world
 	hover			= -1;
 	picked			= -1;
 	pickedContour	= -1;						// where the selected contour begins, when a whole contour is selected, or -1
 	notice			= '';
-	gridStep		= 1;						// the grid's spacing as last drawn, which points snap to
+	gridStep		= {step: 1, every: 5};		// the grid's spacing as last drawn, which points snap to
 	tool			= 'select';					// what a press on empty ground does: 'select', a shape dragged out, or what a page adds
 
 	protected yUp		= false;			// whether the grid is numbered upward, as a font's is, though the points are y down
 	protected rounding	= 1;				// what a point lands on when snapping is off: 0 for anything
 	protected cubic		= false;			// whether cubic controls may be made
-	protected dragged?: {kind: ShapeKind, corners: number[]};	// the shape being dragged out, from corner to corner in world units
-	protected drag?: {x: number, y: number, moved: boolean, point?: number, link?: {anchor: number, other: number, length: number}, custom?: DragHandler & {wx: number, wy: number}, contour?: {s: number, e: number, orig: curveVertex[], wx: number, wy: number, last?: number[], t?: number[], angle?: number}, rotated?: boolean};
+	protected dragged?: {kind: ShapeKind, corners: [float2, float2]};	// the shape being dragged out, from corner to corner in world units
+	protected drag?: {at: float2, moved: boolean, point?: number, link?: {anchor: number, other: number, length: number}, custom?: DragHandler & {w: float2}, contour?: {s: number, e: number, orig: curveVertex[], w: float2, last?: float2, t?: float2, angle?: number}, rotated?: boolean};
 	protected extraViews: string[] = [];		// view options beyond the common ones
 	protected readonly cascade: Cascade;
 
@@ -223,24 +241,26 @@ export abstract class PathEditor {
 	// a simplification being previewed: the contour (or all of them) as it was, and what it is now, shown in place of it
 	private simplifyPx	= 1.5;		// how far it may move the outline, in pixels of the view
 	private simplifying?:	{s: number, len: number, orig: curveVertex[], target: curveVertex[], token: number};
-	private lastPress?: 	{t: number, x: number, y: number};	// the last press of the line tool, for a double click
-	private lineStart?: 	number[];		// where a line begins once its first click is made, before any segment is
-	private lineHover?: 	{x: number, y: number, shift: boolean};	// where the pointer is, for the segment on its way
+	private lastPress?: 	{t: number, p: float2};	// the last press of the line tool, for a double click
+	private lineStart?: 	float2;			// where a line begins once its first click is made, before any segment is
+	private lineHover?: 	{p: float2, shift: boolean};	// where the pointer is, for the segment on its way
 	private chain?:			{s: number};		// the contour a line began, which the next goes on from
 	private lastBounds?:	{w: number, h: number};
 	private xf?:			TransformSet;
 
-	private menuAt		= {x: 0, y: 0};
+	private menuAt		= float2(0, 0);
 	private menuScope:	'points' | 'element' = 'points';	// what a transform from the menu is of: the points (it was opened over one, or the outline) or the element
 	private menuCurve:	{piece: Piece, t: number} | undefined;	// the place on the outline that the menu was opened over
 
 	get dragging() { return !!this.drag; }
 
-	constructor(readonly host: HTMLElement, readonly options = new ViewOptions()) {
-		this.cascade = new Cascade(host, () => this.menuItems());
+	// (own: the editor has the pointer over its drawing to itself; or the page puts it in the stack over something else)
+	constructor(readonly host: HTMLElement, readonly options = new ViewOptions({grid: true}), own = true) {
+		this.cascade = new Cascade(host, () => this.only() ?? this.items());
 		this.svg.append(this.back, this.content, this.front);
 		host.appendChild(this.svg);
-		this.listen();
+		if (own)
+			Input.on(this.svg).add(this.input);
 		new ResizeObserver(() => this.draw()).observe(host);
 	}
 
@@ -252,8 +272,9 @@ export abstract class PathEditor {
 	abstract canEdit(): boolean;
 	/** Whether they may be added to, removed or made into curves, or only moved. */
 	protected structural(): boolean { return true; }
-	/** The points were changed: the page records an edit with this label. */
-	abstract commit(label: string): void;
+	/** The points were changed: the page records an edit with this label. `key`, for a step of something done a step at a time (a
+	 *  nudge), says what it is a step of: steps of the same thing in a row are one edit (see Steps in history.ts). */
+	abstract commit(label: string, key?: string): void;
 	/** What is said of what is under the pointer. */
 	abstract status(text: string): void;
 	/** Whether the editor is showing at all. */
@@ -261,7 +282,7 @@ export abstract class PathEditor {
 	/** What the page says when no point or contour is in question. */
 	abstract describe(): string;
 	/** The extent of what the view fits, in world units. */
-	abstract bounds(): {x0: number, y0: number, x1: number, y1: number};
+	abstract bounds(): float2.extent;
 
 	/** Draws what lies under the outline into the content group, which is in world units. */
 	protected updateContent(_g: SVGGElement) {}
@@ -277,10 +298,10 @@ export abstract class PathEditor {
 	protected formatPoint(x: number, y: number): string { return `(${num(x)}, ${num(y)})`; }
 	/** Why the points cannot be edited, which a click on one says. */
 	protected readOnlyReason(): string { return 'this cannot be edited'; }
-	/** A click that neither picked a point nor moved the view; (x, y) is in the view's pixels. */
-	protected clicked(_e: PointerEvent, _x: number, _y: number) {}
+	/** A click that neither picked a point nor moved the view; `at` is in the view's pixels. */
+	protected clicked(_e: PointerEvent, _at: float2) {}
 	/** A press, before anything under it is looked at: the page may take it, as a pen does wherever it lands. */
-	protected capture(_e: PointerEvent, _x: number, _y: number): DragHandler | undefined { return undefined; }
+	protected capture(_e: PointerEvent, _at: float2): DragHandler | undefined { return undefined; }
 	/** Whether shapes may be drawn: by default, when contours may be added. */
 	protected canDraw(): boolean { return this.canStructure(); }
 	/** The shapes the page can make of a drag. */
@@ -289,15 +310,14 @@ export abstract class PathEditor {
 	protected extraTools(): ToolChoice[] { return []; }
 	/** Where a line goes on from, in world units, if the last one drawn is to be continued: each press then adds a segment from
 	 *  there. By default it is the end of the contour the last line began (a polygon, closed back to its first point). */
-	protected lineContinues(): number[] | undefined {
+	protected lineContinues(): float2 | undefined {
 		const p = this.points(), c = this.chain;
 		if (!c || !p || !this.canStructure() || c.s >= p.length)
 			return;
 		const {s, e} = this.contourOf(c.s);
 		if (s !== c.s || e !== p.length || p[s].flags !== ON_BEGIN)
 			return;
-		const w = this.matrix.mulPos(float2(p[(e - 1)].x, p[(e - 1)].y));
-		return [w.x, w.y];
+		return this.matrix.mulPos(vec(p[e - 1]));
 	}
 	/** Ends the continuing of a line, saying whether there was one. */
 	protected endChain(): boolean {
@@ -314,20 +334,24 @@ export abstract class PathEditor {
 	}
 	/** What the page does when the tool is changed. */
 	protected toolChanged() { this.endChain(); }
-	/** A shape was dragged out from corner (x0, y0) to (x1, y1), in world units: the page adds it. By default it is a contour. */
-	protected addShape(kind: ShapeKind, x0: number, y0: number, x1: number, y1: number) { this.addShapeContour(kind, x0, y0, x1, y1); }
+	/** A shape was dragged out from corner a to b, in world units: the page adds it. By default it is a contour. */
+	protected addShape(kind: ShapeKind, a: float2, b: float2) { this.addShapeContour(kind, a, b); }
 	/** Whether a press on this part of the drawing drags something (the page's `grab`), and not the view. */
 	protected draggable(_target: Element): boolean { return false; }
 	/** If the page can carry what is edited by a transform of its own, the way it does that; the points are then left alone. */
 	protected beginElementTransform(): ElementTransform | undefined { return undefined; }
 	/** A press that took no point or contour: the page may take it to drag something. */
-	protected grab(_e: PointerEvent, _x: number, _y: number): DragHandler | undefined { return undefined; }
+	protected grab(_e: PointerEvent, _at: float2): DragHandler | undefined { return undefined; }
 	/** The points with fewer of them, the outline kept within tol; a page that cannot do this leaves it out, and the menu has no simplify. */
 	protected simplifyPoints?(points: curveVertex[], tol: number): Promise<curveVertex[]>;
 	/** What the page puts at the head of the menu, ahead of the editing and the view. */
-	protected pageItems(_here: {x: number, y: number}): CascadeItem[] { return []; }
+	protected pageItems(_here: float2): CascadeItem[] { return []; }
 	/** Items that are the whole menu for where it was opened, in place of the page's and the editor's. */
-	protected menuOnly(_here: {x: number, y: number}): CascadeItem[] | undefined { return undefined; }
+	protected menuOnly(_here: float2): CascadeItem[] | undefined { return undefined; }
+	/** Where the menu comes up: the editor's own, or a page's that the editor's items are in (see `items`). */
+	protected showMenu(x: number, y: number) { this.cascade.open(x, y); }
+	/** The view moved by a drag on empty ground, by so many of the view's pixels: a page whose view is another's moves that. */
+	protected moveView(by: float2) { this.view.t = this.view.t.add(by); this.draw(); }
 
 	//--- options ------------------------------------------------------------------
 
@@ -337,30 +361,37 @@ export abstract class PathEditor {
 
 	//--- coordinates --------------------------------------------------------------
 
-	toScreen(x: number, y: number): [number, number] {
-		const w = this.matrix.mulPos(float2(x, y));
-		return [w.x * this.view.s + this.view.x, w.y * this.view.s + this.view.y];
+	// a point of the points' own space on the screen
+	toScreen(p: float2) {
+		return this.worldToScreen(this.matrix.mulPos(p));
 	}
-	toWorld(sx: number, sy: number): [number, number] {
-		return [(sx - this.view.x) / this.view.s, (sy - this.view.y) / this.view.s];
+	worldToScreen(w: float2) {
+		return w.scale(this.view.s).add(this.view.t);
 	}
-	toLocal(sx: number, sy: number): [number, number] {
-		const l = this.matrix.inverse().mulPos(float2(...this.toWorld(sx, sy)));
-		return [l.x, l.y];
+	toWorld(sp: float2) {
+		return sp.sub(this.view.t).scale(1 / this.view.s);
+	}
+	toLocal(sp: float2) {
+		return this.matrix.inverse().mulPos(this.toWorld(sp));
 	}
 	private local(e: {clientX: number, clientY: number}) {
 		const rect = this.svg.getBoundingClientRect();
-		return {x: e.clientX - rect.left, y: e.clientY - rect.top};
+		return float2(e.clientX - rect.left, e.clientY - rect.top);
 	}
-	private snapped(sx: number, sy: number): [number, number] {
-		const step = this.option('snap') ? this.gridStep : this.rounding;
-		let [wx, wy] = this.toWorld(sx, sy);
-		if (step) {
-			wx = Math.round(wx / step) * step;
-			wy = Math.round(wy / step) * step;
-		}
-		const {x, y} = this.matrix.inverse().mulPos(float2(wx, wy));
-		return this.rounding ? [Math.round(x), Math.round(y)] : [clean(x), clean(y)];
+	// what points snap to: the grid when snapping is on, or else the rounding
+	private snapStep() {
+		return this.option('snap') ? this.gridStep.step : this.rounding;
+	}
+	// a point of the points' own space as it is kept: on whole units, or to four places
+	private landed(l: float2) {
+		return this.rounding ? float2(Math.round(l.x), Math.round(l.y)) : float2(clean(l.x), clean(l.y));
+	}
+	private vertex(l: float2, flags: number) {
+		const {x, y} = this.landed(l);
+		return curveVertex(x, y, flags);
+	}
+	private snapped(sp: float2) {
+		return this.landed(this.matrix.inverse().mulPos(roundTo(this.toWorld(sp), this.snapStep())));
 	}
 
 	//--- the view -----------------------------------------------------------------
@@ -376,17 +407,17 @@ export abstract class PathEditor {
 
 	// the bounds in the middle of the view, at the scale that fits them or the one given
 	fit(scale?: number) {
-		const w		= this.host.clientWidth, h = this.host.clientHeight, b = this.bounds();
-		const s		= scale ?? Math.max(0.001, Math.min((w - 80) / (b.x1 - b.x0 || 1), (h - 80) / (b.y1 - b.y0 || 1)));
-		this.view	= {s, x: (w - (b.x1 - b.x0) * s) / 2 - b.x0 * s, y: (h - (b.y1 - b.y0) * s) / 2 - b.y0 * s};
+		const host	= float2(this.host.clientWidth, this.host.clientHeight), b = this.bounds(), size = b.size();
+		const s		= scale ?? Math.max(0.001, Math.min((host.x - 80) / (size.x || 1), (host.y - 80) / (size.y || 1)));
+		this.view	= {s, t: host.sub(size.scale(s)).scale(0.5).sub(b.min.scale(s))};
 		this.draw();
 	}
 
 	// zoom about a point of the view, which stays where it is
-	zoom(factor: number, cx = this.host.clientWidth / 2, cy = this.host.clientHeight / 2) {
+	zoom(factor: number, c = float2(this.host.clientWidth / 2, this.host.clientHeight / 2)) {
 		const s = Math.max(0.005, Math.min(this.view.s * factor, 4000));
 		factor = s / this.view.s;
-		this.view = {s, x: cx - (cx - this.view.x) * factor, y: cy - (cy - this.view.y) * factor};
+		this.view = {s, t: c.sub(c.sub(this.view.t).scale(factor))};
 		this.draw();
 	}
 
@@ -406,16 +437,16 @@ export abstract class PathEditor {
 		this.svg.dataset.tool = this.tool;
 		if (!this.active())
 			return;
-		const w = this.host.clientWidth, h = this.host.clientHeight, {s} = this.view;
+		const w = this.host.clientWidth, h = this.host.clientHeight, {s, t} = this.view;
 		if (!w || !h)
 			return;
 
 		const editable	= this.canEdit();
 		const points	= this.points();
-		if (this.xf && (editable || !points || points.length < this.xf.s + this.xf.orig.length))
+		if (this.xf && (!editable || !points || points.length < this.xf.s + this.xf.orig.length))
 			this.xf = undefined;
 		
-		const X = (x: number) => x * s + this.view.x, Y = (y: number) => y * s + this.view.y;
+		const X = (x: number) => x * s + t.x, Y = (y: number) => y * s + t.y;
 		if (!this.lastBounds || this.lastBounds.w !== w || this.lastBounds.h !== h) {
 			this.svg.setAttribute('width', String(w));
 			this.svg.setAttribute('height', String(h));
@@ -424,11 +455,9 @@ export abstract class PathEditor {
 
 		let back = this.paper(X, Y, w, h);
 
-		// a grid of round numbers of the page's units, as fine as keeps its lines apart on the screen
-		if (this.option('grid')) {
-			const raw	= 12 / s, pow = 10 ** Math.floor(Math.log10(raw));
-			const step	= this.gridStep = [1, 2, 5, 10].map(k => k * pow).find(v => v >= raw)!;
-			const every	= Math.round(step / pow) === 5 ? 2 : 5;
+		// a grid of round numbers of the page's units, which points snap to
+		if (this.options.has('grid') && this.option('grid')) {
+			const {step, every} = this.gridStep = gridSpacing(s);
 			let minor = '', major = '', labels = '';
 			const lines = (from: number, to: number, vertical: boolean, flip: number) => {
 				for (let k = Math.ceil(from / step); k <= Math.floor(to / step); k++) {
@@ -441,11 +470,11 @@ export abstract class PathEditor {
 						minor += d;
 				}
 			};
-			lines(-this.view.x / s, (w - this.view.x) / s, true, 1);
+			lines(-t.x / s, (w - t.x) / s, true, 1);
 			if (this.yUp)
-				lines(-(h - this.view.y) / s, this.view.y / s, false, -1);
+				lines(-(h - t.y) / s, t.y / s, false, -1);
 			else
-				lines(-this.view.y / s, (h - this.view.y) / s, false, 1);
+				lines(-t.y / s, (h - t.y) / s, false, 1);
 			back += `<path class="insp-minor" d="${minor}"/><path class="insp-major" d="${major}"/><g class="insp-labels">${labels}</g>`;
 		}
 
@@ -453,10 +482,10 @@ export abstract class PathEditor {
 			back += this.guides(X, Y, w, h);
 		this.back.innerHTML = back;
 
-		this.content.setAttribute('transform', `translate(${num(this.view.x)} ${num(this.view.y)}) scale(${s})`);
+		this.content.setAttribute('transform', `translate(${num(t.x)} ${num(t.y)}) scale(${s})`);
 		this.updateContent(this.content);
 
-		const g = `<g transform="translate(${num(this.view.x)} ${num(this.view.y)}) scale(${s}) matrix(${svgMatrix(this.matrix)})">`;
+		const g = `<g transform="translate(${num(t.x)} ${num(t.y)}) scale(${s}) matrix(${svgMatrix(this.matrix)})">`;
 		const out: string[] = [];
 		if (points) {
 			const n = points.length;
@@ -482,17 +511,15 @@ export abstract class PathEditor {
 				out.push(`${g}${hits}</g>`);
 			}
 
-			const screen = (i: number) => this.toScreen(points[i].x, points[i].y);
+			const screen = (i: number) => this.toScreen(vec(points[i]));
 			if (this.option('polygon')) {
 				let d = '';
 				for (let s = 0; s < n;) {
 					let e = s + 1;
 					while (e < n && !isBegin(points[e].flags))
 						e++;
-					for (let i = s; i < e; i++) {
-						const [x, y] = screen(i);
-						d += `${i === s ? 'M' : 'L'}${num(x)},${num(y)}`;
-					}
+					for (let i = s; i < e; i++)
+						d += `${i === s ? 'M' : 'L'}${xy(screen(i))}`;
 					d += points[(e - 1)].flags !== ON_END ? 'Z' : '';
 					s = e;
 				}
@@ -503,7 +530,7 @@ export abstract class PathEditor {
 				for (let i = 0; i < n; i++) {
 					const inContour = contour && i >= contour.s && i < contour.e;
 					if (inContour || this.option('points')) {
-						const [sx, sy] = screen(i), x = num(sx), y = num(sy), flags = points[i].flags;
+						const sp = screen(i), x = num(sp.x), y = num(sp.y), flags = points[i].flags;
 						const cls	= `insp-pt k${flags}${i === this.picked ? ' picked' : i === this.hover ? ' hover' : ''}${inContour ? ' in-contour' : ''}`;
 						const r		= i === this.hover || i === this.picked ? 5 : 3.5;
 						out.push(isControl(flags)
@@ -556,14 +583,13 @@ export abstract class PathEditor {
 	}
 
 	// the point of the outline nearest a place on the screen, if one is near enough to be meant
-	pointAt(x: number, y: number) {
+	pointAt(sp: float2) {
 		let best = -1, bestD = 10 * 10;
 		if (this.option('points') || this.pickedContour >= 0 || this.picked >= 0) {
 			const p = this.points() ?? [];
 			const {s, e} = this.option('points') ? {s: 0, e: p.length} : this.contourOf(this.pickedContour >= 0 ? this.pickedContour : this.picked);
 			for (let i = s; i < e; i++) {
-				const [sx, sy] = this.toScreen(p[i].x, p[i].y);
-				const d = (sx - x) ** 2 + (sy - y) ** 2;
+				const d = this.toScreen(vec(p[i])).sub(sp).lensq();
 				if (d < bestD) {
 					bestD = d;
 					best = i;
@@ -591,164 +617,147 @@ export abstract class PathEditor {
 		this.draw();
 	}
 
-	private shapeCorners(kind: ShapeKind, a: number[], b: number[], shift: boolean, alt: boolean) {
-		let [x, y] = b, [x0, y0] = a;
+	private shapeCorners(kind: ShapeKind, a: float2, b: float2, shift: boolean, alt: boolean): [float2, float2] {
+		let d = b.sub(a);
 		if (shift) {
 			if (kind === 'line') {
-				const angle = Math.round(Math.atan2(y - y0, x - x0) / (Math.PI / 4)) * Math.PI / 4, d = Math.hypot(x - x0, y - y0);
-				x = x0 + Math.cos(angle) * d;
-				y = y0 + Math.sin(angle) * d;
+				d = float2.cossin(Math.round(d.atan2() / (Math.PI / 4)) * Math.PI / 4).scale(d.len());
 			} else {
-				const d = Math.max(Math.abs(x - x0), Math.abs(y - y0));
-				x = x0 + Math.sign(x - x0 || 1) * d;
-				y = y0 + Math.sign(y - y0 || 1) * d;
+				const m = Math.max(Math.abs(d.x), Math.abs(d.y));
+				d = float2(Math.sign(d.x || 1) * m, Math.sign(d.y || 1) * m);
 			}
 		}
-		if (alt) {
-			x0 = 2 * a[0] - x;
-			y0 = 2 * a[1] - y;
-		}
-		return [x0, y0, x, y];
+		return [alt ? a.sub(d) : a, a.add(d)];
 	}
 
 	// a press with a shape tool chosen drags the shape out, which is shown as it goes and added when it ends
-	private shapeDrag(sx: number, sy: number, ev: PointerEvent): DragHandler | undefined {
+	private shapeDrag(sp: float2, ev: PointerEvent): DragHandler | undefined {
 		const kind = this.tool as ShapeKind;
 		if (!this.shapeKinds().includes(kind) || !this.canDraw())
 			return;
 		// the first corner is on the grid when points snap to it
-		const step = this.option('snap') ? this.gridStep : this.rounding;
-		let [x, y] = this.toWorld(sx, sy);
-		if (step) {
-			x = Math.round(x / step) * step;
-			y = Math.round(y / step) * step;
-		}
+		const w = roundTo(this.toWorld(sp), this.snapStep());
 		if (kind === 'line') {
 			// a line is clicked out: the first click sets where it begins, and each after commits a segment to the click and goes on
 			// from there; the segment on its way follows the pointer
 			const from = this.lineContinues() ?? this.lineStart;
 			// a double click ends it: its first click made the last corner
 			const now = performance.now(), last = this.lastPress;
-			this.lastPress = {t: now, x: sx, y: sy};
-			if (from && last && now - last.t < 500 && Math.hypot(sx - last.x, sy - last.y) < 5) {
+			this.lastPress = {t: now, p: sp};
+			if (from && last && now - last.t < 500 && sp.sub(last.p).len() < 5) {
 				this.endChain();
 				this.draw();
 				return {move() {}, end: () => this.draw()};
 			}
 			if (!from) {
-				this.lineStart = [x, y];
+				this.lineStart = w;
 			} else {
-				const c = this.shapeCorners('line', from, [x, y], ev.shiftKey, false);
-				if (Math.hypot(c[2] - c[0], c[3] - c[1]) * this.view.s >= 3) {
+				const [a, b] = this.shapeCorners('line', from, w, ev.shiftKey, false);
+				if (b.sub(a).len() * this.view.s >= 3) {
 					this.lineStart = undefined;
-					this.addShape('line', c[0], c[1], c[2], c[3]);
+					this.addShape('line', a, b);
 				}
 			}
-			this.lineHover = {x, y, shift: ev.shiftKey};
+			this.lineHover = {p: w, shift: ev.shiftKey};
 			this.draw();
-			return {move: (dx, dy, e) => { this.lineHover = {x: x + dx, y: y + dy, shift: e.shiftKey}; }, end: () => this.draw()};
+			return {move: (d, e) => { this.lineHover = {p: w.add(d), shift: e.shiftKey}; }, end: () => this.draw()};
 		}
-		const start = [x, y];
-		let corners = [x, y, x, y];
+		let corners: [float2, float2] = [w, w];
 		return {
-			move:	(dx, dy, e) => {
-				corners = this.shapeCorners(kind, start, [x + dx, y + dy], e.shiftKey, e.altKey);
+			move:	(d, e) => {
+				corners = this.shapeCorners(kind, w, w.add(d), e.shiftKey, e.altKey);
 				this.dragged = {kind, corners};
 			},
 			end:	moved => {
 				this.dragged = undefined;
-				if (moved && Math.hypot(corners[2] - corners[0], corners[3] - corners[1]) * this.view.s >= 3)
-					this.addShape(kind, corners[0], corners[1], corners[2], corners[3]);
+				if (moved && corners[1].sub(corners[0]).len() * this.view.s >= 3)
+					this.addShape(kind, ...corners);
 				this.draw();
 			},
 		};
 	}
 
 	private shapePreview() {
-		const v = this.view;
+		const screen = (w: float2) => this.worldToScreen(w);
 		// where a line that goes on will go on from
 		const end = this.tool === 'line' ? this.lineContinues() ?? this.lineStart : undefined;
-		const h = this.lineHover;
+		const h = this.lineHover, e = end && screen(end);
+		const marker = e ? `<circle class="insp-draw" cx="${num(e.x)}" cy="${num(e.y)}" r="5" fill="none"/>` : '';
 		if (end && h && !this.dragged) {
-			const c = this.shapeCorners('line', end, [h.x, h.y], h.shift, false);
-			this.dragged = undefined;
-			return `<circle class="insp-draw" cx="${num(end[0] * v.s + v.x)}" cy="${num(end[1] * v.s + v.y)}" r="5" fill="none"/><path class="insp-draw" d="M${num(c[0] * v.s + v.x)},${num(c[1] * v.s + v.y)}L${num(c[2] * v.s + v.x)},${num(c[3] * v.s + v.y)}" fill="none"/>`;
+			const [a, b] = this.shapeCorners('line', end, h.p, h.shift, false).map(screen);
+			return `${marker}<path class="insp-draw" d="M${xy(a)}L${xy(b)}" fill="none"/>`;
 		}
-		const marker = end ? `<circle class="insp-draw" cx="${num(end[0] * v.s + v.x)}" cy="${num(end[1] * v.s + v.y)}" r="5" fill="none"/>` : '';
 		if (!this.dragged)
 			return marker;
-		const [x0, y0, x1, y1] = this.dragged.corners.map((c, i) => num(c * v.s + (i % 2 ? v.y : v.x)));
-		return marker + (this.dragged.kind === 'line' ? `<path class="insp-draw" d="M${x0},${y0}L${x1},${y1}" fill="none"/>`
-			: this.dragged.kind === 'rect' ? `<rect class="insp-draw" x="${Math.min(x0, x1)}" y="${Math.min(y0, y1)}" width="${Math.abs(x1 - x0)}" height="${Math.abs(y1 - y0)}" fill="none"/>`
-			: `<ellipse class="insp-draw" cx="${num((x0 + x1) / 2)}" cy="${num((y0 + y1) / 2)}" rx="${num(Math.abs(x1 - x0) / 2)}" ry="${num(Math.abs(y1 - y0) / 2)}" fill="none"/>`);
+		const [a, b] = this.dragged.corners.map(screen), box = float2.extent.from([a, b]), size = box.size(), c = box.centre();
+		return marker + (this.dragged.kind === 'line' ? `<path class="insp-draw" d="M${xy(a)}L${xy(b)}" fill="none"/>`
+			: this.dragged.kind === 'rect' ? `<rect class="insp-draw" x="${num(box.min.x)}" y="${num(box.min.y)}" width="${num(size.x)}" height="${num(size.y)}" fill="none"/>`
+			: `<ellipse class="insp-draw" cx="${num(c.x)}" cy="${num(c.y)}" rx="${num(size.x / 2)}" ry="${num(size.y / 2)}" fill="none"/>`);
 	}
 
 	// a rectangle or ellipse as a contour, running the way a TrueType outer contour does; an ellipse is made of cubic curves
 	// where the points may be cubic, and of eight quadratic ones where not
-	protected addShapeContour(kind: ShapeKind, x0: number, y0: number, x1: number, y1: number) {
+	protected addShapeContour(kind: ShapeKind, a: float2, b: float2) {
 		if (!this.canStructure())
 			return;
 		const inv = this.matrix.inverse(), p = this.points()!;
 		const first = p.length;
-		const put = (x: number, y: number, flags: number) => {
-			const l = inv.mulPos(float2(x, y));
-			p.push(curveVertex(this.rounding ? Math.round(l.x) : clean(l.x), this.rounding ? Math.round(l.y) : clean(l.y), flags));
-		};
-		const [l, r, t, b] = [Math.min(x0, x1), Math.max(x0, x1), Math.min(y0, y1), Math.max(y0, y1)];
+		const put = (w: float2, flags: number) => { p.push(this.vertex(inv.mulPos(w), flags)); };
 		if (kind === 'line') {
 			// a polygon, a corner for each press: it closes when it comes back to where it began, and Enter or Escape leaves it as it
 			// is. Two points are no outline (a font drops them), so the first line is only shown, and the corner after it is the first
 			// edit, of a polygon that has three.
 			const c = this.chain, end = this.lineContinues();
 			if (c && end) {
-				const q = this.matrix.mulPos(float2(p[c.s].x, p[c.s].y)), count = p.length - c.s;
-				if (count >= 3 && Math.hypot(x1 - q.x, y1 - q.y) * this.view.s < 6) {
+				const q = this.matrix.mulPos(vec(p[c.s])), count = p.length - c.s;
+				if (count >= 3 && b.sub(q).len() * this.view.s < 6) {
 					this.chain = undefined;
 					this.pickedContour = c.s;
 					this.commit('Close contour');
 					this.draw();
 					return;
 				}
-				put(x1, y1, ON_CURVE);
+				put(b, ON_CURVE);
 				this.pickedContour = c.s;
 				this.commit(count === 2 ? 'Draw polygon' : 'Extend contour');
 				this.draw();
 				return;
 			}
-			put(x0, y0, ON_BEGIN);
-			put(x1, y1, ON_CURVE);
+			put(a, ON_BEGIN);
+			put(b, ON_CURVE);
 			this.chain = {s: first};
 			this.picked = -1;
 			this.pickedContour = first;
 			this.draw();
 			return;
 		}
+		const box = float2.extent.from([a, b]), {min, max} = box;
 		if (kind === 'rect') {
-			put(l, b, ON_BEGIN);
-			put(l, t, ON_CURVE);
-			put(r, t, ON_CURVE);
-			put(r, b, ON_CURVE);
+			put(float2(min.x, max.y), ON_BEGIN);
+			put(min, ON_CURVE);
+			put(float2(max.x, min.y), ON_CURVE);
+			put(max, ON_CURVE);
 		} else {
 			// from the left, round clockwise as seen: P(a) is the point at angle a, and the tangent there goes with a falling
-			const cx = (l + r) / 2, cy = (t + b) / 2, rx = (r - l) / 2, ry = (b - t) / 2;
-			const P = (a: number, k = 1) => [cx + Math.cos(a) * rx * k, cy - Math.sin(a) * ry * k];
-			const T = (a: number) => [Math.sin(a) * rx, Math.cos(a) * ry];
-			put(...(P(Math.PI) as [number, number]), ON_BEGIN);
+			const centre = box.centre(), r = box.size().scale(0.5);
+			const P = (a: number, k = 1) => centre.add(float2(Math.cos(a), -Math.sin(a)).mul(r).scale(k));
+			const T = (a: number) => float2(Math.sin(a), Math.cos(a)).mul(r);
+			put(P(Math.PI), ON_BEGIN);
 			if (this.cubic) {
 				const k = 0.5523;
 				for (let i = 0; i < 4; i++) {
-					const a = Math.PI - i * Math.PI / 2, c = a - Math.PI / 2, [px, py] = P(a), [qx, qy] = P(c), t0 = T(a), t1 = T(c);
-					put(px + t0[0] * k, py + t0[1] * k, OFF_BEZ3);
-					put(qx - t1[0] * k, qy - t1[1] * k, OFF_BEZ3);
+					const a0 = Math.PI - i * Math.PI / 2, a1 = a0 - Math.PI / 2, q = P(a1);
+					put(P(a0).add(T(a0).scale(k)), OFF_BEZ3);
+					put(q.sub(T(a1).scale(k)), OFF_BEZ3);
 					if (i < 3)
-						put(qx, qy, ON_CURVE);
+						put(q, ON_CURVE);
 				}
 			} else {
 				for (let i = 0; i < 8; i++) {
 					const a = Math.PI - i * Math.PI / 4;
-					put(...(P(a - Math.PI / 8, 1 / Math.cos(Math.PI / 8)) as [number, number]), OFF_BEZ2);
+					put(P(a - Math.PI / 8, 1 / Math.cos(Math.PI / 8)), OFF_BEZ2);
 					if (i < 7)
-						put(...(P(a - Math.PI / 4) as [number, number]), ON_CURVE);
+						put(P(a - Math.PI / 4), ON_CURVE);
 				}
 			}
 		}
@@ -761,38 +770,33 @@ export abstract class PathEditor {
 	// A contour dragged: it is moved by the pointer's moves, and with Alt turned about the middle of its box (as it was picked)
 	// by the angle the pointer goes round the middle of the contour as it is; the two add up, so Alt may be pressed and let go
 	// during the drag. Shift turns it in steps of 15 degrees, and the move keeps to the grid.
-	private dragContour(c: NonNullable<PathEditor['drag']>['contour'] & {}, wx: number, wy: number, alt: boolean, shift: boolean) {
-		const world = c.orig.map(v => {
-			const w = this.matrix.mulPos(float2(v.x, v.y));
-			return [w.x, w.y];
-		});
-		const xs = world.map(w => w[0]), ys = world.map(w => w[1]);
-		const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-		const last = c.last ?? [c.wx, c.wy], t = c.t ??= [0, 0];
+	private dragContour(c: NonNullable<PathEditor['drag']>['contour'] & {}, w: float2, alt: boolean, shift: boolean) {
+		const world		= c.orig.map(v => this.matrix.mulPos(vec(v)));
+		const centre	= float2.extent.from(world).centre();
+		const last		= c.last ?? c.w;
+		c.t ??= float2(0, 0);
 		c.angle ??= 0;
-		if (alt)
-			c.angle += Math.atan2(wy - (cy + t[1]), wx - (cx + t[0])) - Math.atan2(last[1] - (cy + t[1]), last[0] - (cx + t[0]));
-		else {
-			t[0] += wx - last[0];
-			t[1] += wy - last[1];
+		if (alt) {
+			const o = centre.add(c.t);
+			c.angle += w.sub(o).atan2() - last.sub(o).atan2();
+		} else {
+			c.t = c.t.add(w.sub(last));
 		}
-		c.last = [wx, wy];
+		c.last = w;
 		const angle = shift ? Math.round(c.angle / (Math.PI / 12)) * Math.PI / 12 : c.angle;
-		const step = this.option('snap') ? this.gridStep : this.rounding;
-		const [tx, ty] = step ? t.map(v => Math.round(v / step) * step) : t;
-		const cos = Math.cos(angle), sin = Math.sin(angle), inv = this.matrix.inverse(), p = this.points()!;
-		world.forEach(([x, y], i) => {
-			const l = inv.mulPos(float2(cx + (x - cx) * cos - (y - cy) * sin + tx, cy + (x - cx) * sin + (y - cy) * cos + ty));
-			p[c.s + i].x = this.rounding ? Math.round(l.x) : clean(l.x);
-			p[c.s + i].y = this.rounding ? Math.round(l.y) : clean(l.y);
+		const t = roundTo(c.t, this.snapStep()), rotate = float2.rotate(angle), inv = this.matrix.inverse(), p = this.points()!;
+		world.forEach((v, i) => {
+			const l = this.landed(inv.mulPos(rotate.mul(v.sub(centre)).add(centre).add(t)));
+			p[c.s + i].x = l.x;
+			p[c.s + i].y = l.y;
 		});
 		this.drag!.rotated = angle !== 0;
 	}
 
-	private shift(i: number, dx: number, dy: number) {
+	private shift(i: number, d: float2) {
 		const v = this.points()![i];
-		v.x = clean(v.x + dx);
-		v.y = clean(v.y + dy);
+		v.x = clean(v.x + d.x);
+		v.y = clean(v.y + d.y);
 	}
 
 	// the controls either side of an on-curve point, which go where it goes
@@ -826,11 +830,11 @@ export abstract class PathEditor {
 		const o = this.oppositeOf(k);
 		if (!o)
 			return;
-		const p = this.points()!, {anchor, other} = o;
-		const ax = p[k].x - p[anchor].x, ay = p[k].y - p[anchor].y, bx = p[other].x - p[anchor].x, by = p[other].y - p[anchor].y;
-		const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+		const p = this.points()!, {anchor, other} = o, at = vec(p[anchor]);
+		const a = vec(p[k]).sub(at), b = vec(p[other]).sub(at);
+		const la = a.len(), lb = b.len();
 		// opposite directions, within about a degree
-		if (la > 0 && lb > 0 && ax * bx + ay * by < 0 && Math.abs(ax * by - ay * bx) < 0.02 * la * lb)
+		if (la > 0 && lb > 0 && a.dot(b) < 0 && Math.abs(a.cross(b)) < 0.02 * la * lb)
 			return {anchor, other, length: lb};
 	}
 
@@ -839,34 +843,35 @@ export abstract class PathEditor {
 		const o = this.picked >= 0 ? this.oppositeOf(this.picked) : undefined;
 		if (!this.canStructure() || !o)
 			return;
-		const p = this.points()!, a = p[o.anchor];
-		if (p[this.picked].x === a.x && p[this.picked].y === a.y)
+		const p = this.points()!, a = vec(p[o.anchor]);
+		if (vec(p[this.picked]).eq(a))
 			return this.refuse('the control is on its point, so has no direction');
-		this.keepStraight({...o, length: Math.hypot(p[o.other].x - a.x, p[o.other].y - a.y)}, p[this.picked]);
+		this.keepStraight({...o, length: vec(p[o.other]).sub(a).len()}, p[this.picked]);
 		this.commit('Align handles');
 		this.draw();
 	}
 
 	// the linked control turned to stay in line with the one dragged, at the distance it was
 	private keepStraight(link: {anchor: number, other: number, length: number}, dragged: curveVertex) {
-		const p = this.points()!, a = p[link.anchor], o = p[link.other];
-		const dx = a.x - dragged.x, dy = a.y - dragged.y, d = Math.hypot(dx, dy);
-		if (d === 0)
+		const p = this.points()!, a = vec(p[link.anchor]), o = p[link.other];
+		const d = a.sub(vec(dragged)), len = d.len();
+		if (len === 0)
 			return;
-		o.x = clean(a.x + dx / d * link.length);
-		o.y = clean(a.y + dy / d * link.length);
+		const to = a.add(d.scale(link.length / len));
+		o.x = clean(to.x);
+		o.y = clean(to.y);
 	}
 
-	nudge(dx: number, dy: number) {
+	nudge(d: float2) {
 		if (!this.canEdit() || (this.picked < 0 && this.pickedContour < 0))
 			return;
 		const [from, to] = this.picked >= 0 ? [this.picked, this.picked + 1] : [this.pickedContour, this.contourOf(this.pickedContour).e];
 		for (let i = from; i < to; i++)
-			this.shift(i, dx, dy);
+			this.shift(i, d);
 		if (this.picked >= 0)
-			this.handlesOf(this.picked).forEach(i => this.shift(i, dx, dy));
+			this.handlesOf(this.picked).forEach(i => this.shift(i, d));
 		this.draw();
-		this.commit(this.picked >= 0 ? 'Move point' : 'Move contour');
+		this.commit(this.picked >= 0 ? 'Move point' : 'Move contour', this.picked >= 0 ? `point ${this.picked}` : `contour ${this.pickedContour}`);
 	}
 
 	selectContour(of: number) {
@@ -919,7 +924,7 @@ export abstract class PathEditor {
 			const result = await simplify(sim.orig, this.rounding ? tol / 2 : tol);
 			if (this.simplifying !== sim || token !== sim.token || this.points() !== sim.target)
 				return;
-			const out = result.map(v => curveVertex(this.rounding ? Math.round(v.x) : clean(v.x), this.rounding ? Math.round(v.y) : clean(v.y), v.flags));
+			const out = result.map(v => this.vertex(vec(v), v.flags));
 			sim.target.splice(sim.s, sim.len, ...out);
 			sim.len = out.length;
 			this.picked = this.pickedContour = this.hover = -1;
@@ -1053,15 +1058,14 @@ export abstract class PathEditor {
 	}
 
 	// the place on the outline nearest a place on the screen, if near enough to be meant: the piece it is on, and how far along it
-	curveAt(sx: number, sy: number) {
+	curveAt(sp: float2) {
 		if (!this.points())
 			return;
-		const [lx, ly] = this.toLocal(sx, sy), here = float2(lx, ly);
+		const here = this.toLocal(sp);
 		let best: {piece: Piece, t: number} | undefined, bestD = 8 * 8;
 		for (const piece of this.pieces()) {
-			const bez = curveOf(piece), {t} = bezierClosest(here, bez), q = bez.evaluate(t);
-			const [x, y] = this.toScreen(q.x, q.y);
-			const d = (x - sx) ** 2 + (y - sy) ** 2;
+			const bez = curveOf(piece), {t} = bezierClosest(here, bez);
+			const d = this.toScreen(bez.evaluate(t)).sub(sp).lensq();
 			if (d < bestD && t > 0.001 && t < 0.999) {
 				bestD = d;
 				best = {piece, t};
@@ -1077,16 +1081,14 @@ export abstract class PathEditor {
 		if (!this.canStructure())
 			return;
 		const {points, at} = piece, last = points.length - 1;
-		const make = (x: number, y: number, flags: number) => curveVertex(this.rounding ? Math.round(x) : clean(x), this.rounding ? Math.round(y) : clean(y), flags);
 		const p = this.points()!;
 		if (last === 1) {
-			const q = lerp(points[0], points[1], t);
-			p.splice(at[0] + 1, 0, make(q.x, q.y, ON_CURVE));
+			p.splice(at[0] + 1, 0, this.vertex(lerp(points[0], points[1], t), ON_CURVE));
 			this.picked = at[0] + 1;
 		} else {
-			const inner = curveOf(piece).split(t).control.slice(1, -1), middle = (inner.length - 1) / 2, flags = last === 2 ? OFF_BEZ2 : OFF_BEZ3;
-			const start = at[0] < 0 ? [make(points[0].x, points[0].y, ON_CURVE)] : [], end = at[last] < 0 ? [make(points[last].x, points[last].y, ON_CURVE)] : [];
-			p.splice(at[1], last - 1, ...start, ...inner.map((v, k) => make(v.x, v.y, k === middle ? ON_CURVE : flags)), ...end);
+			const inner = curveOf(piece).splitAt(t).control.slice(1, -1), middle = (inner.length - 1) / 2, flags = last === 2 ? OFF_BEZ2 : OFF_BEZ3;
+			const start = at[0] < 0 ? [this.vertex(points[0], ON_CURVE)] : [], end = at[last] < 0 ? [this.vertex(points[last], ON_CURVE)] : [];
+			p.splice(at[1], last - 1, ...start, ...inner.map((v, k) => this.vertex(v, k === middle ? ON_CURVE : flags)), ...end);
 			this.picked = at[1] + start.length + middle;
 		}
 		this.pickedContour = -1;
@@ -1101,7 +1103,7 @@ export abstract class PathEditor {
 		if (!this.canStructure() || !this.canRaise(piece))
 			return;
 		const {points, at} = piece, p = this.points()!;
-		const make = (q: float2, flags: number) => curveVertex(this.rounding ? Math.round(q.x) : clean(q.x), this.rounding ? Math.round(q.y) : clean(q.y), flags);
+		const make = (q: float2, flags: number) => this.vertex(q, flags);
 		if (points.length === 2) {
 			p.splice(at[0] + 1, 0, make(lerp(points[0], points[1], 0.5), OFF_BEZ2));
 			this.picked = at[0] + 1;
@@ -1124,205 +1126,200 @@ export abstract class PathEditor {
 
 	//--- the pointer ----------------------------------------------------------------
 
-	private listen() {
-		const svg = this.svg;
-		svg.addEventListener('pointerdown', e => {
-			// the right button (or Ctrl with the left, which a Mac takes for it) is for the context menu, not for dragging
-			if (e.button === 2 || (e.button === 0 && e.ctrlKey))
-				return;
-			svg.setPointerCapture(e.pointerId);
-			// a press on the drawing keeps a simplification that is shown
-			this.endSimplify(true);
-			const here = this.local(e), editable = this.canEdit();
-			const taken = this.xf ? this.transformDrag(e, here.x, here.y) : this.capture(e, here.x, here.y) ?? this.shapeDrag(here.x, here.y, e);
-			if (taken) {
-				const [wx, wy] = this.toWorld(here.x, here.y);
-				this.drag = {x: e.clientX, y: e.clientY, moved: false, custom: {...taken, wx, wy}};
-				return;
-			}
-			const point = editable ? this.pointAt(here.x, here.y) : -1;
-			// a point of an outline that cannot be edited says why, instead of nothing happening
-			if (!editable && this.points() && this.pointAt(here.x, here.y) >= 0)
-				this.refuse(this.readOnlyReason());
-			this.drag = {x: e.clientX, y: e.clientY, moved: false, point: point >= 0 ? point : undefined, link: point >= 0 ? this.linkOf(point) : undefined};
-			if (point >= 0) {
-				this.picked = point;
-				this.pickedContour = -1;
-				this.draw();
-				return;
-			}
-			// a contour is picked by its outline, and is then dragged as a whole
-			const hit = editable ? (e.target as Element).closest<SVGElement>('[data-contour]') : null;
-			if (hit) {
-				const {s, e: end} = this.contourOf(+hit.dataset.contour!);
-				this.picked = -1;
-				this.pickedContour = s;
-				const [wx, wy] = this.toWorld(here.x, here.y);
-				this.drag.contour = {s, e: end, orig: this.points()!.slice(s, end).map(v => ({...v})), wx, wy};
-				this.draw();
-				return;
-			}
-			// the page may change what is selected in taking the press, which clears a drag
-			const drag = this.drag, handler = this.grab(e, here.x, here.y);
-			this.drag = drag;
-			if (handler) {
-				const [wx, wy] = this.toWorld(here.x, here.y);
-				drag.custom = {...handler, wx, wy};
-			}
-		});
-		svg.addEventListener('pointermove', e => {
-			const here = this.local(e), drag = this.drag;
-			if (drag?.point !== undefined) {
-				if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 2)
-					drag.moved = true;
-				if (drag.moved) {
-					const [x, y] = this.snapped(here.x, here.y), p = this.points()!;
-					const q = p[drag.point], dx = x - q.x, dy = y - q.y;
-					q.x = x;
-					q.y = y;
-					this.handlesOf(drag.point).forEach(i => this.shift(i, dx, dy));
-					// Alt breaks the link for the rest of the drag, as letting go of it just before the button would re-join them
-					if (e.altKey)
-						drag.link = undefined;
-					if (drag.link)
-						this.keepStraight(drag.link, q);
-					this.draw();
-				}
-				return;
-			}
-			if (drag?.custom) {
-				if (drag.custom.raw || Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3)
-					drag.moved = true;
-				if (drag.moved) {
-					const step = drag.custom.raw ? 0 : this.option('snap') ? this.gridStep : this.rounding;
-					const [wx, wy] = this.toWorld(here.x, here.y);
-					let dx = wx - drag.custom.wx, dy = wy - drag.custom.wy;
-					if (step) {
-						dx = Math.round(dx / step) * step;
-						dy = Math.round(dy / step) * step;
-					}
-					drag.custom.move(clean(dx), clean(dy), e);
-					this.draw();
-				}
-				return;
-			}
-			if (drag?.contour) {
-				if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 2)
-					drag.moved = true;
-				if (drag.moved) {
-					this.dragContour(drag.contour, ...this.toWorld(here.x, here.y), e.altKey, e.shiftKey);
-					this.draw();
-				}
-				return;
-			}
-			if (drag) {
-				if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3)
-					drag.moved = true;
-				if (drag.moved) {
-					svg.style.cursor = 'grabbing';
-					this.view.x += e.clientX - drag.x;
-					this.view.y += e.clientY - drag.y;
-					drag.x = e.clientX;
-					drag.y = e.clientY;
-					this.draw();
-				}
-				return;
-			}
-			if (this.xf) {
-				const xf = this.xf, [wx, wy] = this.toWorld(here.x, here.y);
-				svg.style.cursor = transformCursor(xf.box, xf.quad, partAt(xf.box, xf.quad, float2(wx, wy), this.handleRadius()), xf.mode);
-				return;
-			}
-			if (this.tool === 'line' && (this.lineStart || this.lineContinues())) {
-				const step = this.option('snap') ? this.gridStep : this.rounding;
-				let [x, y] = this.toWorld(here.x, here.y);
-				if (step) {
-					x = Math.round(x / step) * step;
-					y = Math.round(y / step) * step;
-				}
-				this.lineHover = {x, y, shift: e.shiftKey};
-				this.draw();
-			}
-			const at = this.pointAt(here.x, here.y);
-			// a cross on a point, which moves it; a four-way arrow along a curve, which moves the whole contour; an arrow over
-			// something the page can drag (a fill); a hand elsewhere, which moves the view
-			svg.style.cursor = at >= 0 ? 'crosshair' : (e.target as Element).closest('[data-contour]') ? 'move' : this.draggable(e.target as Element) ? 'default' : 'grab';
-			if (at !== this.hover) {
-				this.hover = at;
-				this.draw();
-			}
-		});
-		svg.addEventListener('pointerleave', () => {
-			svg.style.cursor = '';
+	// (what is drawn, under the pointer: a layer of the stack over the drawing (navigate.ts), its own unless a page puts it in another's)
+	readonly input: InputLayer = {
+		press:	e => this.press(e),
+		hover:	e => this.active() ? this.hovered(e) : undefined,
+		leave:	() => {
 			if (!this.drag && this.hover >= 0) {
 				this.hover = -1;
 				this.draw();
 			}
-		});
-		svg.addEventListener('pointerup', e => {
-			if (svg.style.cursor === 'grabbing')
-				svg.style.cursor = 'grab';
-			if (svg.hasPointerCapture(e.pointerId))
-				svg.releasePointerCapture(e.pointerId);
-			const drag = this.drag;
-			this.drag = undefined;
-			if (drag?.custom)
-				drag.custom.end(drag.moved);
-			else if (drag?.point !== undefined && drag.moved)
-				this.commit('Move point');
-			else if (drag?.contour) {
-				if (drag.moved)
-					this.commit(drag.rotated ? 'Rotate contour' : 'Move contour');
-			} else if (drag && !drag.moved) {
-				const here = this.local(e);
-				this.picked = this.pointAt(here.x, here.y);
-				if (this.picked >= 0 || drag.point === undefined)
-					this.pickedContour = -1;
+		},
+		wheel:	e => {
+			if (!this.active())
+				return false;
+			this.zoom(Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002)), this.local(e));
+			return true;
+		},
+		menu:	e => this.active() && this.contextMenu(e),
+	};
+
+	// A press: of a point, which is dragged; of the outline, which drags its contour; of what the page takes (a handle); or of empty ground,
+	// which drags the view. (The right button, or Ctrl with the left, which a Mac takes for it, is for the context menu.)
+	private press(e: PointerEvent): Drag | undefined {
+		if (!this.active() || e.button !== 0 || e.ctrlKey)
+			return;
+		this.pressed(e);
+		return {move: e => this.dragTo(e), end: e => this.released(e)};
+	}
+
+	private pressed(e: PointerEvent) {
+		// a press on the drawing keeps a simplification that is shown
+		this.endSimplify(true);
+		const here = this.local(e), editable = this.canEdit(), at = float2(e.clientX, e.clientY);
+		const taken = this.xf ? this.transformDrag(e, here) : this.capture(e, here) ?? this.shapeDrag(here, e);
+		if (taken) {
+			this.drag = {at, moved: false, custom: {...taken, w: this.toWorld(here)}};
+			return;
+		}
+		const point = editable ? this.pointAt(here) : -1;
+		// a point of an outline that cannot be edited says why, instead of nothing happening
+		if (!editable && this.points() && this.pointAt(here) >= 0)
+			this.refuse(this.readOnlyReason());
+		this.drag = {at, moved: false, point: point >= 0 ? point : undefined, link: point >= 0 ? this.linkOf(point) : undefined};
+		if (point >= 0) {
+			this.picked = point;
+			this.pickedContour = -1;
+			this.draw();
+			return;
+		}
+		// a contour is picked by its outline, and is then dragged as a whole
+		const hit = editable ? (e.target as Element).closest<SVGElement>('[data-contour]') : null;
+		if (hit) {
+			const {s, e: end} = this.contourOf(+hit.dataset.contour!);
+			this.picked = -1;
+			this.pickedContour = s;
+			this.drag.contour = {s, e: end, orig: this.points()!.slice(s, end).map(v => ({...v})), w: this.toWorld(here)};
+			this.draw();
+			return;
+		}
+		// the page may change what is selected in taking the press, which clears a drag
+		const drag = this.drag, handler = this.grab(e, here);
+		this.drag = drag;
+		if (handler)
+			drag.custom = {...handler, w: this.toWorld(here)};
+	}
+
+	private dragTo(e: PointerEvent) {
+		const here = this.local(e), drag = this.drag;
+		// how far the pointer has gone from the press, as the sum of the two ways
+		const travel = () => { const d = drag!.at.sub(float2(e.clientX, e.clientY)); return Math.abs(d.x) + Math.abs(d.y); };
+		if (drag?.point !== undefined) {
+			if (travel() > 2)
+				drag.moved = true;
+			if (drag.moved) {
+				const to = this.snapped(here), p = this.points()!;
+				const q = p[drag.point], d = to.sub(vec(q));
+				q.x = to.x;
+				q.y = to.y;
+				this.handlesOf(drag.point).forEach(i => this.shift(i, d));
+				// Alt breaks the link for the rest of the drag, as letting go of it just before the button would re-join them
+				if (e.altKey)
+					drag.link = undefined;
+				if (drag.link)
+					this.keepStraight(drag.link, q);
 				this.draw();
-				if (this.picked < 0)
-					this.clicked(e, here.x, here.y);
 			}
-		});
-		svg.addEventListener('wheel', e => {
-			e.preventDefault();
-			const here = this.local(e);
-			this.zoom(Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002)), here.x, here.y);
-		}, {passive: false});
-		svg.addEventListener('contextmenu', e => {
-			e.preventDefault();
-			const here = this.local(e);
-			this.menuCurve = undefined;
-			if (this.canEdit()) {
-				const at = this.pointAt(here.x, here.y);
-				const hit = (e.target as Element).closest<SVGElement>('[data-contour]');
-				this.menuScope = at >= 0 || hit ? 'points' : 'element';
-				if (at >= 0) {
-					this.picked = at;
-					this.pickedContour = -1;
-				} else if (hit) {
-					this.menuCurve = this.curveAt(here.x, here.y);
-					this.picked = -1;
-					this.pickedContour = this.contourOf(+hit.dataset.contour!).s;
-				}
+			return;
+		}
+		if (drag?.custom) {
+			if (drag.custom.raw || travel() > 3)
+				drag.moved = true;
+			if (drag.moved) {
+				const d = roundTo(this.toWorld(here).sub(drag.custom.w), drag.custom.raw ? 0 : this.snapStep());
+				drag.custom.move(float2(clean(d.x), clean(d.y)), e);
 				this.draw();
 			}
-			this.menuAt = here;
-			this.cascade.open(e.clientX, e.clientY);
-		});
+			return;
+		}
+		if (drag?.contour) {
+			if (travel() > 2)
+				drag.moved = true;
+			if (drag.moved) {
+				this.dragContour(drag.contour, this.toWorld(here), e.altKey, e.shiftKey);
+				this.draw();
+			}
+			return;
+		}
+		if (drag) {
+			// (empty ground: the view is moved)
+			if (travel() > 3)
+				drag.moved = true;
+			if (drag.moved) {
+				const at = float2(e.clientX, e.clientY);
+				this.svg.style.cursor = 'grabbing';
+				const by = at.sub(drag.at);
+				drag.at = at;
+				this.moveView(by);
+			}
+		}
+	}
+
+	// what is under the pointer, and the cursor for it: a cross on a point, which moves it; a four-way arrow along a curve, which moves the
+	// whole contour; an arrow over something the page can drag (a fill); a hand elsewhere, which moves the view
+	private hovered(e: PointerEvent) {
+		const here = this.local(e);
+		if (this.xf) {
+			const xf = this.xf;
+			return xf.box.cursor(xf.box.part(this.toWorld(here), this.handleRadius()));
+		}
+		if (this.tool === 'line' && (this.lineStart || this.lineContinues())) {
+			this.lineHover = {p: roundTo(this.toWorld(here), this.snapStep()), shift: e.shiftKey};
+			this.draw();
+		}
+		const at = this.pointAt(here);
+		if (at !== this.hover) {
+			this.hover = at;
+			this.draw();
+		}
+		return at >= 0 ? 'crosshair' : (e.target as Element).closest('[data-contour]') ? 'move' : this.draggable(e.target as Element) ? 'default' : 'grab';
+	}
+
+	private released(e: PointerEvent) {
+		const drag = this.drag;
+		this.drag = undefined;
+		if (drag?.custom)
+			drag.custom.end(drag.moved);
+		else if (drag?.point !== undefined && drag.moved)
+			this.commit('Move point');
+		else if (drag?.contour) {
+			if (drag.moved)
+				this.commit(drag.rotated ? 'Rotate contour' : 'Move contour');
+		} else if (drag && !drag.moved) {
+			const here = this.local(e);
+			this.picked = this.pointAt(here);
+			if (this.picked >= 0 || drag.point === undefined)
+				this.pickedContour = -1;
+			this.draw();
+			if (this.picked < 0)
+				this.clicked(e, here);
+		}
+	}
+
+	private contextMenu(e: MouseEvent) {
+		const here = this.local(e);
+		this.menuCurve = undefined;
+		if (this.canEdit()) {
+			const at = this.pointAt(here);
+			const hit = (e.target as Element).closest<SVGElement>('[data-contour]');
+			this.menuScope = at >= 0 || hit ? 'points' : 'element';
+			if (at >= 0) {
+				this.picked = at;
+				this.pickedContour = -1;
+			} else if (hit) {
+				this.menuCurve = this.curveAt(here);
+				this.picked = -1;
+				this.pickedContour = this.contourOf(+hit.dataset.contour!).s;
+			}
+			this.draw();
+		}
+		this.menuAt = here;
+		this.showMenu(e.clientX, e.clientY);
+		return true;
 	}
 
 	//--- transforming ---------------------------------------------------------------
 
 	private modeItem(): CascadeItem {
-		const face = (icon: string) => svgFace(icon);
-		const modes = [
-			{value: 'free' as TransformMode,		face: face(icons.free),			caption: 'Scale and rotate'},
-			{value: 'skew' as TransformMode,		face: face(icons.skew),			caption: 'Skew'},
-			{value: 'distort' as TransformMode,		face: face(icons.distort),		caption: 'Distort'},
-			{value: 'perspective' as TransformMode,	face: face(icons.perspective),	caption: 'Perspective'},
-		];
-		// (a transform of its own cannot distort)
-		return choiceItem('Mode', (this.xf ? this.xf.element : this.menuScope === 'element' && this.beginElementTransform()) ? modes.slice(0, 2) : modes, () => this.xfMode, v => { this.xfMode = v; if (this.xf) this.xf.mode = v; });
+		// Choosing one begins the transform, if it is not under way. (A transform of its own cannot distort or warp.) A warp begins again,
+		// to cut the outline finer, and one that has been bent is applied before another mode is begun.
+		const affine = this.xf ? this.xf.box.affine : this.menuScope === 'element' && !!this.beginElementTransform();
+		return {...choiceItem('Mode', modeChoices(affine), () => this.xfMode, v => {
+			this.xfMode = v;
+			if (!this.xf || (v === 'warp' && this.xf.box.mode !== 'warp') || !this.xf.box.setMode(v))
+				this.startTransform();
+		}), id: 'transform-mode'};
 	}
 	private xfMode: TransformMode = 'free';
 
@@ -1330,22 +1327,57 @@ export abstract class PathEditor {
 		return HANDLE * (window.devicePixelRatio || 1) / this.view.s;
 	}
 
-	// the contour selected, or else all of them, with the box round them in the world
-	private transformSet(): TransformSet | undefined {
+	// the contour selected, or else all of them, with the box round them in the world (for a warp, cut finer)
+	private transformSet(mode = this.xfMode): TransformSet | undefined {
 		const p = this.points();
 		if (!p || !p.length || !this.canEdit())
 			return;
 		// from the menu over the element (not its points or outline) a page that can carries it by a transform of its own, all of it
 		const element	= this.menuScope === 'element' ? this.beginElementTransform() : undefined;
 		const {s, e}	= this.pickedContour >= 0 && this.menuScope === 'points' ? this.contourOf(this.pickedContour) : {s: 0, e: p.length};
-		const orig		= p.slice(s, e).map(v => ({...v}));
-		const world		= orig.map(v => this.matrix.mulPos(float2(v.x, v.y)));
-		const box		= float2.extent.from(world), size = box.extent();
+		const world		= p.slice(s, e).map(v => this.matrix.mulPos(vec(v)));
+		const box		= float2.extent.from(world), size = box.size();
 		if (size.x < 1e-6 || size.y < 1e-6) {
 			this.refuse('there is no area to transform');
 			return;
 		}
-		return {box, quad: rectCorners(box), s, orig, mode: this.xfMode, element};
+		const xf		= new BoxTransform(box, mode, !!element);
+		const refined	= xf.mode === 'warp' && this.canStructure() ? this.refined(p.slice(s, e)) : undefined;
+		const before	= refined && p.splice(s, e - s, ...refined);
+		return {box: xf, s, orig: p.slice(s, refined ? s + refined.length : e).map(v => ({...v})), before, element};
+	}
+
+	// Contours cut finer for a warp to bend: each piece of them into WARP_CUTS, as curves (cubics, or where there are none quadratics),
+	// so that even what is straight bends as the warp does
+	private refined(p: curveVertex[]) {
+		const out: curveVertex[] = [];
+		for (let c = 0; c < p.length;) {
+			const {e} = contourRange(p, c), contour = p.slice(c, e), all = pieces(contour), open = contour[contour.length - 1].flags === ON_END;
+			c = e;
+			if (!all.length) {
+				out.push(...contour);
+				continue;
+			}
+			out.push(this.vertex(all[0].points[0], ON_BEGIN));
+			all.forEach(({points}, n) => {
+				const [a, b] = [points[0], points[points.length - 1]];
+				const curve = points.length === 4 ? curveOf({points, at: []}) as bezier3<float2>
+					: points.length === 3 ? curveOf({points, at: []}) as bezier2<float2>
+					: this.cubic ? new bezier3(a, lerp(a, b, 1 / 3), lerp(a, b, 2 / 3), b) : new bezier2(a, lerp(a, b, 0.5), b);
+				for (let k = 0; k < WARP_CUTS; k++) {
+					const sub = curve.slice(k / WARP_CUTS, (k + 1) / WARP_CUTS);
+					if (sub instanceof bezier3)
+						out.push(this.vertex(sub.c1, OFF_BEZ3), this.vertex(sub.c2, OFF_BEZ3));
+					else
+						out.push(this.vertex(sub.c1, OFF_BEZ2));
+					// (a closed contour goes back to where it began without its last point)
+					const last = n === all.length - 1 && k === WARP_CUTS - 1;
+					if (!last || open)
+						out.push(this.vertex(sub instanceof bezier3 ? sub.c3 : sub.c2, last ? ON_END : ON_CURVE));
+				}
+			});
+		}
+		return out;
 	}
 
 	startTransform() {
@@ -1361,25 +1393,28 @@ export abstract class PathEditor {
 
 	// the points as the box carries them: each from where it was, so that nothing builds up. A mirror turns the contours the
 	// other way round, which the outline's fill goes by, so those that close are put back to run as they did.
-	private carry(xf: TransformSet, quad: float2[], label?: string) {
+	private carry(xf: TransformSet, label?: string) {
 		if (xf.element) {
-			xf.element(affineOf(rectToQuad(xf.box, quad)), label);
+			xf.element(affineOf(xf.box.matrix), label);
 			return;
 		}
-		const p			= this.points()!, h: float3x3 = rectToQuad(xf.box, quad), inv = this.matrix.inverse();
+		const p			= this.points()!, inv = this.matrix.inverse(), carry = xf.box.carry;
 		const area		= (q: float2[]) => q.reduce((a, c, i) => a + c.x * q[(i + 1) % 4].y - q[(i + 1) % 4].x * c.y, 0);
-		const mirrored	= area(quad) * area(rectCorners(xf.box)) < 0;
+		const mirrored	= area(xf.box.corners) * area(xf.box.box.corners()) < 0;
 		const moved		= xf.orig.map(v => {
-			const w = this.matrix.mulPos(float2(v.x, v.y)), t = applyH(h, w.x, w.y), l = inv.mulPos(float2(t.x, t.y));
-			return {...v, x: this.rounding ? Math.round(l.x) : clean(l.x), y: this.rounding ? Math.round(l.y) : clean(l.y)};
+			const t = carryPoint(carry, this.matrix.mulPos(vec(v)));
+			if (isFinite(t.x) && isFinite(t.y)) {
+				const {x, y} = this.landed(inv.mulPos(t));
+				return {...v, x, y};
+			}
 		});
 		if (mirrored && this.structural()) {
 			for (let c = 0; c < moved.length;) {
 				let e = c + 1;
-				while (e < moved.length && !isBegin(moved[e].flags))
+				while (e < moved.length && moved[e] && !isBegin(moved[e]!.flags))
 					e++;
 				// the begin stays where it is, and the rest come back round
-				if (moved[e - 1].flags !== ON_END && moved[c].flags === ON_BEGIN)
+				if (moved[e - 1]?.flags !== ON_END && moved[c]?.flags === ON_BEGIN)
 					moved.splice(c + 1, e - c - 1, ...moved.slice(c + 1, e).reverse());
 				c = e;
 			}
@@ -1387,27 +1422,19 @@ export abstract class PathEditor {
 		moved.forEach((v, i) => Object.assign(p[xf.s + i], v));
 	}
 
-	private transformDrag(e: PointerEvent, sx: number, sy: number): DragHandler | undefined {
-		const xf	= this.xf!, [wx, wy] = this.toWorld(sx, sy), start = float2(wx, wy);
-		const part	= partAt(xf.box, xf.quad, start, this.handleRadius());
-		if (e.detail === 2 && part.kind === 'inside') {
+	private transformDrag(e: PointerEvent, sp: float2): DragHandler | undefined {
+		const xf	= this.xf!, start = this.toWorld(sp);
+		const part	= xf.box.part(start, this.handleRadius());
+		if (e.detail === 2 && (part.kind === 'inside' || part.kind === 'surface')) {
 			this.endTransform(true);
 			return {move() {}, end() {}};
 		}
-		const q0	= xf.quad.map(c => c.dup());
-		const step	= () => this.option('snap') ? this.gridStep : this.rounding;
+		const to	= xf.box.drag(part, start, d => roundTo(d, this.snapStep()));
 		return {
 			raw: true,
-			move: (dx, dy, ev) => {
-				const quad = dragQuad({
-					box: xf.box, q0, part, start, mode: dragMode(part, xf.mode, ev), shift: ev.shiftKey, alt: ev.altKey,
-					move: d => step() ? float2(Math.round(d.x / step()) * step(), Math.round(d.y / step()) * step()) : d,
-				}, float2(start.x + dx, start.y + dy));
-				// a transform of its own is affine: the box stays a parallelogram
-				if (quad && (!xf.element || quad[0].sub(quad[1]).add(quad[2]).sub(quad[3]).len() < 1e-6 * (1 + quad[0].len()))) {
-					xf.quad = quad;
-					this.carry(xf, quad);
-				}
+			move: (d, ev) => {
+				if (to(start.add(d), ev))
+					this.carry(xf);
 			},
 			end: () => {},
 		};
@@ -1418,17 +1445,19 @@ export abstract class PathEditor {
 		const xf = this.xf;
 		if (xf) {
 			this.xf = undefined;
-			const corners	= rectCorners(xf.box);
-			const moved		= xf.quad.some((c, i) => Math.abs(c.x - corners[i].x) > 1e-9 || Math.abs(c.y - corners[i].y) > 1e-9);
+			const moved		= xf.box.moved;
 			if (apply && moved && xf.element)
-				this.carry(xf, xf.quad, 'Transform');
+				this.carry(xf, 'Transform');
 			else if (apply && moved)
 				this.commit('Transform');
 			else if (moved && xf.element)
 				xf.element(float2x3.identity());
-			else if (moved) {
+			else if (!xf.element) {
+				// (and what was cut finer for a warp, as it was before)
 				const p = this.points();
-				if (p)
+				if (p && xf.before)
+					p.splice(xf.s, xf.orig.length, ...xf.before);
+				else if (p)
 					xf.orig.forEach((v, i) => Object.assign(p[xf.s + i], v));
 			}
 			this.draw();
@@ -1437,14 +1466,14 @@ export abstract class PathEditor {
 
 	// a move of the corners of the box by a function of the middle of the box and the point, done at once
 	private quickTransform(label: string, f: (centre: float2, p: float2) => float2) {
-		const xf = this.transformSet();
+		const xf = this.transformSet('free');
 		if (xf) {
-			const c = xf.box.centre();
-			xf.quad = xf.quad.map(p => f(c, p));
+			const c = xf.box.box.centre();
+			xf.box.quad = xf.box.quad.map(p => f(c, p));
 			if (xf.element)
-				this.carry(xf, xf.quad, label);
+				this.carry(xf, label);
 			else {
-				this.carry(xf, xf.quad);
+				this.carry(xf);
 				this.commit(label);
 			}
 			this.draw();
@@ -1457,39 +1486,41 @@ export abstract class PathEditor {
 		if (!xf)
 			return '';
 
-		const {s}		= this.view, m = rectToQuad(xf.box, xf.quad), b = xf.box;
-		const screen	= (p: float2) => `${num(p.x * s + this.view.x)},${num(p.y * s + this.view.y)}`;
-		const o			= b.min, size = b.extent();
-		const at		= (u: number, v: number) => screen(applyH(m, o.x + u * size.x, o.y + v * size.y).xy);
-		const {corners, edges} = boxHandles(b, xf.quad);
-
-		let thirds = '';
-		for (const t of [1 / 3, 2 / 3])
-			thirds += `M${at(t, 0)}L${at(t, 1)}M${at(0, t)}L${at(1, t)}`;
+		const screen	= (p: float2) => xy(this.worldToScreen(p));
+		const {edge: corners, lines, handles} = xf.box.outline();
 
 		const r			= 4;
-		const handles	= [...corners, ...edges].map(h => {
-			const [x, y] = screen(h.xy).split(',').map(Number);
-			return `<rect class="insp-xf-handle" x="${x - r}" y="${y - r}" width="${r * 2}" height="${r * 2}"/>`;
+		const grid		= lines.map(([a, b]) => `M${screen(a)}L${screen(b)}`).join('');
+		const marks		= handles.map(h => {
+			const {x, y} = this.worldToScreen(h);
+			return `<rect class="insp-xf-handle" x="${num(x) - r}" y="${num(y) - r}" width="${r * 2}" height="${r * 2}"/>`;
 		}).join('');
-		return `<path class="insp-xf-grid" d="${thirds}"/><path class="insp-xf-box" d="M${corners.map(screen).join('L')}Z"/>${handles}`;
+		return `<path class="insp-xf-grid" d="${grid}"/><path class="insp-xf-box" d="M${corners.map(screen).join('L')}Z"/>${marks}`;
 	}
 
 	//--- the menu -------------------------------------------------------------------
 
-	private menuItems(): CascadeItem[] {
-		const at	= this.menuAt;
-		const only	= this.menuOnly(at);
+	private readonly op = (id: string, icon: string, caption: string, run: () => void): CascadeItem => ({id, face: () => svgFace(icon), caption: () => caption, select: () => { run(); }});
+
+	// the menu when it is the whole menu: a transform under way, or what the page makes of where it came up (a gradient's)
+	protected only(): CascadeItem[] | undefined {
+		const only = this.menuOnly(this.menuAt);
 		if (only)
 			return only;
-
-		const op = (id: string, icon: string, caption: string, run: () => void): CascadeItem => ({id, face: () => svgFace(icon), caption: () => caption, select: () => { run(); }});
 		if (this.xf)
 			return [
-				op('transform-apply', icons.transform, 'Apply the transform (Enter)', () => this.endTransform(true)),
-				op('transform-cancel', icons.deletePoint, 'Cancel the transform (Esc)', () => this.endTransform(false)),
+				this.op('transform-apply', icons.transform, 'Apply the transform (Enter)', () => this.endTransform(true)),
+				this.op('transform-cancel', icons.deletePoint, 'Cancel the transform (Esc)', () => this.endTransform(false)),
 				this.modeItem(),
 			];
+	}
+
+	/** The editor's items: the page's, the tools, the editing of points and the View item. They are the menu on a page of its own, or
+	 *  are merged into the page's (see mergeItems). */
+	items(): CascadeItem[] {
+		const at = this.menuAt, op = this.op;
+		if (!this.active())
+			return [];
 
 		const items = this.pageItems(at);
 		if (this.canDraw()) {
@@ -1550,23 +1581,22 @@ export abstract class PathEditor {
 				},
 			});
 
-		items.push({
-			id:			'view',
-			face:		() => svgFace(icons.view),
-			caption:	() => 'View',
-			children:	() => [
-				op('fit', icons.fit, 'Fit (0)', () => this.fit()),
-				...[...Object.keys(VIEW_TOGGLES)].filter(n => this.viewNames().includes(n)).map(n => ({
-					...toggleItem(VIEW_TOGGLES[n], svgFace((icons as any)[n]), () => this.option(n), v => { this.options.set(n, v); this.draw(); }),
-					id: 'view-' + n,
-				})),
-			],
-		});
+		items.push(this.viewItem());
 		return items;
 	}
 
+	private viewItem(): CascadeItem {
+		return {id: 'view', face: () => svgFace(icons.view), caption: () => 'View', children: () => [
+			this.op('fit', icons.fit, 'Fit (0)', () => this.fit()),
+			...this.viewNames().map(n => ({
+				...toggleItem(VIEW_TOGGLES[n], svgFace((icons as any)[n]), () => this.option(n), v => { this.options.set(n, v); this.draw(); }),
+				id: 'view-' + n,
+			})),
+		]};
+	}
+
 	private viewNames() {
-		return ['grid', 'outline', 'polygon', 'points', 'numbers', 'snap', ...this.extraViews];
+		return [...(this.options.has('grid') ? ['grid'] : []), 'outline', 'polygon', 'points', 'numbers', 'snap', ...this.extraViews];
 	}
 
 	//--- the keyboard ---------------------------------------------------------------
@@ -1576,10 +1606,10 @@ export abstract class PathEditor {
 		if (this.canEdit() && !this.xf && (this.picked >= 0 || this.pickedContour >= 0)) {
 			const d = e.shiftKey ? 10 : 1;
 			switch (e.key) {
-				case 'ArrowLeft':	this.nudge(-d, 0); 					return true;
-				case 'ArrowRight':	this.nudge(d, 0); 					return true;
-				case 'ArrowUp':		this.nudge(0, -d); 					return true;
-				case 'ArrowDown':	this.nudge(0, d); 					return true;
+				case 'ArrowLeft':	this.nudge(float2(-d, 0)); 			return true;
+				case 'ArrowRight':	this.nudge(float2(d, 0)); 			return true;
+				case 'ArrowUp':		this.nudge(float2(0, -d)); 			return true;
+				case 'ArrowDown':	this.nudge(float2(0, d)); 			return true;
 				case 'Delete': case 'Backspace': this.deletePoint(); 	return true;
 				case 't':			this.togglePoint(); 				return true;
 			}

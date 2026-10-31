@@ -19,12 +19,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { emitGlsl, heightmap, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { float3 } = require('@isopodlabs/maths/vector');
 
 const evalSdf = (sdf, p) => evalSdf3(sdf, float3(p[0], p[1], p[2]));
@@ -850,7 +850,7 @@ for (const wrap of ['sphere', 'cylinder']) {
 	// off the fused path -- a rotation far too slight to be seen keeps it off, which is how the two are held side by
 	// side here -- reads a few tenths of a distance where this one reads its whole one.
 	const general = await run(`wrap("cylinder", r = ${TR}) rotate([0, 0, 1e-6]) ${scale} surface("bend.dat");`);
-	check(general.sdf.k === 'warp', `the same grid off the fused path should be the general bend, not ${general.sdf.k}`);
+	check(general.sdf.k === 'warp', `the same grid off the fused path should be the general bend, not ${general.sdf.k} (${general.warnings})`);
 	const slope = (s) => {
 		const g = [];
 		for (let j = 0; j < rows; j += 5)

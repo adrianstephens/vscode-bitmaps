@@ -1,66 +1,56 @@
-// The bitmap editor's tools, chosen with their options from the menu the right button brings up (cascade.ts), the selection,
-// and undo history.
-// The pixels themselves are changed by edit.ts; this turns pointer and key events into those changes.
+// The bitmap editor's tools, with their options for the menu the right button brings up (cascade.ts), and the selection.
+// The pixels themselves are changed by the Operations here; this turns pointer and key events into those changes.
+// Transforms are not tools (transform.ts): the tools give way to one while it is under way.
 
 import { createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
-import type { Layer, LayerOp } from './layers.js';
-import { Tiles, Pixels, Patch, applyPatch, RGBA, warpCPU, imageSize, imageRect } from './raster.js';
-import { applyH } from './transformbox.js';
-import { TransformMode, TransformPart, HANDLE, partAt, transformCursor, dragMode, dragQuad, boxHandles, transformIcons } from './transformbox.js';
-import { float2, float3, float3x3 } from '@isopodlabs/maths/vector';
+import { Pixels, RGBAPixels, RGBA, asRGBA, imageSize, imageRect, unionRect, getPixel } from './opengl.js';
+import { Tiles, TILE, Patch, applyPatch, blurWith, ShadePass, levelsPixels, levelsUniforms, kernelUniforms, Levels, Kernel, boxKernel, embossKernel, edgeKernel } from './raster.js';
+import { float2 } from '@isopodlabs/maths/vector';
 import { Selection, ellipsePoints } from './bitmapSelection.js';
-import { Cascade, CascadeItem, svgFace, swatchFace, valueItem, choiceItem, toggleItem, multiplicativeStep } from './cascade.js';
+import { History, type HistoryEntry } from './history.js';
+import { Input, Place, type Drag } from './navigate.js';
+import { gridSpacing } from './pathedit.js';
+import { Cascade, CascadeItem, svgFace, swatchFace, valueItem, choiceItem, toggleItem, multiplicativeStep, colourItems, valueFace, ValueOptions, sliderItem } from './cascade.js';
 
-// the whole-image operations, which the extension offers in the editor's title menu
-export type EditOp	= 'fill' | 'clear' | 'invert' | 'flipHorizontal' | 'flipVertical' | 'rotateClockwise' | 'rotateAnticlockwise' | 'crop' | 'selectAll' | 'deselect' | 'invertSelection'
-	| 'toCubemap';	// (not the tools': the image made into a cubemap, if it is laid out as one, or square, for the same on every face)
-export type Tool	= 'hand' | 'marquee' | 'ellipse-marquee' | 'lasso' | 'polygon-lasso' | 'wand' | 'brush' | 'pencil' | 'eraser' | 'bucket' | 'gradient' | 'eyedropper' | 'line' | 'rect' | 'ellipse' | 'transform';
+type FilterKind = 'blur' | 'sharpen' | 'levels' | 'boxBlur' | 'emboss' | 'edges';
+type FilterUsing = {blurRadius?: number, sharpenRadius?: number, boxSize?: number};
+
+export type Tool	= 'hand' | 'marquee' | 'ellipse-marquee' | 'lasso' | 'polygon-lasso' | 'wand' | 'brush' | 'pencil' | 'eraser' | 'stamp' | 'bucket' | 'gradient' | 'eyedropper' | 'line' | 'rect' | 'ellipse';
 
 export type ShapeKind = 'line' | 'rect' | 'ellipse';
 export type ShapeFill = 'stroke' | 'fill' | 'both';
 export type SelectMode = 'replace' | 'add' | 'subtract' | 'intersect';
 
-// what a transform is of: the current layer (or the picture, within its canvas, if it has none), or the whole document
-export type TransformTarget = 'layer' | 'image';
-export type { TransformMode };
-
 const clamp = (v: number, lo: number, hi: number) => v < lo ? lo : v > hi ? hi : v;
+
+export interface CloneSource {
+	from?:		RGBAPixels;	// what the clone stamp copies from, chosen now (what the tools draw on, or all the picture shows) and read as each stroke begins
+	at:			float2;
+	offset?:	float2;
+}
 
 // what the editor needs of the viewer it is part of
 export interface PaintHost {
 	canvas:			HTMLCanvasElement;
-	target():									Pixels | undefined;	// what the tools draw on: the current layer's pixels (which cover the canvas), or the picture if there is none
-	pick(x: number, y: number):				RGBA | undefined;	// the colour seen at a pixel of the picture (of the current layer, if it is on it)
+	target():									RGBAPixels | undefined;	// what the tools draw on: the current layer's pixels (which cover the canvas), or the picture if there is none
+	pick(x: number, y: number):					RGBA | undefined;	// the colour seen at a pixel of the picture (of the current layer, if it is on it)
 	toScreen(p: float2):						float2;				// a point of the image, in canvas pixels
 	pixelSize():								number;				// how long a canvas pixel is, in the image's pixels
-	toImage(clientX: number, clientY: number):	float2;				// image coordinates, not whole pixels
-	changed(image: Pixels, rect?: float2.extent): void;				// pixels of an image (all of them, without a rect) have changed
-	edited(label: string):						void;				// an undoable change has been made
+	toImage(x: number, y: number):				float2;				// image coordinates, not whole pixels
+	changed(image: RGBAPixels, rect?: float2.extent): void;				// pixels of an image (all of them, without a rect) have changed
+	shade?(program: string, image: Pixels, area: float2.extent, passes: ShadePass[] | Record<string, any>, reach?: number): Pixels | undefined;	// the pixels of an area of an image run through a filter's shader (assets/<program>.frag), in passes or just the uniforms of one, that looks `reach` pixels around each one; nothing where there is no GPU
+	previewShade?(image: RGBAPixels, program: string, extra?: Pixels[]): ShadePreview | undefined;	// an image shown as a filter's shader draws it from its pixels (given as u_image, and `extra` to units 1 on), without changing them; nothing where it cannot be
 	redraw():									void;
-	menu():									CascadeItem[];		// more for the tool menu, which is all of it where the tools cannot be used
-	panelOpened():								void;				// the tool menu has come up over the image
-	beginTransform(target: TransformTarget, selection?: Selection):	TransformSession | undefined;	// the current layer or the whole picture is to be transformed (the part of it the selection covers, if there is one)
-	transform(change: DocumentChange):			HistoryEntry | undefined;	// flip, rotate or crop the whole document, layers and all, which may change its size: done, and how to undo and redo it
+	cloneSource?(at: float2, all: boolean):		CloneSource | undefined;	// what the clone stamp copies from, chosen now (what the tools draw on, or all the picture shows) and read as each stroke begins
+	// for a picture of surfaces that join (the faces of a cube), where a stroke goes on from one to the next
+	crossTo?(x: number, y: number, last: float2): float2 | undefined;	// the pointer is over another surface, which is the target now: where `last` is on it
+	adjoining?(p: float2, q: float2, size: number): {image: RGBAPixels, p: float2, q: float2, size: number}[];	// a stroke from p to q on the target, as it falls on the other surfaces it reaches
 }
 
-// A transform under way, as the viewer has it: what is being transformed, and the showing of it as it is carried
-export interface TransformSession {
-	box:		float2.extent;				// what is being transformed, in canvas coordinates
-	layer?:		Layer;						// and the layer, if it is one
-	selection?:	Selection;					// the selection which what is transformed is the part of, if it is
-	update(matrix: float3x3): void;			// it is carried by this, from canvas coordinates: the viewer shows it so (and draws the tools again)
-	end(): void;							// it is no longer carried
-}
-
-export type DocumentChange =
-	| {kind: 'flip', horizontal: boolean}
-	| {kind: 'rotate', clockwise: boolean}
-	| {kind: 'crop', rect: float2.extent}
-	| {kind: 'warp', matrix: float3x3, layer?: Layer, selection?: Selection};	// the current layer (cut to the canvas), or the document
-
-export interface HistoryEntry {
-	undo(): void;
-	redo(): void;
+// what a tool shows of its change while it is dragged, where working out the pixels each time would be too slow
+export interface ShadePreview {
+	show(uniforms: Record<string, any>): void;	// the image as the shader draws it with these
+	end(): void;								// the image's own pixels shown again
 }
 
 interface ToolInfo {
@@ -123,6 +113,12 @@ const toolInfo: Record<Tool, ToolInfo> = {
 		key:		'e',//	'eraser'],
 		label:		'Eraser',
 	},
+	stamp:			{
+		icon:		'<path d="M6.5 2.5h3v4l1 2h3v3h-11v-3h3l1-2z"/><path d="M3 13.5h10"/>',
+		key:		's',
+		label:		'Clone Stamp',
+		hint:		'Alt-click where to copy from (on any layer), then paint',
+	},
 	bucket:			{
 		icon:		'<path d="M3 8l5-5 5 5-4.5 4.5a1.5 1.5 0 0 1-2 0z"/><path d="M13.5 10.5c0 1-1 1.5-1 2.2a1 1 0 0 0 2 0c0-.7-1-1.2-1-2.2z" fill="currentColor"/>',
 		hotspot:	[12, 19],//'bucket':
@@ -155,39 +151,47 @@ const toolInfo: Record<Tool, ToolInfo> = {
 		key:		'u',//	'line', 'rect', 'ellipse'],
 		label:		'Ellipse',
 	},
-	transform:			{
-		icon:		'<path d="M4 3.5h8.5V12H4z"/><rect x="2.5" y="2" width="3" height="3" fill="currentColor"/><rect x="11" y="2" width="3" height="3" fill="currentColor"/><rect x="11" y="10.5" width="3" height="3" fill="currentColor"/><rect x="2.5" y="10.5" width="3" height="3" fill="currentColor"/>',
-		key:		'',		// chosen from the menu, as a free transform or one of the image
-		label:		'Transform',
-	},
-
 };
 
 // the tools that share a place in the menu, which shows the one last used
 const toolGroups: Tool[][] = [
 	['marquee', 'ellipse-marquee', 'lasso', 'polygon-lasso', 'wand'],
-	['brush', 'pencil', 'eraser'],
+	['brush', 'pencil', 'eraser', 'stamp'],
 	['bucket', 'gradient'],
 	['line', 'rect', 'ellipse'],
 ];
 
 // icons of things in the menu that are not tools
 const menuIcons = {
-	...transformIcons,
 	selectAll:	'<rect x="2.5" y="2.5" width="11" height="11" stroke-dasharray="2 1.5"/><path d="M5.5 8l2 2 3-4"/>',
 	deselect:	'<rect x="2.5" y="2.5" width="11" height="11" stroke-dasharray="2 1.5"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5"/>',
+	growSelection:	'<rect x="5.5" y="5.5" width="5" height="5"/><rect x="1.5" y="1.5" width="13" height="13" stroke-dasharray="2 1.5"/>',
+	shrinkSelection: '<rect x="1.5" y="1.5" width="13" height="13"/><rect x="5.5" y="5.5" width="5" height="5" stroke-dasharray="2 1.5"/>',
+	borderSelection: '<rect x="2.5" y="2.5" width="11" height="11"/><rect x="5.5" y="5.5" width="5" height="5"/>',
+	smoothSelection: '<path d="M2.5 11c3 0 2-6 5.500-6s2.500 6 5.500 6" stroke-dasharray="2 1.5"/>',
+	featherSelection: '<rect x="4.5" y="4.5" width="7" height="7" stroke-dasharray="1 1.5"/><rect x="2.5" y="2.5" width="11" height="11" stroke-dasharray="1 3" opacity=".6"/>',
 	invertSelection: '<rect x="2.5" y="2.5" width="11" height="11" stroke-dasharray="2 1.5"/><path d="M2.5 2.5h11v11z" fill="currentColor"/>',
 	selectNew:	'<rect x="3.5" y="3.5" width="9" height="9"/>',
 	selectAdd:	'<rect x="2.5" y="2.5" width="7" height="7"/><rect x="6.5" y="6.5" width="7" height="7"/>',
 	selectSub:	'<path d="M2.5 2.5h7v4h4v7h-7v-4h-4z"/>',
 	selectInt:	'<rect x="2.5" y="2.5" width="7" height="7"/><rect x="6.5" y="6.5" width="7" height="7"/><rect x="6.5" y="6.5" width="3" height="3" fill="currentColor"/>',
-	crop:		'<path d="M4.5 1.5v10h10M1.5 4.5h10v10"/>',
+	blur:		'<circle cx="8" cy="8" r="2"/><circle cx="8" cy="8" r="4" stroke-dasharray="1 1.5"/><circle cx="8" cy="8" r="6" stroke-dasharray="0.5 2"/>',
+	sharpen:	'<path d="M8 2.5l5.5 10h-11z"/><path d="M8 6.5l2.5 4.5h-5z" fill="currentColor"/>',
+	levels:		'<path d="M2.5 13.5h11M4.5 13.5v-4M7 13.5v-9M9.5 13.5v-6M12 13.5v-3"/>',
+	filters:	'<path d="M2.5 3.5h11L9.5 8.5v4l-3 1.5v-5.5z"/>',
+	boxBlur:	'<rect x="2.5" y="2.5" width="11" height="11"/><path d="M2.5 6.2h11M2.5 9.8h11M6.2 2.5v11M9.8 2.5v11"/>',
+	emboss:		'<path d="M3 13l4-9 6 9z"/><path d="M7 4l-4 9" stroke-width="2.4"/>',
+	edges:		'<path d="M2.5 2.5h5v5h-5zM8.5 8.5h5v5h-5z" stroke-dasharray="2 1.2"/>',
+	reset:		'<path d="M3.5 8a4.5 4.5 0 1 0 1.5-3.4M3 2.5v3h3"/>',
 	swap:		'<path d="M3 6h9l-2.5-2.5M13 10H4l2.5 2.5"/>',
+	picker:		'<path d="M10.5 2.5l3 3-7 7H3.5v-3z"/><path d="M9 4l3 3"/>',
 	contiguous:	'<path d="M2.5 8h3l2-3 2 6 2-3h2"/>',
 	filled:		'<rect x="2.5" y="3.5" width="11" height="9" fill="currentColor"/>',
 	outline:	'<rect x="2.5" y="3.5" width="11" height="9"/>',
 	both:		'<rect x="2.5" y="3.5" width="11" height="9" fill="currentColor" fill-opacity="0.4" stroke-width="2"/>',
-	image:		'<rect x="1.5" y="1.5" width="13" height="13" stroke-dasharray="2 1.5"/><path d="M5 11l6-6M8 5h3v3M5 8v3h3"/>',
+	aligned:	'<path d="M2.5 5.5h4M2.5 10.5h4M9.5 5.5h4M9.5 10.5h4"/><path d="M6.5 8h3M8.5 7l1 1-1 1"/>',
+	oneLayer:	'<rect x="2.5" y="5.5" width="11" height="5"/>',
+	allLayers:	'<path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" stroke-width="2"/>',
 };
 
 const crosshair = '<path d="M8 1.5v4.5M8 10v4.5M1.5 8h4.5M10 8h4.5"/>';
@@ -207,7 +211,6 @@ function cursorFor(tool: Tool) {
 	return `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${x} ${y}, crosshair`;
 }
 
-const MAX_HISTORY = 200;
 
 
 const hex = (c: RGBA) => '#' + [c.r, c.g, c.b, c.a].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
@@ -222,30 +225,43 @@ export class Painter {
 	private opacity		= 1;
 	private tolerance	= 32;
 	private contiguous	= true;
+	// how far each of the selection's modifiers goes, in pixels
+	private modifyBy: Record<'growSelection' | 'shrinkSelection' | 'borderSelection' | 'smoothSelection' | 'featherSelection', number> = {
+		growSelection: 4, shrinkSelection: 4, borderSelection: 4, smoothSelection: 4, featherSelection: 8,
+	};
+	private blurRadius	= 4;		// the gaussian blur of the filter, in pixels
+	private boxSize	= 3;		// the box blur filter's side, in pixels
+	private sharpenRadius = 2;		// the blur the sharpen filter's unsharp mask is taken against, in pixels
+	private levels:	Levels = {black: 0, white: 255, gamma: 1};	// the levels filter's settings
 	private shapeFill: ShapeFill = 'fill';
+	private aligned		= true;		// the clone stamp keeps its offset from one stroke to the next (or starts each from its source)
+	private sample:		'oneLayer' | 'allLayers' = 'oneLayer';	// what the clone stamp copies: the layer it was pointed at on, or all the picture shows
+	// where the clone stamp copies from, and once a stroke has begun, how far that is from where it paints
+	private stamp:		CloneSource | undefined;
 
-	private selection:	Selection | undefined;
+	private selected:	Selection | undefined;
 	private selectMode:	SelectMode = 'replace';
+	private previewFrame: number | undefined;		// the frame at which a filter's preview is to be shown
+	private blurring:	Operation | undefined;			// the filter being previewed, which is not yet an edit
+	private preview:	Selection | undefined;			// what the selection would become under the modifier the pointer is on
 	private draft:		float2[] | undefined;			// the outline of a selection being drawn, in image coordinates
 	private corners:	{points: float2[], mode: SelectMode} | undefined;	// a polygonal lasso under way
-	private history:	HistoryEntry[] = [];
-	private position	= 0;
-	private pointer:	float2 | undefined;
-	private spaceDown	= false;
+	private pointer:	float2 | undefined;			// where the pointer is over the picture, while it is the tools'
 	private active		= false;
-	private transformMode: TransformMode = 'free';
-	private xf: {session: TransformSession, layer?: Layer, selection?: Selection, box: float2.extent, quad: float2[], previous: Tool} | undefined;	// a transform under way
+	grid				= false;		// whether the pixel grid is shown over the picture, which it is under a shape layer's editor as well
+	private suspended	= false;		// another editor has the picture (a shape layer's, which edits its path), or the 3D view does
+	private aside		= false;		// a transform has the pointer
+	private readonly stack: Input;
 
 	private ctx:		CanvasRenderingContext2D;
-	private menu:		Cascade;
 	private lastOfGroup	= new Map<Tool[], Tool>();
 	private colourInput	= createElement('input');	// the system's colour picker, for the colour being chosen
 	private picking:	'fg' | 'bg' = 'fg';
 
-	constructor(public host: PaintHost, private overlay: HTMLCanvasElement) {
+	// (the menu is the page's: these are some of what is in it)
+	constructor(public host: PaintHost, private overlay: HTMLCanvasElement, private readonly history: History, private readonly menu: Cascade) {
 		this.ctx = overlay.getContext('2d')!;
 		const stage = overlay.parentElement!;
-		this.menu = new Cascade(stage, () => this.active ? [...this.menuItems(), ...this.host.menu()] : this.host.menu());
 
 		// out of sight, but where the menu is, which is where the picker comes up
 		this.colourInput.type = 'color';
@@ -256,35 +272,18 @@ export class Painter {
 		});
 		stage.append(this.colourInput);
 
-		host.canvas.addEventListener('pointermove', e => {
-			if (this.active) {
-				this.pointer = this.host.toImage(e.clientX, e.clientY);
-				if (this.xf && !e.buttons && !this.spaceDown) {
-					const part = this.partAt(this.pointer);
-					this.host.canvas.style.cursor = transformCursor(this.xf.box, this.xf.quad, part, this.transformMode, this.xf.layer ? 'move' : 'default');
-				}
+		// (the pointer is theirs while nothing over them shows a cursor of its own: Space, a transform's box)
+		this.stack = Input.on(host.canvas);
+		this.stack.add({
+			press:		e => this.press(e),
+			hover:		e => this.hover(e),
+			leave:		() => {
+				this.pointer = undefined;
 				this.draw();
-			}
-		});
-		// the right button brings up the tools; anything else closes them again
-		host.canvas.addEventListener('contextmenu', e => {
-			if (this.active || this.host.menu().length) {
-				e.preventDefault();
-				this.openMenu(e.clientX, e.clientY);
-			}
-		});
-		host.canvas.addEventListener('pointerleave', () => {
-			this.pointer = undefined;
-			this.draw();
-		});
-
-		window.addEventListener('keydown', e => this.keyDown(e));
-		window.addEventListener('keyup', e => {
-			if (e.key === ' ' && this.spaceDown) {
-				this.spaceDown = false;
-				this.updateCursor();
-			}
-		});
+			},
+			key:		e => this.keyDown(e),
+			covered:	by => this.covered(by),
+		}, Place.tools);
 
 		this.setTool('hand');
 	}
@@ -297,21 +296,53 @@ export class Painter {
 	enabled(on: boolean) {
 		this.active = on;
 		this.overlay.classList.toggle('hidden', !on);
-		if (!on) {
-			this.spaceDown = false;
+		if (!on)
 			this.menu.close();
-			this.endTransform(false);
-		}
 		this.updateCursor();
 	}
 
-	// a new image: nothing selected, nothing to undo
+	// the pointer over the picture: where the brush is drawn, and the tool's cursor
+	private hover(e: PointerEvent) {
+		if (!this.active)
+			return undefined;
+		this.pointer = this.host.toImage(e.clientX, e.clientY);
+		this.draw();
+		return this.suspended || this.aside ? undefined : cursorFor(this.tool);
+	}
+
+	// Something over the tools has the picture for now (or has given it back). A transform: the tools take no presses and no keys, and what
+	// they draw over the picture is put away but the grid. Another editor (a shape layer's), or the 3D view: the tools are put away and take
+	// no keys, and none of their operations are done.
+	private covered(by: number | undefined) {
+		const aside = by === Place.transform, suspended = by !== undefined && !aside;
+		if (aside !== this.aside) {
+			this.aside		= aside;
+			this.corners	= undefined;
+		}
+		if (suspended !== this.suspended) {
+			this.suspended = suspended;
+			if (suspended)
+				this.menu.close();
+			this.menu.refresh();
+		}
+		this.draw();
+	}
+
+
+	// what is selected, which a transform carries
+	get selection() {
+		return this.selected;
+	}
+	set selection(s: Selection | undefined) {
+		this.selected = s;
+		this.draw();
+	}
+
+	// a new image: nothing selected
 	reset() {
-		this.endTransform(false);
-		this.selection	= undefined;
+		this.selected	= undefined;
 		this.draft		= this.corners = undefined;
-		this.history	= [];
-		this.position	= 0;
+		this.stamp		= undefined;
 	}
 
 	resize() {
@@ -320,9 +351,6 @@ export class Painter {
 	}
 
 	setTool(tool: Tool) {
-		// another tool, chosen while transforming, applies the transform first
-		if (this.xf && tool !== 'transform')
-			this.endTransform(true, false);
 		this.tool		= tool;
 		this.corners	= undefined;
 		const group		= toolGroups.find(g => g.includes(tool));
@@ -337,7 +365,10 @@ export class Painter {
 	// the menu
 	//-------------------------------------------------------------------------
 
-	private menuItems(): CascadeItem[] {
+	// the tools, for the menu (none while they are put away)
+	menuItems(): CascadeItem[] {
+		if (!this.active || this.suspended || this.aside)
+			return [];
 		const size = valueItem({
 			label: 'size', caption: 'Size', min: 1, max: 200,
 			get: () => this.size, set: v => { this.size = v; this.draw(); },
@@ -358,12 +389,144 @@ export class Painter {
 			get: () => this.tolerance, set: v => this.tolerance = v,
 			step: (v, steps) => v + 4 * steps, presets: [0, 8, 16, 32, 64, 128],
 		});
+		// a selection modifier: clicked it applies, and scrolled over (or dragged along its presets) it changes by how much
+		const modifier = (o: keyof Painter['modifyBy'], icon: string, name: string): CascadeItem => {
+			const presets = [1, 2, 4, 8, 16, 32, 64, 128];
+			const value = valueItem({
+				label: 'px', caption: `${name} by`, min: 1, max: 200,
+				get: () => this.modifyBy[o], set: v => { this.modifyBy[o] = v; this.previewModifier(o); },
+				step: multiplicativeStep(), presets,
+			});
+			return {
+				...value,
+				id:			o,
+				face:		() => svgFace(icon),
+				caption:	() => `${name} by ${this.modifyBy[o]} px (scroll or drag to change)`,
+				select:		() => { this.previewModifier(undefined); return this.run(o); },
+				hover:		on => this.previewModifier(on ? o : undefined),
+				children:	() => value.children!().map((c, i) => ({...c, hover: (on: boolean) => this.previewModifier(on ? o : undefined, presets[i])})),
+			};
+		};
+		// the blur filter: clicked it blurs what is selected (or the layer), and scrolled over (or dragged along its presets) it takes the radius
+		const blurPresets = [1, 2, 4, 8, 16, 32, 64];
+		const blur = valueItem({
+			label: 'px', caption: 'Blur radius', min: 1, max: 100,
+			get: () => this.blurRadius, set: v => { this.blurRadius = v; this.previewFilter('blur'); },
+			step: multiplicativeStep(), presets: blurPresets,
+		});
+		const blurItem: CascadeItem = {
+			...blur,
+			id:			'blur',
+			face:		() => svgFace(menuIcons.blur),
+			caption:	() => `Gaussian blur of ${this.blurRadius} px (scroll or drag to change)`,
+			select:		() => this.run('blur'),
+			hover:		on => { if (!on) this.previewFilter(); },
+			// choosing a size blurs by it, and pointing at one shows it
+			children:	() => blur.children!().map((c, i) => ({...c,
+				hover:	(on: boolean) => this.previewFilter(on ? 'blur' : undefined, {blurRadius: blurPresets[i]}),
+				select:	() => { this.blurRadius = blurPresets[i]; return this.run('blur'); },
+			})),
+		};
+		// sharpen: an unsharp mask against a blur of this radius, in the same way
+		const sharpenItem: CascadeItem = {
+			...valueItem({
+				label: 'px', caption: 'Sharpen radius', min: 1, max: 100,
+				get: () => this.sharpenRadius, set: v => { this.sharpenRadius = v; this.previewFilter('sharpen'); },
+				step: multiplicativeStep(), presets: blurPresets,
+			}),
+			id:			'sharpen',
+			face:		() => svgFace(menuIcons.sharpen),
+			caption:	() => `Sharpen with a radius of ${this.sharpenRadius} px (scroll or drag to change)`,
+			select:		() => this.run('sharpen'),
+			hover:		on => { if (!on) this.previewFilter(); },
+			children:	() => blurPresets.map(r => ({
+				face:		() => valueFace('', String(r)),
+				caption:	() => `Sharpen with a radius of ${r} px`,
+				hover:		(on: boolean) => this.previewFilter(on ? 'sharpen' : undefined, {sharpenRadius: r}),
+				select:		() => { this.sharpenRadius = r; return this.run('sharpen'); },
+			})),
+		};
+		// levels: the black point, white point and gamma, each shown on the picture while it is pointed at, and the icon applies them
+		const levelValue = (label: string, caption: string, min: number, max: number, get: () => number, set: (v: number) => void, o: Partial<ValueOptions> = {}) => {
+			const item = sliderItem({label, caption, min, max, markers: 5, get, set: v => { set(v); this.previewFilter('levels'); }, ...o});
+			return {...item, hover: (on: boolean) => this.previewFilter(on ? 'levels' : undefined)} as CascadeItem;
+		};
+		const levelsItem: CascadeItem = {
+			id:			'levels',
+			face:		() => svgFace(menuIcons.levels),
+			caption:	() => `Levels ${this.levels.black}, ${this.levels.gamma.toFixed(2)}, ${this.levels.white}: click to apply`,
+			select:		() => { this.previewFilter(); return this.run('levels'); },
+			children:	() => [
+				levelValue('black', 'Black point', 0, 254, () => this.levels.black, v => this.levels.black = Math.min(v, this.levels.white - 1)),
+				levelValue('γ', 'Gamma', 0.1, 9.99, () => this.levels.gamma, v => this.levels.gamma = v,
+					{step: (v, n) => Math.round(Math.max(0.1, v * 1.05 ** n) * 100) / 100, resolution: 0, format: v => v.toFixed(2)}),
+				levelValue('white', 'White point', 1, 255, () => this.levels.white, v => this.levels.white = Math.max(v, this.levels.black + 1)),
+				{face: () => svgFace(menuIcons.reset), caption: () => 'Reset levels', select: () => { this.levels = {black: 0, white: 255, gamma: 1}; return true; }},
+			],
+		};
+		// the convolution filters: box blur, by the side of the box, and emboss and edge detect, which take nothing
+		const boxSizes = [3, 5, 7];
+		const boxItem: CascadeItem = {
+			...valueItem({
+				label: 'box', caption: 'Box blur size', min: 3, max: 7,
+				get: () => this.boxSize, set: v => { this.boxSize = v; this.previewFilter('boxBlur'); },
+				step: (v, n) => Math.min(7, Math.max(3, v + 2 * Math.sign(n))), presets: boxSizes, resolution: 2,
+			}),
+			id:			'boxBlur',
+			face:		() => svgFace(menuIcons.boxBlur),
+			caption:	() => `Box blur ${this.boxSize} px wide (scroll or drag to change)`,
+			select:		() => this.run('boxBlur'),
+			hover:		on => { if (!on) this.previewFilter(); },
+			children:	() => boxSizes.map(n => ({
+				face:		() => valueFace('', String(n)),
+				caption:	() => `Box blur ${n} px wide`,
+				hover:		(on: boolean) => this.previewFilter(on ? 'boxBlur' : undefined, {boxSize: n}),
+				select:		() => { this.boxSize = n; return this.run('boxBlur'); },
+			})),
+		};
+		const convolution = (kind: 'emboss' | 'edges', icon: string, caption: string): CascadeItem => ({
+			id:			kind,
+			face:		() => svgFace(icon),
+			caption:	() => caption,
+			select:		() => this.run(kind),
+			hover:		on => this.previewFilter(on ? kind : undefined),
+		});
+		// all the filters, under one icon
+		const filters: CascadeItem = {
+			id:			'filters',
+			face:		() => svgFace(menuIcons.filters),
+			caption:	() => 'Filters',
+			children:	() => [
+				blurItem,
+				sharpenItem,
+				levelsItem,
+				boxItem,
+				convolution('emboss', menuIcons.emboss, 'Emboss'),
+				convolution('edges', menuIcons.edges, 'Detect edges'),
+			],
+		};
 		const contiguous = toggleItem('Contiguous', svgFace(menuIcons.contiguous), () => this.contiguous, v => this.contiguous = v);
 		const shapeFill = choiceItem('Shape', [
 			{value: 'fill' as const,	face: svgFace(menuIcons.filled),	caption: 'Filled'},
 			{value: 'stroke' as const,	face: svgFace(menuIcons.outline),	caption: 'Outline'},
 			{value: 'both' as const,	face: svgFace(menuIcons.both),		caption: 'Filled and outlined'},
 		], () => this.shapeFill, v => this.shapeFill = v);
+		const aligned: CascadeItem = {
+			...toggleItem('Aligned', svgFace(menuIcons.aligned), () => this.aligned, v => {
+				this.aligned = v;
+			//	if (this.stamp)
+			//		this.stamp.offset = undefined;
+				this.draw();
+			}),
+			id: 'aligned',
+		};
+		const sample: CascadeItem = {
+			...choiceItem('Sample', [
+				{value: 'oneLayer' as const,	face: svgFace(menuIcons.oneLayer),	caption: 'The layer Alt-clicked on'},
+				{value: 'allLayers' as const,	face: svgFace(menuIcons.allLayers),	caption: 'All layers'},
+			], () => this.sample, v => this.sample = v),
+			id: 'sample',
+		};
 
 		const selectModes = choiceItem('Selection', [
 			{value: 'replace' as const,		face: svgFace(menuIcons.selectNew),	caption: 'New selection'},
@@ -381,6 +544,7 @@ export class Painter {
 			brush:				[size, hardness, opacity],
 			pencil:				[size, opacity],
 			eraser:				[size, hardness, opacity],
+			stamp:				[size, hardness, opacity, aligned, sample],
 			bucket:				[tolerance, contiguous, opacity],
 			gradient:			[opacity],
 			line:				[size, opacity],
@@ -410,58 +574,30 @@ export class Painter {
 				children:	() => [...tools.map(tool), ...extra],
 			};
 		};
-		const op = (o: EditOp, icon: string, caption: string): CascadeItem => ({
+		const op = (o: string, icon: string, caption: string): CascadeItem => ({
 			id:			o,
 			face:		() => svgFace(icon),
 			caption:	() => caption,
 			select:		() => this.run(o),
 		});
 		const colour = (which: 'fg' | 'bg', caption: string): CascadeItem => ({
+			id:			which,
 			face:		() => swatchFace(hex(this[which])),
 			caption:	() => `${caption} ${hex(this[which])}`,
-			select:		() => {
-				this.picking = which;
-				this.colourInput.value = hex(this[which]);
-				this.colourInput.showPicker?.() ?? this.colourInput.click();
-				return true;
-			},
-		});
-
-		const mode = choiceItem('Mode', [
-			{value: 'free' as const,		face: svgFace(menuIcons.free),			caption: 'Scale and rotate'},
-			{value: 'skew' as const,		face: svgFace(menuIcons.skew),			caption: 'Skew'},
-			{value: 'distort' as const,		face: svgFace(menuIcons.distort),		caption: 'Distort'},
-			{value: 'perspective' as const,	face: svgFace(menuIcons.perspective),	caption: 'Perspective'},
-		], () => this.transformMode, v => this.transformMode = v);
-		
-		const transform: CascadeItem = {
-			id:			'transform',
-			face:		() => svgFace(toolInfo.transform.icon),
-			caption:	() => 'Transform',
-			active:		() => !!this.xf,
 			children:	() => [
+				...colourItems(which, () => this[which], c => this.setColour(which, {...c, a: 255}), () => true, []),
 				{
-					id:			'transform-layer',
-					face:		() => svgFace(toolInfo.transform.icon),
-					caption:	() => 'Free Transform (Enter applies, Esc cancels)',
-					active:		() => !!this.xf?.layer,
-					select:		() => this.startTransform('layer'),
-					children:	() => [mode],
+					face:		() => svgFace(menuIcons.picker),
+					caption:	() => 'Choose with the system colour picker',
+					select:		() => {
+						this.picking = which;
+						this.colourInput.value = hex(this[which]);
+						this.colourInput.showPicker?.() ?? this.colourInput.click();
+						return true;
+					},
 				},
-				{
-					id:			'transform-image',
-					face:		() => svgFace(menuIcons.image),
-					caption:	() => 'Transform Image: all of it, onto a canvas that fits',
-					active:		() => !!this.xf && !this.xf.layer,
-					select:		() => this.startTransform('image'),
-					children:	() => [mode],
-				},
-				op('flipHorizontal', menuIcons.flipH, 'Flip Horizontal'),
-				op('flipVertical', menuIcons.flipV, 'Flip Vertical'),
-				op('rotateClockwise', menuIcons.rotateCW, 'Rotate 90° Clockwise'),
-				op('rotateAnticlockwise', menuIcons.rotateACW, 'Rotate 90° Anticlockwise'),
 			],
-		};
+		});
 
 		const [select, paint, fill, shapes] = toolGroups;
 		return [
@@ -470,12 +606,16 @@ export class Painter {
 				op('selectAll', menuIcons.selectAll, 'Select All (⌘A)'),
 				op('deselect', menuIcons.deselect, 'Deselect (⌘D)'),
 				op('invertSelection', menuIcons.invertSelection, 'Invert Selection (⇧⌘I)'),
-				op('crop', menuIcons.crop, 'Crop to Selection'),
+				modifier('growSelection', menuIcons.growSelection, 'Grow Selection'),
+				modifier('shrinkSelection', menuIcons.shrinkSelection, 'Shrink Selection'),
+				modifier('borderSelection', menuIcons.borderSelection, 'Border Selection'),
+				modifier('smoothSelection', menuIcons.smoothSelection, 'Smooth Selection'),
+				modifier('featherSelection', menuIcons.featherSelection, 'Feather Selection'),
 			]),
 			group(paint, 'Paint'),
 			group(fill, 'Fill'),
 			group(shapes, 'Shapes'),
-			transform,
+			filters,
 			tool('eyedropper'),
 			{
 				id:			'colours',
@@ -492,131 +632,65 @@ export class Painter {
 	}
 
 	private updateCursor() {
-		this.host.canvas.style.cursor = !this.active ? '' : this.xf && !this.spaceDown ? '' : cursorFor(this.spaceDown ? 'hand' : this.tool);
-	}
-
-	//-------------------------------------------------------------------------
-	// transforming
-	//-------------------------------------------------------------------------
-
-	// a transform is under way (its box and handles may be anywhere, including off the picture)
-	get transforming() {
-		return !!this.xf;
-	}
-
-	private startTransform(target: TransformTarget) {
-		this.endTransform(true, false);
-		const begun = this.host.beginTransform(target, this.selection && !this.selection.empty ? this.selection : undefined);
-		if (!begun)
-			return;
-		const {box, layer, selection} = begun;
-		this.xf		= {session: begun, layer, selection, box, quad: box.corners(), previous: this.tool};
-		this.tool	= 'transform';
-		this.updateCursor();
-		begun.update(float3x3.fromQuad(box, this.xf.quad));
-	}
-
-	// apply it (as an edit) or not, and go back to the tool before
-	private endTransform(apply: boolean, restoreTool = true) {
-		const xf = this.xf;
-		if (!xf)
-			return;
-		this.xf = undefined;
-		xf.session.end();
-		const corners	= xf.box.corners();
-		const moved		= xf.quad.some((p, i) => Math.abs(p.x - corners[i].x) > 1e-9 || Math.abs(p.y - corners[i].y) > 1e-9);
-		if (apply && moved)
-			this.transform({kind: 'warp', matrix: float3x3.fromQuad(xf.box, xf.quad), layer: xf.layer, selection: xf.selection}, xf.layer || xf.selection ? 'Free Transform' : 'Transform Image');
-		else
-			this.host.redraw();
-		if (restoreTool)
-			this.setTool(xf.previous);
-	}
-
-	private partAt(p: float2): TransformPart {
-		const xf = this.xf!;
-		return partAt(xf.box, xf.quad, p, HANDLE * (window.devicePixelRatio || 1) * this.host.pixelSize());
-	}
-
-	// a drag of the box: from where it was when the drag began, by what is under the pointer and the mode
-	private transformDrag(event: PointerEvent) {
-		const xf = this.xf!, canvas = this.host.canvas;
-		const start = this.host.toImage(event.clientX, event.clientY);
-		const part = this.partAt(start);
-		if (event.detail === 2 && part.kind === 'inside') {
-			this.endTransform(true);
-			return;
-		}
-		// the whole document is where it is, whatever is done to it
-		if (part.kind === 'inside' && !xf.layer && !xf.selection)
-			return;
-		canvas.setPointerCapture(event.pointerId);
-		const q0 = xf.quad.map(p => p.dup());
-
-		const move = (e: PointerEvent) => {
-			const q = dragQuad({
-				box: xf.box, q0, part, start,
-				mode: dragMode(part, this.transformMode, e), shift: e.shiftKey, alt: e.altKey,
-				// by whole pixels, so that a layer only moved is not resampled
-				move: d => float2(Math.round(d.x), Math.round(d.y)),
-			}, this.host.toImage(e.clientX, e.clientY));
-			if (q) {
-				xf.quad = q;
-				xf.session.update(float3x3.fromQuad(xf.box, q));
-			}
-		};
-		const up = () => {
-			canvas.removeEventListener('pointermove', move);
-			canvas.removeEventListener('pointerup', up);
-			canvas.removeEventListener('pointercancel', up);
-			canvas.removeEventListener('lostpointercapture', up);
-		};
-		canvas.addEventListener('pointermove', move);
-		canvas.addEventListener('pointerup', up);
-		canvas.addEventListener('pointercancel', up);
-		canvas.addEventListener('lostpointercapture', up);
+		this.stack.refresh();
 	}
 
 	// one of the whole-image operations (whether it is one of the tools': the others are not done)
-	run(op: EditOp | LayerOp): boolean {
+	run(op: string): boolean {
 		const image = this.host.target();
-		if (!this.active || !image)
+		if (!this.active || !image || this.suspended || this.aside)
 			return false;
 		switch (op) {
-			case 'fill':				this.fillSelection(this.fg, 'Fill'); break;
-			case 'clear':				this.clearSelection(); break;
-			case 'invert':				this.invert(); break;
-			case 'flipHorizontal':		this.transform({kind: 'flip', horizontal: true}, 'Flip Horizontal'); break;
-			case 'flipVertical':		this.transform({kind: 'flip', horizontal: false}, 'Flip Vertical'); break;
-			case 'rotateClockwise':		this.transform({kind: 'rotate', clockwise: true}, 'Rotate Clockwise'); break;
-			case 'rotateAnticlockwise':	this.transform({kind: 'rotate', clockwise: false}, 'Rotate Anticlockwise'); break;
-			case 'crop':				this.cropToSelection(); break;
-			case 'selectAll':
-				this.select(Selection.all(imageSize(image)), 'Select All');
-				break;
-			case 'deselect':
-				this.select(undefined, 'Deselect');
-				break;
-			case 'invertSelection':
-				this.select(this.selection ? this.selection.invert(imageSize(image)) : Selection.all(imageSize(image)), 'Invert Selection');
-				break;
-			default:
-				return false;
+			case 'fill':				return this.fillSelection(this.fg, 'Fill'), true;
+			case 'clear':				return this.clearSelection(), true;
+			case 'invert':				return this.invert(), true;
+			case 'blur':				return this.filter('blur', 'Blur'), true;
+			case 'sharpen':				return this.filter('sharpen', 'Sharpen'), true;
+			case 'levels':				return this.filter('levels', 'Levels'), true;
+			case 'boxBlur':				return this.filter('boxBlur', 'Box Blur'), true;
+			case 'emboss':				return this.filter('emboss', 'Emboss'), true;
+			case 'edges':				return this.filter('edges', 'Detect Edges'), true;
+			case 'selectAll':			return this.select(Selection.all(imageSize(image)), 'Select All'), true;
+			case 'deselect':			return this.select(undefined, 'Deselect'), true;
+			case 'invertSelection':		return this.select(this.selection ? this.selection.invert(imageSize(image)) : Selection.all(imageSize(image)), 'Invert Selection'), true;
+			case 'growSelection':
+			case 'shrinkSelection':
+			case 'borderSelection':
+			case 'smoothSelection':
+			case 'featherSelection':	return !!this.selection && (this.select(this.modified(op, this.modifyBy[op]), op.replace('Selection', ' Selection').replace(/^./, c => c.toUpperCase())), true);
+			default:					return false;
 		}
-		return true;
+	}
+
+	// the selection as a modifier, of so many pixels, would leave it
+	private modified(op: keyof Painter['modifyBy'], n: number) {
+		const sel = this.selection!, size = imageSize(this.host.target()!);
+		switch (op) {
+			case 'growSelection':	return sel.growClamp(n, size);
+			case 'shrinkSelection':	return sel.growClamp(-n, size);
+			case 'borderSelection':	return sel.border(n, size);
+			case 'smoothSelection':	return sel.smooth(n, size, this.maskBlur);
+			default:				return sel.feather(n, size, this.maskBlur);
+		}
+	}
+
+	// show what a modifier would do, with the amount it has (or one that is being considered); nothing stops it
+	private previewModifier(op: keyof Painter['modifyBy'] | undefined, amount?: number) {
+		this.preview = op && this.active && this.selection && this.host.target() ? this.modified(op, amount ?? this.modifyBy[op]) : undefined;
+		this.draw();
 	}
 
 	// the selection becomes this, which is an undoable edit (as in Photoshop) unless nothing changes
-	private select(s: Selection | undefined, label = 'Select') {
+	select(s: Selection | undefined, label = 'Select') {
 		const before = this.selection;
-		this.draft = this.corners = undefined;
+		this.draft = this.corners = this.preview = undefined;
 		if (s === before) {
 			this.draw();
 			return;
 		}
 		const set = (v: Selection | undefined) => () => {
-			this.selection = v;
-			this.draft = this.corners = undefined;
+			this.selected = v;
+			this.draft = this.corners = this.preview = undefined;
 			this.draw();
 		};
 		set(s)();
@@ -656,49 +730,33 @@ export class Painter {
 		this.menu.refresh();
 	}
 
-	//-------------------------------------------------------------------------
-	// history
-	//-------------------------------------------------------------------------
-
 	private push(entry: HistoryEntry, label: string) {
-		this.history.length = this.position;
-		this.history.push(entry);
-		if (this.history.length > MAX_HISTORY)
-			this.history.shift();
-		this.position = this.history.length;
-		this.host.edited(label);
+		this.history.push(entry, label);
 	}
 
-	undo() {
-		if (this.position > 0)
-			this.history[--this.position].undo();
+	// finish operations (of one edit, which may reach more than one image): if they changed anything, that is an edit.
+	// A patch is of the image it was made on, which may not be the one being drawn on when it is undone
+	private commitAll(ops: Iterable<Operation>, label: string) {
+		const made: {image: RGBAPixels, patch: Patch}[] = [];
+		for (const op of ops) {
+			const patch = op.commit();
+			if (patch)
+				made.push({image: op.image, patch});
+		}
+		const apply = (which: 'before' | 'after') => () => {
+			for (const {image, patch} of made)
+				this.host.changed(image, applyPatch(image, patch, which));
+		};
+		if (made.length)
+			this.push({undo: apply('before'), redo: apply('after')}, label);
 	}
 
-	redo() {
-		if (this.position < this.history.length)
-			this.history[this.position++].redo();
-	}
-
-	// an edit made elsewhere (to the layers), already done
-	record(label: string, undo: () => void, redo: () => void) {
-		this.push({undo, redo}, label);
-	}
-
-	// a patch is of the image it was made on, which may not be the one being drawn on when it is undone
-	private pushPatch(image: Pixels, patch: Patch, label: string) {
-		const apply = (which: 'before' | 'after') => () => this.host.changed(image, applyPatch(image, patch, which));
-		this.push({undo: apply('before'), redo: apply('after')}, label);
-	}
-
-	// finish an operation: if it changed anything, that is an edit
 	private commit(op: Operation, label: string) {
-		const patch = op.commit();
-		if (patch)
-			this.pushPatch(op.image, patch, label);
+		this.commitAll([op], label);
 	}
 
-	private operation(blend: Operation['blend'] = 'paint') {
-		const op = new Operation(this.host.target()!, this.selection);
+	private operation(blend: Operation['blend'] = 'paint', image = this.host.target()!, selection = this.selection) {
+		const op = new Operation(image, selection);
 		op.opacity	= this.opacity;
 		op.colour	= this.fg;
 		op.blend	= blend;
@@ -745,102 +803,207 @@ export class Painter {
 		this.commit(op, 'Invert');
 	}
 
-	// change the whole document, which the selection does not survive
-	private transform(change: DocumentChange, label: string) {
-		const entry = this.host.transform(change);
-		if (!entry)
+	// the selection, or the whole layer, filtered: the selection's soft edge is how much of the filter a pixel takes
+	private filter(kind: FilterKind, label: string) {
+		if (this.previewFrame !== undefined) {
+			cancelAnimationFrame(this.previewFrame);
+			this.previewFrame = undefined;
+		}
+		if (this.blurring) {
+			// as it was previewed, at the settings it was left with
+			this.showFilter(kind);
+			const op = this.blurring;
+			this.blurring = undefined;
+			this.commit(op, label);
 			return;
-		// the selection goes with what it selected, if it was that which was transformed: else it does not survive the change
-		const before = change.kind === 'warp' ? change.selection : undefined, image = this.host.target();
-		const after = before && image && change.kind === 'warp' ? warpSelection(before, change.matrix, imageRect(image)) : undefined;
-		const use = (run: () => void, selection: Selection | undefined) => () => {
-			this.selection = selection;
-			run();
-		};
-		this.selection = after;
-		this.push({undo: use(entry.undo, before), redo: use(entry.redo, after)}, label);
+		}
+		const op = this.filterOperation(kind);
+		if (op)
+			this.commit(op, label);
 	}
 
-	private cropToSelection() {
-		const image = this.host.target(), s = this.selection;
-		if (!image || !s)
+	// a mask (one value a pixel, 0..255, zero beyond its edges) blurred in place, on the GPU, as bytes (which a selection's coverage
+	// is, and which can be drawn into where floats cannot); left as it is where there is no GPU
+	private maskBlur = (f: Float32Array, width: number, height: number, sigma: number) => {
+		const image = Pixels(Uint8ClampedArray.from(f), width, height, 1), blurred = this.blurred(image, imageRect(image), sigma, 0, 'zero');
+		if (blurred)
+			f.set(blurred.data);
+	};
+
+	// an area of an image blurred, or sharpened by an unsharp mask of this radius, on the GPU; nothing where there is none
+	private blurred(image: Pixels, area: float2.extent, radius: number, sharpen = 0, edge: 'zero' | 'clamp' = 'clamp') {
+		return blurWith((passes, reach) => this.host.shade?.('blur', image, area, passes, reach), image, radius, edge, sharpen);
+	}
+
+	// the filter as the settings (or those given instead) have it, on an area of an image
+	private filtered(kind: FilterKind, image: Pixels, area: float2.extent, using: FilterUsing = {}) {
+		switch (kind) {
+			case 'blur': {
+				const radius = using.blurRadius ?? this.blurRadius;
+				return this.blurred(image, area, radius);
+			}
+			case 'sharpen': {
+				const radius = using.sharpenRadius ?? this.sharpenRadius;
+				return this.blurred(image, area, radius, 1);
+			}
+			case 'boxBlur':
+			case 'emboss':
+			case 'edges': {
+				const kernel = kind === 'boxBlur' ? boxKernel(using.boxSize ?? this.boxSize) : kind === 'emboss' ? embossKernel : edgeKernel;
+				return this.host.shade?.('convolve', image, area, kernelUniforms(kernel), kernel.size >> 1);
+			}
+			case 'levels':
+				return this.host.shade?.('levels', image, area, levelsUniforms(this.levels)) ?? levelsPixels(image, area, this.levels);
+		}
+	}
+
+	// the operation which has filtered the selection (or layer), if there was anything to filter
+	private filterOperation(kind: FilterKind, op = this.operation(), using?: FilterUsing) {
+		const image = op.image;
+		const area = op.bounds();
+		if (area.empty())
 			return;
-		const min = float2(Math.max(0, s.l), Math.max(0, s.t)), max = float2(Math.min(image.width, s.r), Math.min(image.height, s.b));
-		if (max.x > min.x && max.y > min.y)
-			this.transform({kind: 'crop', rect: new float2.extent(min, max)}, 'Crop');
+		op.blend = 'replace';
+		op.opacity = 1;
+		const result = this.filtered(kind, image, area, using) as RGBAPixels | undefined;	// (a picture's pixels in, so a picture's out)
+		if (!result)
+			return;		// (no GPU to do it)
+		op.replace(area, result);
+		this.flush(op);
+		return op;
+	}
+
+	// Show the filter on the picture without making an edit, or (without one) take it away. A filter of a big picture takes a while,
+	// so the showing waits for the next frame, and what is asked for in the meantime (the wheel turning, a value dragged) is
+	// only shown as it stands then.
+	private previewFilter(kind?: FilterKind, using?: FilterUsing) {
+		if (this.previewFrame !== undefined) {
+			cancelAnimationFrame(this.previewFrame);
+			this.previewFrame = undefined;
+		}
+		if (kind === undefined || !this.host.target()) {
+			this.showFilter();
+			return;
+		}
+		this.previewFrame = requestAnimationFrame(() => {
+			this.previewFrame = undefined;
+			this.showFilter(kind, using);
+		});
+	}
+
+	// the preview as it is asked for, at once
+	private showFilter(kind?: FilterKind, using?: FilterUsing) {
+		const op = this.blurring;
+		if (op) {
+			op.reset();
+			this.flush(op);
+		}
+		if (kind === undefined || !this.host.target()) {
+			this.blurring = undefined;
+			return;
+		}
+		this.blurring = this.filterOperation(kind, op ?? this.operation(), using);
 	}
 
 	//-------------------------------------------------------------------------
 	// pointer
 	//-------------------------------------------------------------------------
 
-	// Begin a tool's drag; false if the pointer is not for it (the viewer then pans)
-	// the tools, brought up at a point of the window
-	openMenu(clientX: number, clientY: number, items?: CascadeItem[]) {
-		this.host.panelOpened();
+	// the menu has come up at a point of the window, which is where the system's colour picker is to come up
+	menuOpened(x: number, y: number) {
 		const r = this.overlay.parentElement!.getBoundingClientRect();
-		this.colourInput.style.left = `${clientX - r.left}px`;
-		this.colourInput.style.top	= `${clientY - r.top}px`;
-		this.menu.open(clientX, clientY, items);
+		this.colourInput.style.left = `${x - r.left}px`;
+		this.colourInput.style.top	= `${y - r.top}px`;
 	}
 
-	pointerDown(event: PointerEvent) {
+	// Begin a tool's drag; undefined if the pointer is not for it (the viewer then pans)
+	private press(event: PointerEvent): Drag | true | undefined {
 		const image = this.host.target();
-		if (!this.active || !image || event.button !== 0 || this.tool === 'hand' || this.spaceDown)
-			return false;
-		// control-click is a right click on a Mac, and opens the context menu
-		if (event.ctrlKey && navigator.platform.toLowerCase().includes('mac'))
-			return false;
-		if (this.xf) {
-			this.transformDrag(event);
-			return true;
-		}
+		if (!this.active || this.suspended || this.aside || !image || event.button !== 0 || this.tool === 'hand')
+			return;
 
-		const canvas = this.host.canvas;
-		canvas.setPointerCapture(event.pointerId);
 		const start = this.host.toImage(event.clientX, event.clientY);
 
+		// (every point the pointer passed through, not just where it is when the frame is drawn)
+		let drag: Drag | true = true;
 		const track = (move: (e: PointerEvent, p: float2) => void, up: (e: PointerEvent) => void) => {
-			const onMove = (e: PointerEvent) => {
-				// every point the pointer passed through, not just where it is when the frame is drawn
-				const events = e.getCoalescedEvents?.() ?? [];
-				for (const c of events.length ? events : [e])
-					move(c, this.host.toImage(c.clientX, c.clientY));
-			};
-			// the end of a drag is the pointer's release, or its capture being lost (a context menu opening takes the release)
-			let done = false;
-			const onUp = (e: PointerEvent) => {
-				if (done)
-					return;
-				done = true;
-				canvas.removeEventListener('pointermove', onMove);
-				canvas.removeEventListener('pointerup', onUp);
-				canvas.removeEventListener('pointercancel', onUp);
-				canvas.removeEventListener('lostpointercapture', onUp);
-				up(e);
-			};
-			canvas.addEventListener('pointermove', onMove);
-			canvas.addEventListener('pointerup', onUp);
-			canvas.addEventListener('pointercancel', onUp);
-			canvas.addEventListener('lostpointercapture', onUp);
+			drag = {coalesced: true, move: e => move(e, this.pointer = this.host.toImage(e.clientX, e.clientY)), end: up};
 		};
 
 		switch (this.tool) {
 			case 'brush':
 			case 'pencil':
 			case 'eraser': {
-				const op = this.operation(this.tool === 'eraser' ? 'erase' : 'paint');
+				// (a stroke may go on to other surfaces of the picture, each with an operation of its own: the selection is of the first)
+				const blend = this.tool === 'eraser' ? 'erase' : 'paint';
+				const ops = new Map<RGBAPixels, Operation>();
+				const opOn = (on: RGBAPixels) => {
+					let o = ops.get(on);
+					if (!o)
+						ops.set(on, o = this.operation(blend, on, on === image ? this.selection : undefined));
+					return o;
+				};
+				let op = opOn(image);
+				let last = start;
+				const segment = (o: Operation, a: float2, b: float2, size: number) => {
+					if (this.tool === 'pencil')
+						pencilSegment(o, a.x, a.y, b.x, b.y, size);
+					else
+						brushSegment(o, a.x, a.y, b.x, b.y, size, this.hardness);
+				};
+				const stroke = (to: float2) => {
+					segment(op, last, to, this.size);
+					for (const s of this.host.adjoining?.(last, to, this.size) ?? [])
+						segment(opOn(s.image), s.p, s.q, s.size);
+					last = to;
+					for (const o of ops.values())
+						this.flush(o);
+				};
+				stroke(start);
+				track((c, p) => {
+					const carried = this.host.crossTo?.(c.clientX, c.clientY, last);
+					if (carried) {
+						last = carried;
+						op = opOn(this.host.target()!);
+						p = this.host.toImage(c.clientX, c.clientY);
+					}
+					stroke(p);
+				}, () => this.commitAll(ops.values(), toolInfo[this.tool].label!));
+				break;
+			}
+
+			case 'stamp': {
+				if (event.altKey) {
+					// where it copies from: this point, of the layer (or all the picture) seen now
+					this.stamp = this.host.cloneSource?.(start, this.sample === 'allLayers');
+					this.draw();
+					break;
+				}
+				const stamp = this.stamp;
+				let from = stamp?.from;
+				if (!stamp || !from)
+					break;
+				// (a copy of what is drawn on, so a stroke copies what was there before it and not itself)
+				if (from === image)
+					from = RGBAPixels(image.data.slice(), image.width, image.height);
+
+				// by whole pixels, so what is copied is not resampled
+				const offset	= stamp.offset ??= float2(Math.round(stamp.at.x - start.x), Math.round(stamp.at.y - start.y));
+				const colour	= (x: number, y: number) => asRGBA(getPixel(from, x + offset.x, y + offset.y));
+				const op		= this.operation();
 				let last = start;
 				const stroke = (to: float2) => {
-					if (this.tool === 'pencil')
-						pencilSegment(op, last.x, last.y, to.x, to.y, this.size);
-					else
-						brushSegment(op, last.x, last.y, to.x, to.y, this.size, this.hardness);
+					brushSegment(op, last.x, last.y, to.x, to.y, this.size, this.hardness, colour);
 					last = to;
 					this.flush(op);
 				};
 				stroke(start);
-				track((_, p) => stroke(p), () => this.commit(op, toolInfo[this.tool].label!));
+				track((_, p) => stroke(p), () => {
+					//if (!this.aligned)
+					//	stamp.offset = undefined;
+					this.commit(op, toolInfo.stamp.label);
+					this.draw();
+				});
 				break;
 			}
 
@@ -850,10 +1013,13 @@ export class Painter {
 			case 'gradient': {
 				const op = this.operation();
 				const tool = this.tool;
+				// (a gradient covers all it can, so the GPU shows it as it is dragged, and its pixels are worked out once, when it is let go)
+				const selected = op.selection, m = selected?.mask, mask = m && Pixels(new Uint8ClampedArray(m.buffer as ArrayBuffer, m.byteOffset, m.length), selected.width, selected.height, 1);
+				const preview = tool === 'gradient' ? this.host.previewShade?.(op.image, 'gradient', mask ? [mask] : []) : undefined;
 				let end = start;
-				let shift = false, alt = false;
-				const render = () => {
-					op.reset();
+				let shift = false, alt = false, frame: number | undefined;
+				// where it goes from and to
+				const ends = (): [number, number, number, number] => {
 					let {x, y} = end;
 					let x0 = start.x, y0 = start.y;
 					if (shift) {
@@ -873,6 +1039,22 @@ export class Painter {
 						x0 = 2 * start.x - x;
 						y0 = 2 * start.y - y;
 					}
+					return [x0, y0, x, y];
+				};
+				// (once a frame, however many moves there were)
+				const render = () => {
+					frame = undefined;
+					const [x0, y0, x, y] = ends();
+					if (preview) {
+						const {fg, bg} = this, box = selected ?? imageRect(op.image);
+						preview.show({
+							u_selection: 1, u_selected: [box.min.x, box.min.y, box.max.x - box.min.x, box.max.y - box.min.y], u_masked: mask ? 1 : 0,
+							u_line: [x0, y0, x - x0, y - y0], u_from: [fg.r / 255, fg.g / 255, fg.b / 255, fg.a / 255], u_to: [bg.r / 255, bg.g / 255, bg.b / 255, bg.a / 255],
+							u_opacity: op.opacity,
+						});
+						return;
+					}
+					op.reset();
 					if (tool === 'gradient')
 						drawGradient(op, x0, y0, x, y, this.fg, this.bg);
 					else
@@ -886,8 +1068,19 @@ export class Painter {
 					end = p;
 					shift = e.shiftKey;
 					alt = e.altKey;
-					render();
-				}, () => this.commit(op, toolInfo[tool].label!));
+					frame ??= requestAnimationFrame(render);
+				}, () => {
+					if (frame !== undefined)
+						cancelAnimationFrame(frame);
+					if (preview) {
+						drawGradient(op, ...ends(), this.fg, this.bg);
+						op.take();			// (all the image is shown again as it ends)
+						preview.end();
+					} else {
+						render();
+					}
+					this.commit(op, toolInfo[tool].label!);
+				});
 				break;
 			}
 
@@ -896,12 +1089,11 @@ export class Painter {
 				floodFill(op, Math.floor(start.x), Math.floor(start.y), this.tolerance, this.contiguous);
 				this.flush(op);
 				this.commit(op, 'Paint Bucket');
-				canvas.releasePointerCapture(event.pointerId);
 				break;
 			}
 
 			case 'eyedropper': {
-				// the colour seen, which with layers is not any one layer's
+				// the colour the tooltip shows: the current layer's, where the pointer is on it
 				const sample = (e: PointerEvent, p: {x: number, y: number}) => {
 					const c = this.host.pick(Math.floor(p.x), Math.floor(p.y));
 					if (c)
@@ -974,7 +1166,6 @@ export class Painter {
 			}
 
 			case 'polygon-lasso': {
-				canvas.releasePointerCapture(event.pointerId);
 				if (!this.corners) {
 					this.corners = {points: [start], mode: this.modeFor(event)};
 				} else {
@@ -990,12 +1181,11 @@ export class Painter {
 			}
 
 			case 'wand': {
-				canvas.releasePointerCapture(event.pointerId);
 				this.join(Selection.wand(image, Math.floor(start.x), Math.floor(start.y), this.tolerance, this.contiguous), this.modeFor(event));
 				break;
 			}
 		}
-		return true;
+		return drag;
 	}
 
 	// close the polygonal lasso and select what it encloses
@@ -1016,65 +1206,47 @@ export class Painter {
 	// keys
 	//-------------------------------------------------------------------------
 
-	private keyDown(e: KeyboardEvent) {
-		const target = e.target as HTMLElement | null;
-		if (!this.active || (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) && (target as HTMLInputElement).type !== 'checkbox' && (target as HTMLInputElement).type !== 'range'))
-			return;
+	// a key: whether the tools take it
+	private keyDown(e: KeyboardEvent): boolean {
+		// (a transform has the keys it wants)
+		if (!this.active || this.suspended || this.aside)
+			return false;
 
 		const image = this.host.target();
 		const mod = e.metaKey || e.ctrlKey;
 		const key = e.key.toLowerCase();
 
 		if (mod) {
-			if (key === 'a' && image) {
+			if (key === 'a' && image)
 				this.run('selectAll');
-				e.preventDefault();
-			} else if (key === 'i' && e.shiftKey) {
+			else if (key === 'i' && e.shiftKey)
 				this.run('invertSelection');
-				e.preventDefault();
-			} else if (key === 'd') {
+			else if (key === 'd')
 				this.run('deselect');
-				e.preventDefault();
-			} else if (e.key === 'Backspace') {
+			else if (e.key === 'Backspace')
 				this.fillSelection(this.bg, 'Fill');
-				e.preventDefault();
-			}
-			return;
+			else
+				return false;
+			return true;
 		}
 
-		if (this.corners) {
+		// (with a polygonal lasso under way, any other key goes on to do what it does)
+		if (this.corners && ['Enter', 'Escape', 'Backspace', 'Delete'].includes(e.key)) {
 			if (e.key === 'Enter') {
 				this.finishCorners();
 			} else if (e.key === 'Escape') {
 				this.corners = undefined;
 				this.draw();
-			} else if (e.key === 'Backspace' || e.key === 'Delete') {
+			} else {
 				this.corners.points.pop();
 				if (!this.corners.points.length)
 					this.corners = undefined;
 				this.draw();
-			} else {
-				// (any other key goes on to do what it does)
 			}
-			if (['Enter', 'Escape', 'Backspace', 'Delete'].includes(e.key)) {
-				e.preventDefault();
-				return;
-			}
+			return true;
 		}
 
-		if (this.xf && (e.key === 'Enter' || e.key === 'Escape')) {
-			this.endTransform(e.key === 'Enter');
-			e.preventDefault();
-			return;
-		}
-
-		if (e.key === ' ') {
-			if (!this.spaceDown) {
-				this.spaceDown = true;
-				this.host.canvas.style.cursor = '';
-			}
-			e.preventDefault();
-		} else if (e.key === 'Escape') {
+		if (e.key === 'Escape') {
 			// (an open menu takes the key itself)
 			this.select(undefined);
 
@@ -1083,7 +1255,6 @@ export class Painter {
 				this.fillSelection(this.fg, 'Fill');
 			else
 				this.clearSelection();
-			e.preventDefault();
 
 		} else if (key === 'x') {
 			this.swapColours();
@@ -1096,18 +1267,76 @@ export class Painter {
 			this.draw();
 			this.menu.refresh();
 
-		} else if (!e.altKey) {
-			const group = Object.entries(toolInfo).filter(([t, info]) => info.key === e.key).map(([t, info]) => t as Tool);
-			if (group.length) {
-				const i = group.indexOf(this.tool);
-				this.setTool(group[(i + 1) % group.length]);
-			}
+		} else {
+			const group = e.altKey ? [] : Object.entries(toolInfo).filter(([t, info]) => info.key === e.key).map(([t, info]) => t as Tool);
+			if (!group.length)
+				return false;
+			const i = group.indexOf(this.tool);
+			this.setTool(group[(i + 1) % group.length]);
 		}
+		return true;
 	}
 
 	//-------------------------------------------------------------------------
 	// overlay: the selection and the brush
 	//-------------------------------------------------------------------------
+
+	// a grid of round numbers of the image's pixels, as fine as keeps its lines apart on the screen (but not finer than a pixel), over the
+	// image (or the part of the canvas it is seen in); its major lines numbered on white strips against the image's top and left edges,
+	// kept on the screen when an edge is off it
+	private drawGrid(screen: (p: float2) => float2, pixelRatio: number) {
+		const ctx = this.ctx, o = screen(float2(0, 0)), k = screen(float2(1, 1)).x - o.x;
+		if (!(k > 0))
+			return;
+		const target = this.host.target(), size = target ? imageSize(target) : undefined;
+		const W = this.overlay.width, H = this.overlay.height;
+		const x0 = Math.max(0, -o.x / k), x1 = Math.min(size?.x ?? Infinity, (W - o.x) / k);
+		const y0 = Math.max(0, -o.y / k), y1 = Math.min(size?.y ?? Infinity, (H - o.y) / k);
+		const {step, every} = gridSpacing(k / pixelRatio, 12, 1);
+		const sx = (v: number) => Math.round(o.x + v * k) + 0.5, sy = (v: number) => Math.round(o.y + v * k) + 0.5;
+		const xs: number[] = [], ys: number[] = [];
+		for (let i = Math.ceil(x0 / step); i <= Math.floor(x1 / step); i++)
+			xs.push(i);
+		for (let i = Math.ceil(y0 / step); i <= Math.floor(y1 / step); i++)
+			ys.push(i);
+		for (const major of [false, true]) {
+			ctx.beginPath();
+			for (const i of xs)
+				if ((i % every === 0) === major) {
+					ctx.moveTo(sx(i * step), sy(y0));
+					ctx.lineTo(sx(i * step), sy(y1));
+				}
+			for (const i of ys)
+				if ((i % every === 0) === major) {
+					ctx.moveTo(sx(x0), sy(i * step));
+					ctx.lineTo(sx(x1), sy(i * step));
+				}
+			ctx.lineWidth = pixelRatio;
+			ctx.setLineDash([]);
+			ctx.strokeStyle = major ? 'rgba(128, 128, 128, 0.8)' : 'rgba(128, 128, 128, 0.4)';
+			ctx.stroke();
+		}
+
+		const th = 15 * pixelRatio, text = (i: number) => String(i * step);
+		ctx.font = `${11 * pixelRatio}px sans-serif`;
+		const tw = Math.ceil(Math.max(0, ...ys.filter(i => i % every === 0).map(i => ctx.measureText(text(i)).width))) + 6 * pixelRatio;
+		const ty = Math.max(0, Math.min(H - th, o.y - th)), lx = Math.max(0, Math.min(W - tw, o.x - tw));
+		const strip = (x: number, y: number, w: number, h: number, draw: () => void) => {
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(x, y, w, h);
+			ctx.clip();
+			ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+			ctx.fillRect(x, y, w, h);
+			ctx.fillStyle = '#000';
+			ctx.textAlign = 'left';
+			ctx.textBaseline = 'middle';
+			draw();
+			ctx.restore();
+		};
+		strip(sx(x0) - 0.5, ty, sx(x1) - sx(x0), th, () => xs.forEach(i => i % every === 0 && ctx.fillText(text(i), sx(i * step) + 3 * pixelRatio, ty + th / 2)));
+		strip(lx, sy(y0) - 0.5, tw, sy(y1) - sy(y0), () => ys.forEach(i => i % every === 0 && ctx.fillText(text(i), lx + 3 * pixelRatio, sy(i * step) - th / 2 + pixelRatio)));
+	}
 
 	draw() {
 		const ctx = this.ctx;
@@ -1117,8 +1346,12 @@ export class Painter {
 
 		const screen		= (p: float2) => this.host.toScreen(p);
 		const pixelRatio	= window.devicePixelRatio || 1;
+		if (this.grid)
+			this.drawGrid(screen, pixelRatio);
+		if (this.suspended || this.aside)
+			return;		// (and the selection is not where it was while what it selects is carried)
 
-		const outline = (path: () => void) => {
+		const outline = (path: () => void, dash = '#000') => {
 			ctx.lineWidth = pixelRatio;
 			ctx.setLineDash([]);
 			ctx.strokeStyle = '#fff';
@@ -1126,13 +1359,13 @@ export class Painter {
 			path();
 			ctx.stroke();
 			ctx.setLineDash([4 * pixelRatio, 4 * pixelRatio]);
-			ctx.strokeStyle = '#000';
+			ctx.strokeStyle = dash;
 			ctx.beginPath();
 			path();
 			ctx.stroke();
 		};
 
-		const s = this.xf?.selection ? undefined : this.selection;	// (the selection is not where it was while what it selects is carried)
+		const s = this.selected;
 		if (s) {
 			// a pixel's edge is on the screen's pixels' edges, to be sharp
 			const loops = s.outline();
@@ -1146,6 +1379,18 @@ export class Painter {
 				}
 			});
 		}
+		if (this.preview) {
+			const loops = this.preview.outline();
+			outline(() => {
+				for (const loop of loops) {
+					for (let i = 0; i < loop.length; i += 2) {
+						const p = screen(float2(loop[i], loop[i + 1]));
+						i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y);
+					}
+					ctx.closePath();
+				}
+			}, '#e60');
+		}
 		const draft = this.corners ? [...this.corners.points, ...(this.pointer ? [this.pointer] : [])] : this.draft;
 		if (draft?.length) {
 			outline(() => {
@@ -1158,43 +1403,23 @@ export class Painter {
 			});
 		}
 
-		if (this.xf) {
-			// the box, with lines through it in thirds, and its handles
-			const {corners, edges} = boxHandles(this.xf.box, this.xf.quad);
-			const m = float3x3.fromQuad(this.xf.box, this.xf.quad), b = this.xf.box;
-			const o = b.min, size = b.extent();
-			const at = (u: number, v: number) => screen(applyH(m, o.x + u * size.x, o.y + v * size.y).xy);
-			ctx.save();
-			ctx.globalAlpha = 0.5;
-			ctx.lineWidth = pixelRatio;
-			ctx.strokeStyle = '#fff';
-			ctx.beginPath();
-			for (const t of [1 / 3, 2 / 3]) {
-				const [a, c, d, e] = [at(t, 0), at(t, 1), at(0, t), at(1, t)];
-				ctx.moveTo(a.x, a.y); ctx.lineTo(c.x, c.y);
-				ctx.moveTo(d.x, d.y); ctx.lineTo(e.x, e.y);
-			}
-			ctx.stroke();
-			ctx.restore();
-			outline(() => {
-				corners.map(screen).forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-				ctx.closePath();
-			});
-			const r = 3.5 * pixelRatio;
-			ctx.setLineDash([]);
-			for (const h of [...corners, ...edges].map(p => screen(p.xy))) {
-				ctx.fillStyle = '#fff';
-				ctx.strokeStyle = '#000';
-				ctx.lineWidth = pixelRatio;
-				ctx.fillRect(h.x - r, h.y - r, 2 * r, 2 * r);
-				ctx.strokeRect(h.x - r, h.y - r, 2 * r, 2 * r);
-			}
-		}
-
-		if (this.pointer && !this.spaceDown && ['brush', 'pencil', 'eraser', 'line'].includes(this.tool)) {
+		if (this.pointer && ['brush', 'pencil', 'eraser', 'stamp', 'line'].includes(this.tool)) {
 			const r = Math.max(this.size / this.host.pixelSize() / 2, 2 * pixelRatio);
 			const centre = screen(this.pointer!);
 			outline(() => ctx.arc(centre.x, centre.y, r, 0, Math.PI * 2));
+		}
+
+		// where the clone stamp copies from: what is under the pointer once a stroke has set how far away that is
+		const stamp = this.tool === 'stamp' ? this.stamp : undefined;
+		if (stamp) {
+			const at = stamp.offset && this.pointer ? this.pointer.add(stamp.offset) : stamp.at;
+			const c = screen(at), r = 6 * pixelRatio;
+			outline(() => {
+				ctx.moveTo(c.x - r, c.y);
+				ctx.lineTo(c.x + r, c.y);
+				ctx.moveTo(c.x, c.y - r);
+				ctx.lineTo(c.x, c.y + r);
+			});
 		}
 	}
 }
@@ -1211,7 +1436,7 @@ class Operation extends Tiles {
 	colour		= RGBA(0, 0, 0, 255);
 	blend:		Blend = 'paint';
 
-	constructor(image: Pixels, readonly selection?: Selection | null) { super(image); }
+	constructor(image: RGBAPixels, readonly selection?: Selection | null) { super(image); }
 
 	// where anything can be drawn: the selection, inside the image
 	bounds(): float2.extent {
@@ -1222,6 +1447,39 @@ class Operation extends Tiles {
 	// how much of a pixel the selection lets through
 	private cover(x: number, y: number) {
 		return this.selection ? this.selection.at(x, y) / 255 : 1;
+	}
+
+	// What put does for each pixel of `area` with the colours of `src` (the area's size, from its corner), the selection's coverage
+	// the weight of each, as 'replace' at full opacity: all at once, as it is for a filter of a whole picture
+	replace(area: float2.extent, src: RGBAPixels) {
+		const {width, height, data: d} = this.image, s = src.data, sw = src.width, sel = this.selection;
+		const a = area.intersect(new float2.extent(float2(0, 0), float2(width, height)));
+		if (a.empty())
+			return;
+		for (let ty = Math.floor(a.min.y / TILE); ty * TILE < a.max.y; ty++) {
+			for (let tx = Math.floor(a.min.x / TILE); tx * TILE < a.max.x; tx++) {
+				const t = this.tile(tx * TILE, ty * TILE), tw = t.max.x - t.min.x, b = t.before, cover = t.cover;
+				const x0 = Math.max(a.min.x, t.min.x), x1 = Math.min(a.max.x, t.max.x), y0 = Math.max(a.min.y, t.min.y), y1 = Math.min(a.max.y, t.max.y);
+				for (let y = y0; y < y1; y++) {
+					for (let x = x0; x < x1; x++) {
+						const c = sel ? sel.at(x, y) / 255 : 1, i = (y - t.min.y) * tw + (x - t.min.x);
+						if (c <= 0 || c <= cover[i])
+							continue;
+						cover[i] = c;
+						const o = (y * width + x) * 4, k = ((y - area.min.y) * sw + x - area.min.x) * 4, j = i * 4;
+						if (c === 1) {
+							d[o] = s[k]; d[o + 1] = s[k + 1]; d[o + 2] = s[k + 2]; d[o + 3] = s[k + 3];
+						} else {
+							d[o]		= Math.round(b[j]		+ (s[k]		- b[j])		* c);
+							d[o + 1]	= Math.round(b[j + 1]	+ (s[k + 1]	- b[j + 1])	* c);
+							d[o + 2]	= Math.round(b[j + 2]	+ (s[k + 2]	- b[j + 2])	* c);
+							d[o + 3]	= Math.round(b[j + 3]	+ (s[k + 3]	- b[j + 3])	* c);
+						}
+					}
+				}
+			}
+		}
+		this.dirty = unionRect(this.dirty, a);
 	}
 
 	// give a pixel coverage `c` (0..1) of `colour`; a pixel only ever gains coverage until the operation is reset
@@ -1293,8 +1551,9 @@ function smooth(c: number) {
 
 // A soft round brush dragged from one point to the next: coverage depends only on the distance from the segment, so
 // a stroke is even however the pointer moved. Hardness 1 is a hard edge (still antialiased); less than that fades
-// from that fraction of the radius.
-function brushSegment(op: Operation, x0: number, y0: number, x1: number, y1: number, size: number, hardness: number) {
+// from that fraction of the radius. It paints the operation's colour, or each pixel the colour `colour` gives it (none where
+// it gives none).
+function brushSegment(op: Operation, x0: number, y0: number, x1: number, y1: number, size: number, hardness: number, colour?: (x: number, y: number) => RGBA | undefined) {
 	const r		= size / 2;
 	const f		= Math.max(r * (1 - hardness), 1);
 	const reach	= r + 1;
@@ -1306,7 +1565,9 @@ function brushSegment(op: Operation, x0: number, y0: number, x1: number, y1: num
 	for (let y = ya; y < yb; y++) {
 		for (let x = xa; x < xb; x++) {
 			const c = clamp((r + 0.5 - segmentDistance(x + 0.5, y + 0.5, x0, y0, dx, dy, len2)) / f, 0, 1);
-			op.put(x, y, f > 1 ? smooth(c) : c);
+			const k = c > 0 && colour ? colour(x, y) : op.colour;
+			if (k)
+				op.put(x, y, f > 1 ? smooth(c) : c, k);
 		}
 	}
 }
@@ -1420,7 +1681,7 @@ function drawGradient(op: Operation, x0: number, y0: number, x1: number, y1: num
 			op.put(x, y, 1, RGBA(
 				c0.r + (c1.r - c0.r) * t,
 				c0.g + (c1.g - c0.g) * t,
-				c0.g + (c1.g - c0.g) * t,
+				c0.b + (c1.b - c0.b) * t,
 				c0.a + (c1.a - c0.a) * t,
 			));
 		}
@@ -1434,7 +1695,7 @@ function drawGradient(op: Operation, x0: number, y0: number, x1: number, y1: num
 // Paint every pixel that is within `tolerance` of the one at (sx, sy): those connected to it (not crossing the selection's
 // edge), or all of them
 function floodFill(op: Operation, sx: number, sy: number, tolerance: number, contiguous: boolean) {
-	const {data, width, height} = op.image;
+	const {data: data, width, height} = op.image;
 	if (sx < 0 || sy < 0 || sx >= width || sy >= height)
 		return;
 
@@ -1510,7 +1771,7 @@ function fillArea(op: Operation) {
 }
 
 function invertArea(op: Operation) {
-	const {data, width} = op.image;
+	const {data: data, width} = op.image;
 	const bb = op.bounds();
 	op.blend = 'replace';
 	for (let y = bb.min.y; y < bb.max.y; y++) {
@@ -1519,18 +1780,4 @@ function invertArea(op: Operation) {
 			op.put(x, y, 1, RGBA(255 - data[o], 255 - data[o + 1], 255 - data[o + 2], data[o + 3]));
 		}
 	}
-}
-
-// A selection, with what it selects carried by a matrix (from the image's coordinates): where the coverage lands, within the image;
-// nothing if none of it does
-function warpSelection(s: Selection, m: float3x3, within: float2.extent) {
-	const area = m.transformExtent(s.bounds())?.roundOut().intersect(within);
-	if (!area || area.empty())
-		return undefined;
-	const coverage = new Uint8ClampedArray(s.width * s.height).fill(255);
-	if (s.mask)
-		coverage.set(s.mask);
-	const local = m.matmul(float3x3.translate(float2(s.l, s.t)));
-	const warped = warpCPU({data: coverage, width: s.width, height: s.height}, local, area, 1);
-	return new Selection(area.min.x, area.min.y, area.max.x, area.max.y, Uint8Array.from(warped.data)).trimmed();
 }

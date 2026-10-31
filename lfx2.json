@@ -1,0 +1,1356 @@
+
+{
+    "key": "lfx2",
+    "effectsVersion": 0,
+    "version": 16,
+    "descriptor": {
+        "name": "",
+        "classId": "null",
+        "items": {
+            "Scl": {
+                "type": "UntF",
+                "unit": "#Prc",
+                "value": 416.6666666666667
+            },
+            "masterFXSwitch": {
+                "type": "bool",
+                "value": true
+            },
+            "dropShadowMulti": {
+                "type": "VlLs",
+                "value": [
+                    {
+                        "type": "Objc",
+                        "value": {
+                            "name": "",
+                            "classId": "DrSh",
+                            "items": {
+                                "enab": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "present": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "showInDialog": {
+                                    "type": "bool",
+                                    "value": true
+                                },
+                                "Md": {
+                                    "type": "enum",
+                                    "typeId": "BlnM",
+                                    "value": "Mltp"
+                                },
+                                "Clr": {
+                                    "type": "Objc",
+                                    "value": {
+                                        "name": "",
+                                        "classId": "RGBC",
+                                        "items": {
+                                            "Rd": {
+                                                "type": "doub",
+                                                "value": 0
+                                            },
+                                            "Grn": {
+                                                "type": "doub",
+                                                "value": 0
+                                            },
+                                            "Bl": {
+                                                "type": "doub",
+                                                "value": 0
+                                            }
+                                        }
+                                    }
+                                },
+                                "Opct": {
+                                    "type": "UntF",
+                                    "unit": "#Prc",
+                                    "value": 35
+                                },
+                                "uglg": {
+                                    "type": "bool",
+                                    "value": true
+                                },
+                                "lagl": {
+                                    "type": "UntF",
+                                    "unit": "#Ang",
+                                    "value": 90
+                                },
+                                "Dstn": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 13
+                                },
+                                "Ckmt": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 0
+                                },
+                                "blur": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 29
+                                },
+                                "Nose": {
+                                    "type": "UntF",
+                                    "unit": "#Prc",
+                                    "value": 0
+                                },
+                                "AntA": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "TrnS": {
+                                    "type": "Objc",
+                                    "value": {
+                                        "name": "",
+                                        "classId": "ShpC",
+                                        "items": {
+                                            "Nm": {
+                                                "type": "TEXT",
+                                                "value": "Linear"
+                                            },
+                                            "Crv": {
+                                                "type": "VlLs",
+                                                "value": [
+                                                    {
+                                                        "type": "Objc",
+                                                        "value": {
+                                                            "name": "",
+                                                            "classId": "CrPt",
+                                                            "items": {
+                                                                "Hrzn": {
+                                                                    "type": "doub",
+                                                                    "value": 0
+                                                                },
+                                                                "Vrtc": {
+                                                                    "type": "doub",
+                                                                    "value": 0
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    {
+                                                        "type": "Objc",
+                                                        "value": {
+                                                            "name": "",
+                                                            "classId": "CrPt",
+                                                            "items": {
+                                                                "Hrzn": {
+                                                                    "type": "doub",
+                                                                    "value": 255
+                                                                },
+                                                                "Vrtc": {
+                                                                    "type": "doub",
+                                                                    "value": 255
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                },
+                                "layerConceals": {
+                                    "type": "bool",
+                                    "value": true
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "innerShadowMulti": {
+                "type": "VlLs",
+                "value": [
+                    {
+                        "type": "Objc",
+                        "value": {
+                            "name": "",
+                            "classId": "IrSh",
+                            "items": {
+                                "enab": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "present": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "showInDialog": {
+                                    "type": "bool",
+                                    "value": true
+                                },
+                                "Md": {
+                                    "type": "enum",
+                                    "typeId": "BlnM",
+                                    "value": "Mltp"
+                                },
+                                "Clr": {
+                                    "type": "Objc",
+                                    "value": {
+                                        "name": "",
+                                        "classId": "RGBC",
+                                        "items": {
+                                            "Rd": {
+                                                "type": "doub",
+                                                "value": 0
+                                            },
+                                            "Grn": {
+                                                "type": "doub",
+                                                "value": 0
+                                            },
+                                            "Bl": {
+                                                "type": "doub",
+                                                "value": 0
+                                            }
+                                        }
+                                    }
+                                },
+                                "Opct": {
+                                    "type": "UntF",
+                                    "unit": "#Prc",
+                                    "value": 35
+                                },
+                                "uglg": {
+                                    "type": "bool",
+                                    "value": true
+                                },
+                                "lagl": {
+                                    "type": "UntF",
+                                    "unit": "#Ang",
+                                    "value": 90
+                                },
+                                "Dstn": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 13
+                                },
+                                "Ckmt": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 0
+                                },
+                                "blur": {
+                                    "type": "UntF",
+                                    "unit": "#Pxl",
+                                    "value": 29
+                                },
+                                "Nose": {
+                                    "type": "UntF",
+                                    "unit": "#Prc",
+                                    "value": 0
+                                },
+                                "AntA": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "TrnS": {
+                                    "type": "Objc",
+                                    "value": {
+                                        "name": "",
+                                        "classId": "ShpC",
+                                        "items": {
+                                            "Nm": {
+                                                "type": "TEXT",
+                                                "value": "Linear"
+                                            },
+                                            "Crv": {
+                                                "type": "VlLs",
+                                                "value": [
+                                                    {
+                                                        "type": "Objc",
+                                                        "value": {
+                                                            "name": "",
+                                                            "classId": "CrPt",
+                                                            "items": {
+                                                                "Hrzn": {
+                                                                    "type": "doub",
+                                                                    "value": 0
+                                                                },
+                                                                "Vrtc": {
+                                                                    "type": "doub",
+                                                                    "value": 0
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    {
+                                                        "type": "Objc",
+                                                        "value": {
+                                                            "name": "",
+                                                            "classId": "CrPt",
+                                                            "items": {
+                                                                "Hrzn": {
+                                                                    "type": "doub",
+                                                                    "value": 255
+                                                                },
+                                                                "Vrtc": {
+                                                                    "type": "doub",
+                                                                    "value": 255
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "OrGl": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "OrGl",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Scrn"
+                        },
+                        "Clr": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 255
+                                    }
+                                }
+                            }
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        },
+                        "GlwT": {
+                            "type": "enum",
+                            "typeId": "BETE",
+                            "value": "SfBL"
+                        },
+                        "Ckmt": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 0
+                        },
+                        "blur": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 17
+                        },
+                        "Nose": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 0
+                        },
+                        "ShdN": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 0
+                        },
+                        "AntA": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "TrnS": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "ShpC",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Linear"
+                                    },
+                                    "Crv": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "Inpr": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        }
+                    }
+                }
+            },
+            "solidFillMulti": {
+                "type": "VlLs",
+                "value": [
+                    {
+                        "type": "Objc",
+                        "value": {
+                            "name": "",
+                            "classId": "SoFi",
+                            "items": {
+                                "enab": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "present": {
+                                    "type": "bool",
+                                    "value": false
+                                },
+                                "showInDialog": {
+                                    "type": "bool",
+                                    "value": true
+                                },
+                                "Md": {
+                                    "type": "enum",
+                                    "typeId": "BlnM",
+                                    "value": "Nrml"
+                                },
+                                "Clr": {
+                                    "type": "Objc",
+                                    "value": {
+                                        "name": "",
+                                        "classId": "RGBC",
+                                        "items": {
+                                            "Rd": {
+                                                "type": "doub",
+                                                "value": 129.00192260742188
+                                            },
+                                            "Grn": {
+                                                "type": "doub",
+                                                "value": 129.00192260742188
+                                            },
+                                            "Bl": {
+                                                "type": "doub",
+                                                "value": 129.00192260742188
+                                            }
+                                        }
+                                    }
+                                },
+                                "Opct": {
+                                    "type": "UntF",
+                                    "unit": "#Prc",
+                                    "value": 100
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "GrFl": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "GrFl",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Nrml"
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "Grad": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "Gradient",
+                                "classId": "Grdn",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Orange_08"
+                                    },
+                                    "GrdF": {
+                                        "type": "enum",
+                                        "typeId": "GrdF",
+                                        "value": "CstS"
+                                    },
+                                    "Intr": {
+                                        "type": "doub",
+                                        "value": 4096
+                                    },
+                                    "Clrs": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "Clrt",
+                                                    "items": {
+                                                        "Clr": {
+                                                            "type": "Objc",
+                                                            "value": {
+                                                                "name": "",
+                                                                "classId": "RGBC",
+                                                                "items": {
+                                                                    "Rd": {
+                                                                        "type": "doub",
+                                                                        "value": 255
+                                                                    },
+                                                                    "Grn": {
+                                                                        "type": "doub",
+                                                                        "value": 122.00000032782555
+                                                                    },
+                                                                    "Bl": {
+                                                                        "type": "doub",
+                                                                        "value": 149.00000631809235
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        "Type": {
+                                                            "type": "enum",
+                                                            "typeId": "Clry",
+                                                            "value": "UsrS"
+                                                        },
+                                                        "Lctn": {
+                                                            "type": "long",
+                                                            "value": 0
+                                                        },
+                                                        "Mdpn": {
+                                                            "type": "long",
+                                                            "value": 50
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "Clrt",
+                                                    "items": {
+                                                        "Clr": {
+                                                            "type": "Objc",
+                                                            "value": {
+                                                                "name": "",
+                                                                "classId": "RGBC",
+                                                                "items": {
+                                                                    "Rd": {
+                                                                        "type": "doub",
+                                                                        "value": 255
+                                                                    },
+                                                                    "Grn": {
+                                                                        "type": "doub",
+                                                                        "value": 181.99611335992813
+                                                                    },
+                                                                    "Bl": {
+                                                                        "type": "doub",
+                                                                        "value": 149.99611526727676
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        "Type": {
+                                                            "type": "enum",
+                                                            "typeId": "Clry",
+                                                            "value": "UsrS"
+                                                        },
+                                                        "Lctn": {
+                                                            "type": "long",
+                                                            "value": 4096
+                                                        },
+                                                        "Mdpn": {
+                                                            "type": "long",
+                                                            "value": 50
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    "Trns": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "TrnS",
+                                                    "items": {
+                                                        "Opct": {
+                                                            "type": "UntF",
+                                                            "unit": "#Prc",
+                                                            "value": 99.6078431372549
+                                                        },
+                                                        "Lctn": {
+                                                            "type": "long",
+                                                            "value": 0
+                                                        },
+                                                        "Mdpn": {
+                                                            "type": "long",
+                                                            "value": 50
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "TrnS",
+                                                    "items": {
+                                                        "Opct": {
+                                                            "type": "UntF",
+                                                            "unit": "#Prc",
+                                                            "value": 100
+                                                        },
+                                                        "Lctn": {
+                                                            "type": "long",
+                                                            "value": 4096
+                                                        },
+                                                        "Mdpn": {
+                                                            "type": "long",
+                                                            "value": 50
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "Angl": {
+                            "type": "UntF",
+                            "unit": "#Ang",
+                            "value": -142
+                        },
+                        "Type": {
+                            "type": "enum",
+                            "typeId": "GrdT",
+                            "value": "Rdl "
+                        },
+                        "Rvrs": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "Dthr": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "Algn": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Scl": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "Ofst": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "Pnt ",
+                                "items": {
+                                    "Hrzn": {
+                                        "type": "UntF",
+                                        "unit": "#Prc",
+                                        "value": 13.022494544233671
+                                    },
+                                    "Vrtc": {
+                                        "type": "UntF",
+                                        "unit": "#Prc",
+                                        "value": -32.72237668500332
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "patternFill": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "patternFill",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Nrml"
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "Ptrn": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "Ptrn",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Tree Tile 4"
+                                    },
+                                    "Idnt": {
+                                        "type": "TEXT",
+                                        "value": "92150a0d-bc3e-9349-adc8-869fb042a4b0"
+                                    }
+                                }
+                            }
+                        },
+                        "Scl": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "Algn": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "phase": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "Pnt ",
+                                "items": {
+                                    "Hrzn": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Vrtc": {
+                                        "type": "doub",
+                                        "value": 0
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "FrFX": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "FrFX",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Styl": {
+                            "type": "enum",
+                            "typeId": "FStl",
+                            "value": "OutF"
+                        },
+                        "PntT": {
+                            "type": "enum",
+                            "typeId": "FrFl",
+                            "value": "SClr"
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Nrml"
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "Sz": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 57
+                        },
+                        "Clr": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 220.00000208616257
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 92.31517240405083
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 194.47081357240677
+                                    }
+                                }
+                            }
+                        },
+                        "overprint": {
+                            "type": "bool",
+                            "value": false
+                        }
+                    }
+                }
+            },
+            "IrGl": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "IrGl",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Scrn"
+                        },
+                        "Clr": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 255
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 255
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 255
+                                    }
+                                }
+                            }
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 35
+                        },
+                        "GlwT": {
+                            "type": "enum",
+                            "typeId": "BETE",
+                            "value": "SfBL"
+                        },
+                        "Ckmt": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 0
+                        },
+                        "blur": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 0
+                        },
+                        "Nose": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 0
+                        },
+                        "ShdN": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 0
+                        },
+                        "AntA": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "TrnS": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "ShpC",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Linear"
+                                    },
+                                    "Crv": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "Inpr": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        },
+                        "glwS": {
+                            "type": "enum",
+                            "typeId": "IGSr",
+                            "value": "SrcE"
+                        }
+                    }
+                }
+            },
+            "ebbl": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "ebbl",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "hglM": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Scrn"
+                        },
+                        "hglC": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 255
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 255
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 255
+                                    }
+                                }
+                            }
+                        },
+                        "hglO": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        },
+                        "sdwM": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Mltp"
+                        },
+                        "sdwC": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 0
+                                    }
+                                }
+                            }
+                        },
+                        "sdwO": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        },
+                        "bvlT": {
+                            "type": "enum",
+                            "typeId": "bvlT",
+                            "value": "PrBL"
+                        },
+                        "bvlS": {
+                            "type": "enum",
+                            "typeId": "BESl",
+                            "value": "InrB"
+                        },
+                        "uglg": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "lagl": {
+                            "type": "UntF",
+                            "unit": "#Ang",
+                            "value": 90
+                        },
+                        "Lald": {
+                            "type": "UntF",
+                            "unit": "#Ang",
+                            "value": 30
+                        },
+                        "srgR": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 100
+                        },
+                        "blur": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 8
+                        },
+                        "bvlD": {
+                            "type": "enum",
+                            "typeId": "BESs",
+                            "value": "In  "
+                        },
+                        "TrnS": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "ShpC",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Linear"
+                                    },
+                                    "Crv": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "antialiasGloss": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "Sftn": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 0
+                        },
+                        "useShape": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "useTexture": {
+                            "type": "bool",
+                            "value": false
+                        }
+                    }
+                }
+            },
+            "ChFX": {
+                "type": "Objc",
+                "value": {
+                    "name": "",
+                    "classId": "ChFX",
+                    "items": {
+                        "enab": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "present": {
+                            "type": "bool",
+                            "value": false
+                        },
+                        "showInDialog": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Md": {
+                            "type": "enum",
+                            "typeId": "BlnM",
+                            "value": "Mltp"
+                        },
+                        "Clr": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "RGBC",
+                                "items": {
+                                    "Rd": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Grn": {
+                                        "type": "doub",
+                                        "value": 0
+                                    },
+                                    "Bl": {
+                                        "type": "doub",
+                                        "value": 0
+                                    }
+                                }
+                            }
+                        },
+                        "AntA": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Invr": {
+                            "type": "bool",
+                            "value": true
+                        },
+                        "Opct": {
+                            "type": "UntF",
+                            "unit": "#Prc",
+                            "value": 50
+                        },
+                        "lagl": {
+                            "type": "UntF",
+                            "unit": "#Ang",
+                            "value": 90
+                        },
+                        "Dstn": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 208
+                        },
+                        "blur": {
+                            "type": "UntF",
+                            "unit": "#Pxl",
+                            "value": 217
+                        },
+                        "MpgS": {
+                            "type": "Objc",
+                            "value": {
+                                "name": "",
+                                "classId": "ShpC",
+                                "items": {
+                                    "Nm": {
+                                        "type": "TEXT",
+                                        "value": "Linear"
+                                    },
+                                    "Crv": {
+                                        "type": "VlLs",
+                                        "value": [
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 0
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "type": "Objc",
+                                                "value": {
+                                                    "name": "",
+                                                    "classId": "CrPt",
+                                                    "items": {
+                                                        "Hrzn": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        },
+                                                        "Vrtc": {
+                                                            "type": "doub",
+                                                            "value": 255
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "numModifyingFX": {
+                "type": "long",
+                "value": 2
+            }
+        }
+    },
+    "padding": {
+        "0": 0
+    }
+}

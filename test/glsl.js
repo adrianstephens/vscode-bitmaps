@@ -143,6 +143,13 @@ function parse(src) {
 			return {k: 'decl', type, decls};
 		}
 		const target = eatId();
+		// x++ or x--, which the tokenizer splits into two operators
+		if ((at('+') || at('-')) && peek(1) && peek(1).v === peek().v) {
+			const delta = t[i++].v === '+' ? 1 : -1;
+			i++;
+			eat(';');
+			return {k: 'inc', name: target, delta};
+		}
 		// a compound assignment, which the tokenizer splits into two operators
 		const compound = (at('+') || at('-') || at('*') || at('/')) && peek(1) && peek(1).v === '=' ? t[i++].v : null;
 		eat('=');
@@ -185,11 +192,17 @@ function parse(src) {
 	}
 
 	const functions = new Map();
+	functions.globals = [];			// the variables declared outside any function, set before anything is called
 	while (i < t.length) {
 		const type = peek() && peek().k === 'id' && TYPES.has(peek().v) ? t[i++].v : null;
 		if (!type)
 			throw new Error(`expected a function, got ${peek() ? peek().v : 'end'}`);
 		const name = eatId();
+		if (at('=') || at(';')) {
+			functions.globals.push({name, v: at('=') ? (eat('='), expr()) : null});
+			eat(';');
+			continue;
+		}
 		eat('(');
 		const params = [];
 		if (!at(')'))
@@ -459,6 +472,8 @@ function makeMap(code, entry = 'map', extra = {}) {
 		}
 		return undefined;
 	};
+	for (const g of functions.globals)
+		globals.declare(g.name, g.v ? evalExpr(g.v, globals) : 0);
 	return (p) => call(entry, [p]);
 }
 
@@ -466,7 +481,7 @@ module.exports = {makeMap};
 
 // Running it as a script checks one thing: that it can read its own generator's output.
 if (require.main === module) {
-	const { evaluate } = require('../out/src/scad/evaluate.js');
+	const { evaluate } = require('./scadhost.js');
 	const { emitGlsl } = require('../out/src/scad/sdf.js');
 	const { sdf } = evaluate('rotate([30,0,0]) cube([1,2,3]);', 'glsl.js');
 	const g = emitGlsl(sdf);

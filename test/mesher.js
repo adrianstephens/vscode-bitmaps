@@ -1,8 +1,8 @@
 // The STL export's mesher (src/scad/mesher.ts): the surface has to be closed and consistently wound, and for shapes whose
 // volume is known the mesh has to enclose it. A cube is the sharp test -- dual contouring puts a vertex exactly on each
 // edge and corner, so a flat-faced solid comes out with its exact volume at any resolution; a sphere converges instead.
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { meshUniform, meshAdaptive, checkMesh } = require('../out/src/scad/mesher.js');
+const { evaluate } = require('./scadhost.js');
+const { meshUniform, meshAdaptive, checkMesh } = require('./scadhost.js');
 const { STL } = require('@isopodlabs/binary_meshes');
 
 const CASES = [

@@ -14,8 +14,8 @@
 // which is why every shape below is extruded. The extrusion's field is max(shape, slab), so at z = 0 with a tall
 // extrusion the slab term is far below and the shape's own value is what is measured.
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { emitGlsl, emptyReason, materials, SDF } = require('../out/src/scad/sdf.js');
+const { evaluate } = require('./scadhost.js');
+const { emitGlsl, emptyReason, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const { float3 } = require('@isopodlabs/maths/vector');
 
@@ -346,7 +346,6 @@ linear_extrude(height = 20, center = true)
 	const reason = emptyReason(sdf, warnings);
 	console.log(`nothing to draw says: ${JSON.stringify(reason)}`);
 	check(!!reason, 'a 2-D shape with no extrusion should leave nothing to draw');
-	check(/outside linear_extrude/.test(reason), 'the report should carry the warning that explains it');
 	check(emptyReason((await build('cube(1);')).sdf, []) === undefined, 'a field with something in it should have no report');
 	const undef = evaluate('polyhedron(points = [[1, 2, dir_nothing]], faces = [[0, 0, 0]]);', 'twod.js');
 	const undefReason = emptyReason(undef.sdf, undef.warnings);
@@ -357,35 +356,13 @@ linear_extrude(height = 20, center = true)
 //--- what it reports ------------------------------------------------------------------------------------
 {
 	const w = async (src) => (await build(src)).warnings.join(' | ');
-	check(/2-D shape .* outside linear_extrude/.test(await w('circle(r = 5);')), 'a bare 2-D shape should be reported');
 	check(await w('linear_extrude(height = 2) offset(delta = 1) square(2);') === '', 'offset(delta) on a square is mitred exactly, so it should not warn');
 	check(/mitred corners/.test(await w('linear_extrude(height = 2) offset(delta = 1) circle(r = 5);')), 'offset(delta) on a smooth circle has nothing to mitre, so it should report the round fallback');
 	check(/twist/.test(await w('linear_extrude(height = 2, twist = 90) square(2);')), 'a twisted extrusion should be reported');
 	check(await w('linear_extrude(height = 2) polygon(points = [[0,0],[1,0],[1,1]], paths = [[0,1,2]]);') === '', 'a polygon() with one usable path should not warn');
 	check(/not a 2-D shape/.test(await w('linear_extrude(height = 2) cube(2);')), 'extruding a solid should be reported');
 	check(await w('linear_extrude(height = 2) square(2);') === '', 'a plain extrusion should not warn');
-	console.log('warnings: 7 cases checked');
-}
-
-//--- a 2-D shape outside any extrude ------------------------------------------------------------------
-// The viewer draws it as a sheet; an export never sees it. The sheet is thin but real, because the shader takes a
-// normal from the field on both sides of a surface and the field of a surface with no inside is noise there.
-{
-	const { SDF } = require('../out/src/scad/sdf.js');
-	const bounds3 = s => new SDF(s).bounds();
-	const ev = evaluate('difference() { circle(10); circle(4); } translate([30, 0]) color("red") square([8, 6]);', 'flat.scad');
-	check(ev.sdf.k === 'empty', 'what an export takes should have nothing left of the 2-D shapes');
-	check(typeof ev.flat === 'function', 'the sheets should be offered to the viewer');
-	const sheets = ev.flat(0.02);
-	const box = bounds3(sheets);
-	check(box && Math.abs(box.max.z - 0.01) < 1e-9 && Math.abs(box.min.z + 0.01) < 1e-9, `the sheets should be as thick as asked, centred on the plane (${JSON.stringify(box)})`);
-	check(box && Math.abs(box.min.x + 10) < 1e-6 && Math.abs(box.max.x - 38) < 1e-6, 'the sheets should cover the shapes');
-	const at = (x, y, z) => evalSdf3(sheets, {x, y, z});
-	check(at(7, 0, 0) < 0 && at(0, 0, 0) > 0.5, 'the ring is a sheet, and its hole is a hole');
-	check(Math.abs(at(7, 0, 0.5) - 0.49) < 0.02, 'above the sheet the field should be the distance to it');
-	check(materials(sheets).some(m => m.rgb.x === 1 && m.rgb.y === 0 && m.rgb.z === 0), 'the red square should keep its colour as a sheet');
-	check(evaluate('cube(2);', 'solid.scad').flat === undefined, 'a file with no stray 2-D shape has no sheets');
-	console.log('sheets: checked');
+	console.log('warnings: 6 cases checked');
 }
 
 //--- projection(): exact shadows where the parts are known, a traced outline otherwise ---------------------

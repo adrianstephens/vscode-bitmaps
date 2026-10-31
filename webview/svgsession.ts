@@ -6,10 +6,12 @@ import { createElement, createSVGElement, SVG_NS } from '@isopodlabs/vscode_util
 import { PathEditor, ViewOptions, svgPath, type DragHandler, type ElementTransform, type ShapeKind, type ToolChoice } from './pathedit.js';
 import { float2, float2x3 } from '@isopodlabs/maths/vector';
 import type { curveVertex } from '@isopodlabs/binary_fonts';
-import { choiceItem, toggleItem, valueItem, svgFace, swatchFace, type CascadeItem } from './cascade.js';
+import { choiceItem, valueItem, svgFace, swatchFace, colourItems, type CascadeItem } from './cascade.js';
 import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
-
-const STOP_HIT = 10;		// pixels from a stop (or the gradient's axis) that a press takes it
+import { type RGB, toHex, fromHex, mixColour, clamp01 } from './colour.js';
+import { Steps } from './history.js';
+import { GradientEditor, cssOf, type Stop, type Spread, type Paint, type PaintMode, type PaintOptions } from './gradientedit.js';
+export { cssOf, type Stop, type Spread, type Paint, type PaintMode, type PaintOptions } from './gradientedit.js';
 
 export interface SessionUi {
 	view:		HTMLElement;		// where the drawing is shown
@@ -24,7 +26,9 @@ export interface SessionUi {
 }
 
 export interface SessionBackend {
-	save(text: string, label: string): void;
+	// the drawing's text after an edit; `continues` if it is a later step of the one before (a value still being turned), which
+	// changes that edit rather than being another (if it is still the last: else it is dropped, as the drawing is loaded again)
+	save(text: string, label: string, continues?: boolean): void;
 	// a path or basic shape as the points the editor takes
 	shapePoints(name: string, attributes: Record<string, string>): Promise<curveVertex[]>;
 	// the points with fewer of them, the outline kept within tol
@@ -56,9 +60,6 @@ const elementIcons = {
 	forward:	'<rect x="2" y="2" width="8" height="8"/><rect x="6" y="6" width="8" height="8" fill="currentColor" fill-opacity="0.4"/><path d="M12 1V4"/>',
 	backward:	'<rect x="6" y="6" width="8" height="8"/><rect x="2" y="2" width="8" height="8" fill="currentColor" fill-opacity="0.4"/><path d="M4 12V15"/>',
 	back:		'<rect x="6" y="6" width="8" height="8"/><rect x="2" y="2" width="8" height="8" fill="currentColor"/>',
-
-//	gradient:	'<circle cx="4" cy="12" r="1.8"/><circle cx="12" cy="4" r="1.8"/><path d="M5.3 10.7L10.7 5.3"/>'
-
 };
 
 export function createSession(ui: SessionUi, backend: SessionBackend): Session {
@@ -85,7 +86,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	let pointsD		= '';					// what they were drawn as when read
 	let selectToken	= 0;
 	// what the editor is doing in place of editing the points of the shape: a gradient's stops are edited on the drawing
-	let mode:		GradientMode | undefined;
+	let mode:		SvgGradient | undefined;
 
 	// the drawing as shown: one group, with a copy of each element that is drawn
 	const display	= createSVGElement('g', {class: SCOPE});
@@ -112,9 +113,43 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		return (prolog ? prolog + '\n' : '') + body + epilog;
 	}
 
-	function save(label: string) {
-		if (!readOnly)
-			backend.save(serialise(), label);
+	// An edit, saved: the drawing's text goes to the host, whose history it is. A value changed a step at a time (`key` says what it is
+	// of, with the label) is one edit: its first step is saved at once, and the steps after it as changes to that edit, the drawing as
+	// it is after each (so that what is done after them is not in it) sent every little while as they come, and at the `last` one.
+	const steps = new Steps;
+	let continuing: {label: string, text: string, timer: number} | undefined;
+	const SEND = 150;
+
+	function save(label: string, key?: unknown, last = false) {
+		if (readOnly)
+			return;
+		if (key !== undefined && steps.step(key, label)) {
+			const text = serialise();
+			if (continuing)
+				continuing.text = text;
+			else
+				continuing = {label, text, timer: window.setTimeout(sendContinuing, SEND)};
+			if (last)
+				endSteps();
+			return;
+		}
+		endSteps();
+		backend.save(serialise(), label);
+		if (key !== undefined && !last)
+			steps.step(key, label);
+	}
+	function sendContinuing() {
+		const c = continuing;
+		continuing = undefined;
+		if (c) {
+			clearTimeout(c.timer);
+			backend.save(c.text, c.label, true);
+		}
+	}
+	// the steps there have been are sent, and another is another edit
+	function endSteps() {
+		sendContinuing();
+		steps.end();
 	}
 
 	const showError = (message: string) => backend.error(message);
@@ -370,7 +405,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		if (!a || !b)
 			return float2x3.identity();
 		const v = editor.view;
-		return fromDOM(new DOMMatrix().translate(v.x, v.y).scale(v.s).inverse().multiply(a.inverse().multiply(b)));
+		return fromDOM(new DOMMatrix().translate(v.t.x, v.t.y).scale(v.s).inverse().multiply(a.inverse().multiply(b)));
 	}
 
 	// the transform an element has, as a matrix
@@ -403,25 +438,25 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	}
 
 	// the displacement of a world distance in the space an element's transform is in, which is its parent's
-	function inParent(e: Element, dx: number, dy: number) {
-		return worldMatrix(dispOf.get(e)?.parentNode as SVGElement | undefined).inverse().mulDir(float2(dx, dy));
+	function inParent(e: Element, d: float2) {
+		return worldMatrix(dispOf.get(e)?.parentNode as SVGElement | undefined).inverse().mulDir(d);
 	}
 
-	// `by` is what is applied to the element in its parent's space, which is a move of (dx, dy) in the world if none is given
+	// `by` is what is applied to the element in its parent's space, which is a move of `d` in the world if none is given
 	// puts the selected element's transform, as it is now, into the properties that show it
 	let refreshTransform: (() => void) | undefined;
 	let refreshStrokeWidth: (() => void) | undefined;
 
-	function moveElement(e: Element, dx: number, dy: number, label?: string, base?: float2x3, by?: float2x3) {
-		const d = dispOf.get(e);
-		if (readOnly || !d || e === src!.documentElement)
+	function moveElement(e: Element, d: float2, label?: string, base?: float2x3, by?: float2x3) {
+		const disp = dispOf.get(e);
+		if (readOnly || !disp || e === src!.documentElement)
 			return;
-		const text = transformText((by ?? float2.translate(inParent(e, dx, dy))).mulAffine(base ?? transformOf(d)));
+		const text = transformText((by ?? float2.translate(inParent(e, d))).mulAffine(base ?? transformOf(disp)));
 		if (label)
 			(text === undefined ? e.removeAttribute('transform') : e.setAttribute('transform', text));
 		syncAttributes(e);
 		if (!label)
-			d.setAttribute('transform', text ?? '');
+			disp.setAttribute('transform', text ?? '');
 		else {
 			save(label);
 			showProps();		// its transform is one of them
@@ -455,8 +490,8 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			const offset = getProp(s, 'offset') ?? '0';
 			const c = parseColour(getProp(s, 'stop-color') ?? '#000000');
 			return {
-				offset: Math.max(0, Math.min(1, offset.endsWith('%') ? parseFloat(offset) / 100 : parseFloat(offset) || 0)),
-				color: c?.color ?? '#000000',
+				offset: clamp01(offset.endsWith('%') ? parseFloat(offset) / 100 : parseFloat(offset) || 0),
+				color: c?.color ?? {r: 0, g: 0, b: 0},
 				opacity: (c?.opacity ?? 1) * (parseFloat(getProp(s, 'stop-opacity') ?? '1')),
 			};
 		});
@@ -514,30 +549,13 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	}
 
 	function stopElement(s: Stop) {
-		return createSVGElement('stop', {offset: num(s.offset), 'stop-color': s.color, 'stop-opacity': s.opacity !== 1 ? num(s.opacity) : undefined}, undefined, src!);
-	}
-
-	// the colour a gradient has at an offset
-	function colourAt(stops: Stop[], t: number): Stop {
-		const sorted = [...stops].sort((a, b) => a.offset - b.offset), i = sorted.findIndex(s => s.offset >= t);
-		if (i <= 0)
-			return {...sorted[i < 0 ? sorted.length - 1 : 0], offset: t};
-		const a = sorted[i - 1], b = sorted[i], u = (t - a.offset) / ((b.offset - a.offset) || 1);
-		const mix = [1, 3, 5].map(k => Math.round(parseInt(a.color.slice(k, k + 2), 16) * (1 - u) + parseInt(b.color.slice(k, k + 2), 16) * u).toString(16).padStart(2, '0')).join('');
-		return {offset: t, color: '#' + mix, opacity: a.opacity + (b.opacity - a.opacity) * u};
-	}
-
-	// the stops with another at an offset, which keeps them in order, and where it is
-	function withStop(stops: Stop[], t: number) {
-		t = Math.round(Math.min(1, Math.max(0, t)) * 1000) / 1000;
-		const at = stops.findIndex(s => s.offset > t), index = at < 0 ? stops.length : at;
-		return {stops: [...stops.slice(0, index), colourAt(stops, t), ...stops.slice(index)], index};
+		return createSVGElement('stop', {offset: num(s.offset), 'stop-color': toHex(s.color), 'stop-opacity': s.opacity !== 1 ? num(s.opacity) : undefined}, undefined, src!);
 	}
 
 	// the paint a gradient is, for the controls
 	function gradientPaint(g: Element): Paint {
 		const spread = g.getAttribute('spreadMethod');
-		return {kind: 'gradient', type: g.localName === 'radialGradient' ? 'radial' : 'linear', stops: readStops(g), spread: spread === 'reflect' || spread === 'repeat' ? spread : 'pad'};
+		return {type: g.localName === 'radialGradient' ? 'radial' : 'linear', stops: readStops(g), spread: spread === 'reflect' || spread === 'repeat' ? spread : 'pad'};
 	}
 
 	// an attribute of a gradient, or of the ones it refers to when it has none
@@ -559,31 +577,31 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		};
 		const [w, h, diagonal] = [vb.w, vb.h, Math.hypot(vb.w, vb.h) / Math.SQRT2];
 		const points = g.localName === 'linearGradient'
-			? [at('x1', 0, w), at('y1', 0, h), 1, at('x2', objectUnits ? 1 : w, w), at('y2', 0, h), 1]
+			? [float2(at('x1', 0, w), at('y1', 0, h)), float2(at('x2', objectUnits ? 1 : w, w), at('y2', 0, h))]
 			: (() => {
 				const cx = at('cx', objectUnits ? 0.5 : w / 2, w), cy = at('cy', objectUnits ? 0.5 : h / 2, h), r = at('r', objectUnits ? 0.5 : diagonal / 2, diagonal);
-				return [cx, cy, 1, cx + r, cy, 1, at('fx', cx, w), at('fy', cy, h), 1];
+				return [float2(cx, cy), float2(cx + r, cy), float2(at('fx', cx, w), at('fy', cy, h))];
 			})();
 		const transform = createSVGElement('g', {transform: inherited(g, 'gradientTransform') ?? ''});
 		return {points, matrix: (objectUnits ? float2x3(float2(box.width, 0), float2(0, box.height), float2(box.x, box.y)) : float2x3.identity()).mulAffine(transformOf(transform))};
 	}
 
 	// a gradient's geometry written from handles
-	function setHandles(g: Element, p: number[]) {
+	function setHandles(g: Element, p: float2[]) {
 		const set = (name: string, v: number | undefined) => v === undefined ? g.removeAttribute(name) : g.setAttribute(name, String(+v.toFixed(5)));
 		if (g.localName === 'linearGradient') {
-			set('x1', p[0]);
-			set('y1', p[1]);
-			set('x2', p[3]);
-			set('y2', p[4]);
+			set('x1', p[0].x);
+			set('y1', p[0].y);
+			set('x2', p[1].x);
+			set('y2', p[1].y);
 			return;
 		}
-		const focused = Math.hypot(p[6] - p[0], p[7] - p[1]) > 1e-9;
-		set('cx', p[0]);
-		set('cy', p[1]);
-		set('r', Math.hypot(p[3] - p[0], p[4] - p[1]));
-		set('fx', focused ? p[6] : undefined);
-		set('fy', focused ? p[7] : undefined);
+		const focused = p[2].sub(p[0]).len() > 1e-9;
+		set('cx', p[0].x);
+		set('cy', p[0].y);
+		set('r', p[1].sub(p[0]).len());
+		set('fx', focused ? p[2].x : undefined);
+		set('fy', focused ? p[2].y : undefined);
 	}
 
 	function enterGradient(e: Element, prop: 'fill' | 'stroke', stop = 0) {
@@ -591,7 +609,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		if (!g)
 			return;
 		const {points: p, matrix} = gradientHandles(e, g);
-		mode = new GradientMode(prop, p, matrix, stop);
+		mode = new SvgGradient(prop, p, matrix, stop);
 		updateMatrix();
 		editor.reset();
 		editor.draw();
@@ -644,20 +662,21 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			get(): Paint {
 				const v = getProp(e, prop);
 				if (v === undefined)
-					return {kind: 'unset', effective: getComputedStyle(d)[prop]};
+					return {type: 'unset', effective: getComputedStyle(d)[prop]};
 				if (v === 'none')
-					return {kind: 'none'};
+					return {type: 'none'};
 				const g = gradientOf(v);
 				if (g)
 					return gradientPaint(g);
 				const c = parseColour(v);
-				return c ? {kind: 'color', color: c.color} : {kind: 'other', text: v};
+				return c ? {type: 'color', color: c.color} : {type: 'other', text: v};
 			},
 			set(paint, final) {
-				if (mode && paint.kind !== 'gradient')
+				const gradient = 'stops' in paint;
+				if (mode && !gradient)
 					exitGradient();
 				const old = gradientOf(getProp(e, prop));
-				if (paint.kind === 'gradient') {
+				if (gradient) {
 					let g = ownGradient(e, prop);
 					const type = paint.type + 'Gradient';
 					if (!g || g.localName !== type) {
@@ -676,17 +695,16 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 					syncAttributes(e);
 					rebuildElement(defsOf());
 				} else {
-					setProp(e, prop, paint.kind === 'unset' ? undefined : paint.kind === 'none' ? 'none' : paint.kind === 'color' ? paint.color : paint.text);
+					setProp(e, prop, paint.type === 'unset' ? undefined : paint.type === 'none' ? 'none' : paint.type === 'color' ? toHex(paint.color) : paint.text);
 					syncAttributes(e);
 					if (old) {
 						dropUnused(old);
 						rebuildElement(defsOf());
 					}
 				}
-				if (final) {
-					save(`Change ${prop}`);
+				save(`Change ${prop}`, e, final);
+				if (final)
 					showProps();
-				}
 			},
 			handles: {
 				get: () => mode?.prop === prop,
@@ -697,8 +715,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 				set(v, final) {
 					setProp(e, prop + '-opacity', v === 1 ? undefined : String(v));
 					syncAttributes(e);
-					if (final)
-						save(`Change ${prop} opacity`);
+					save(`Change ${prop} opacity`, e, final);
 				},
 			},
 		};
@@ -735,18 +752,13 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	}
 
 	// a property that is being adjusted a step at a time (a wheel, a drag): drawn and shown in its panel field as it changes, and
-	// recorded once, for one undo, when there has been no change for a moment
-	let adjusting: number | undefined;
-	function settle(done: () => void) {
-		clearTimeout(adjusting);
-		adjusting = window.setTimeout(() => { adjusting = undefined; done(); }, 500);
-	}
+	// the steps one edit
 	function adjustProp(e: Element, name: string, value: string | undefined, label: string) {
 		setProp(e, name, value || undefined);
 		syncAttributes(e);
 		editor.draw();
 		refreshStrokeWidth?.();
-		settle(() => save(label));
+		save(label, e);
 	}
 
 	function showProps() {
@@ -981,16 +993,16 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 
 	//--- drawing freehand ------------------------------------------------------------------------
 
-	let lineChain: {e: Element, start: number[], end: number[], segments: number} | undefined;		// the line being continued, and where it ends in world units
-	let stroke: [number, number][] | undefined;		// the one being drawn, in world units
+	let lineChain: {e: Element, start: float2, end: float2, segments: number} | undefined;		// the line being continued, and where it ends in world units
+	let stroke: float2[] | undefined;		// the one being drawn, in world units
 
 	// the stroke as a path in the selected group (or the drawing), following it to within two pixels
-	async function drawStroke(world: [number, number][]) {
+	async function drawStroke(world: float2[]) {
 		if (!src || readOnly || world.length < 2)
 			return;
 		const parent = newParent();
 		const to = worldMatrix(dispOf.get(parent)).inverse();
-		const local = world.map(([x, y]) => to.mulPos(float2(x, y)));
+		const local = world.map(w => to.mulPos(w));
 		const unit = Math.sqrt(Math.abs(to.det())) / editor.view.s;		// a pixel of the screen, in the parent's units
 		try {
 			const points = await backend.fitStroke!(local.flatMap(p => [p.x, p.y]), 2 * unit);
@@ -1014,20 +1026,20 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		return selected && selected !== root && selected.localName === 'g' ? selected : inside ?? (selected?.localName === 'svg' ? selected : root);
 	}
 
-	function addDragged(kind: ShapeKind, x0: number, y0: number, x1: number, y1: number) {
+	function addDragged(kind: ShapeKind, a: float2, b: float2) {
 		if (!src || readOnly)
 			return;
 		// a line that goes on adds a segment to the path it began, or closes it where it came back to its beginning
 		if (kind === 'line' && lineChain && src.contains(lineChain.e)) {
-			const c = lineChain, e = c.e, q = worldMatrix(dispOf.get(e.parentElement!)).inverse().mulPos(float2(x1, y1));
-			if (c.segments >= 2 && Math.hypot(x1 - c.start[0], y1 - c.start[1]) * editor.view.s < 6) {
+			const c = lineChain, e = c.e, q = worldMatrix(dispOf.get(e.parentElement!)).inverse().mulPos(b);
+			if (c.segments >= 2 && b.sub(c.start).len() * editor.view.s < 6) {
 				e.setAttribute('d', `${e.getAttribute('d')}Z`);
 				lineChain = undefined;
 				restructure('Close line', e);
 				return;
 			}
 			e.setAttribute('d', `${e.getAttribute('d')}L${num(q.x)} ${num(q.y)}`);
-			c.end = [x1, y1];
+			c.end = b;
 			c.segments++;
 			restructure('Extend line', e);
 			return;
@@ -1035,8 +1047,8 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		const parent = newParent();
 		const to = worldMatrix(dispOf.get(parent)).inverse();
 		const unit = Math.sqrt(Math.abs(to.det())) / editor.view.s;		// a pixel of the screen, in the parent's units
-		const p = to.mulPos(float2(x0, y0)), q = to.mulPos(float2(x1, y1));
-		if (Math.hypot(q.x - p.x, q.y - p.y) < 2 * unit)
+		const p = to.mulPos(a), q = to.mulPos(b);
+		if (q.sub(p).len() < 2 * unit)
 			return;
 		const e = createSVGElement(kind === 'line' ? 'path' : kind, undefined, undefined, src);
 		const set = (name: string, v: number) => e.setAttribute(name, String(num(v)));
@@ -1060,7 +1072,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		} else
 			e.setAttribute('fill', '#4c8bf5');
 		parent.append(e);
-		lineChain = kind === 'line' ? {e, start: [x0, y0], end: [x1, y1], segments: 1} : undefined;
+		lineChain = kind === 'line' ? {e, start: a, end: b, segments: 1} : undefined;
 		restructure(`Draw ${kind}`, e);
 	}
 
@@ -1113,41 +1125,18 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 
 	//--- menus for colours and gradient stops -------------------------------------------------------------------
 
-	const COLOURS = ['#000000', '#ffffff', '#808080', '#e53935', '#fb8c00', '#fdd835', '#43a047', '#1e88e5', '#8e24aa'];
-
-	// swatches, and a custom colour with a red, a green and a blue, for a colour that `put` takes (final when it is let go)
-	function colourItems(idp: string, get: () => string, put: (c: string, final: boolean) => void, known = () => true): CascadeItem[] {
-		const channels: CascadeItem[] = ['R', 'G', 'B'].map((label, i) => ({
-			...valueItem({
-				label,
-				caption:	['Red', 'Green', 'Blue'][i],
-				get:		() => parseInt(get().slice(1 + 2 * i, 3 + 2 * i), 16),
-				set:		v => {
-					const c = get(), hex = Math.round(Math.min(255, Math.max(0, v))).toString(16).padStart(2, '0');
-					put(c.slice(0, 1 + 2 * i) + hex + c.slice(3 + 2 * i), false);
-					settle(() => { put(get(), true); });
-				},
-				min:		0,
-				max:		255,
-				step:		(v, steps) => v + 4 * steps,
-				presets:	[0, 64, 128, 192, 255],
-			}),
-			id:			`${idp}-${label.toLowerCase()}`,
-		}));
-		return [
-			...COLOURS.map(c => ({id: `${idp}-${c.slice(1)}`, face: () => swatchFace(c), caption: () => c, active: () => known() && get().toLowerCase() === c, select: () => { put(c, true); }})),
-			{id: `${idp}-custom`, face: () => swatchFace(get()), caption: () => `Custom colour ${get()}`, children: () => channels},
-		];
-	}
-
 	// Editing a gradient is a mode of the editor, not more of editing a shape: the stops are shown along the gradient's axis in
 	// place of the shape's points, and the pointer, the menu and the status are for them. A gradient is in its own space, which
 	// `matrix` takes to the shape's; `points` are its start and end (or centre, a place a radius away and the focus) in it.
-	class GradientMode {
-		private saved:	number[];
-		constructor(readonly prop: 'fill' | 'stroke', readonly points: number[], readonly matrix: float2x3, public stop = 0) {
+	// the gradient being edited, kept in the drawing as attributes
+	class SvgGradient extends GradientEditor {
+		private saved:	float2[];
+		constructor(readonly prop: 'fill' | 'stroke', points: float2[], matrix: float2x3, stop = 0) {
+			super(prop, points, matrix, () => editor.draw(), stop);
 			this.saved = points.slice();
 		}
+
+		options() { return selected ? paintOptions(selected, this.prop) : undefined; }
 
 		// the gradient's geometry, written where it belongs and recorded
 		commit() {
@@ -1166,219 +1155,19 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			const g = selected && gradientOf(getProp(selected, this.prop)), shown = g && dispOf.get(g);
 			const p = this.points, was = this.saved;
 			// the focus goes with the centre, and so does the place that sets the radius
-			if (g?.localName === 'radialGradient' && (p[0] !== was[0] || p[1] !== was[1]) && p[3] === was[3] && p[4] === was[4]) {
-				[3, 6].forEach(i => { p[i] += p[0] - was[0]; p[i + 1] += p[1] - was[1]; });
+			const same = (a: float2, b: float2) => a.x === b.x && a.y === b.y;
+			if (g?.localName === 'radialGradient' && !same(p[0], was[0]) && same(p[1], was[1])) {
+				const moved = p[0].sub(was[0]);
+				p[1] = p[1].add(moved);
+				p[2] = p[2].add(moved);
 			}
 			this.saved = p.slice();
 			if (g && shown)
 				setHandles(shown, p);
 		}
-
-		describe() {
-			return `${this.prop} gradient \u00b7 drag a stop to move it (the first and last move the ends) \u00b7 right-click a stop for its menu, or the line to add one`;
-		}
-
-		// where the stops lie: along the axis, the line between the start and end
-		private track(ed: PathEditor) {
-			const p = this.points, a = ed.toScreen(p[0], p[1]), b = ed.toScreen(p[3], p[4]);
-			const dx = b[0] - a[0], dy = b[1] - a[1];
-			if (Math.hypot(dx, dy) < 24)
-				return;
-			const x = a[0], y = a[1];
-			return {x, y, dx, dy, at: (t: number) => [x + dx * t, y + dy * t]};
-		}
-
-		overlay(ed: PathEditor) {
-			const track = this.track(ed), paint = selected && paintOptions(selected, this.prop).get();
-			if (!track || paint?.kind !== 'gradient')
-				return '';
-			const current = Math.min(this.stop, paint.stops.length - 1);
-			const line = `M${num(track.x)},${num(track.y)}l${num(track.dx)},${num(track.dy)}`;
-			// a radial gradient's stops are each a circle (drawn through its space, which may make it an ellipse), dotted
-			const rings = paint.type !== 'radial' ? '' : paint.stops.map((s, i) => {
-				const p = this.points, r = Math.hypot(p[3] - p[0], p[4] - p[1]) * s.offset;
-				if (r <= 0)
-					return '';
-				const d = Array.from({length: 64}, (_, k) => ed.toScreen(p[0] + r * Math.cos(k * Math.PI / 32), p[1] + r * Math.sin(k * Math.PI / 32)).map(num).join(',')).join('L');
-				return `<path d="M${d}Z" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="3" stroke-dasharray="1 5" stroke-linecap="round"/>`
-					+ `<path d="M${d}Z" fill="none" stroke="${i === current ? '#fff' : cssOf({...s, opacity: 1})}" stroke-width="1.5" stroke-dasharray="1 5" stroke-linecap="round"/>`;
-			}).join('');
-			return rings + `<path d="${line}" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="4" stroke-linecap="round"/><path d="${line}" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>`
-				+ paint.stops.map((s, i) => {
-					const [x, y] = track.at(s.offset), on = i === current;
-					return `<circle cx="${num(x)}" cy="${num(y)}" r="${on ? 9 : 7}" fill="${cssOf(s)}" stroke="${on ? '#fff' : '#000'}" stroke-width="${on ? 3 : 2}"/>`
-						+ (on ? `<circle cx="${num(x)}" cy="${num(y)}" r="10.5" fill="none" stroke="#000" stroke-opacity="0.6"/>` : '');
-				}).join('');
-		}
-
-		// the stop (or the axis, where one may be added) under a place on the screen, with where along the axis that is
-		private hit(ed: PathEditor, px: number, py: number) {
-			const track = this.track(ed);
-			if (!track || !selected)
-				return;
-			const options = paintOptions(selected, this.prop), paint = options.get();
-			if (paint.kind !== 'gradient')
-				return;
-			const len2 = track.dx * track.dx + track.dy * track.dy;
-			const along = (x: number, y: number) => Math.min(1, Math.max(0, ((x - track.x) * track.dx + (y - track.y) * track.dy) / len2));
-			let index = -1, near = STOP_HIT;
-			paint.stops.forEach((s, i) => {
-				const [x, y] = track.at(s.offset), d = Math.hypot(x - px, y - py) - (i === this.stop ? 0.5 : 0);
-				if (d <= near) {
-					near = d;
-					index = i;
-				}
-			});
-			const t = along(px, py), [bx, by] = track.at(t);
-			if (index < 0 && Math.hypot(bx - px, by - py) > STOP_HIT)
-				return;
-			return {options, paint, index, t, along};
-		}
-
-		// a press on a stop selects it and drags it along the axis; the first and last are the ends of the gradient, which they move
-		// instead. The axis between the stops is for the menu, which adds one there.
-		capture(ed: PathEditor, px: number, py: number): DragHandler | undefined {
-			const hit = this.hit(ed, px, py);
-			if (!hit || hit.index < 0)
-				return;
-			const {options, paint, along, index} = hit;
-			let moved = false;
-			this.stop = index;
-			ed.draw();
-			const here = (ev: PointerEvent) => {
-				const r = ed.svg.getBoundingClientRect();
-				return [ev.clientX - r.left, ev.clientY - r.top] as const;
-			};
-			const last = paint.stops.length - 1;
-			if (index === 0 || index === last) {
-				const p = this.points, was = p.slice(), radial = p.length > 6;
-				const o0 = paint.stops[0].offset, o1 = paint.stops[last].offset, span = o1 - o0;
-				const start = ed.toLocal(px, py);
-				return {
-					raw:	true,
-					move:	(_dx, _dy, ev) => {
-						const [qx, qy] = ed.toLocal(...here(ev));
-						if (radial) {
-							if (index === 0) {
-								// the centre; what is set by it goes with it
-								p[0] = was[0] + qx - start[0];
-								p[1] = was[1] + qy - start[1];
-							} else if (o1 > 1e-6) {
-								p[3] = was[0] + (qx - was[0]) / o1;
-								p[4] = was[1] + (qy - was[1]) / o1;
-							}
-						} else if (span > 1e-6) {
-							// the other end stays where it is, and the gradient runs from this one to it
-							const vx = was[3] - was[0], vy = was[4] - was[1];
-							const [fx, fy] = index === 0 ? [was[0] + o1 * vx, was[1] + o1 * vy] : [was[0] + o0 * vx, was[1] + o0 * vy];
-							const nx = (index === 0 ? fx - qx : qx - fx) / span, ny = (index === 0 ? fy - qy : qy - fy) / span;
-							p[0] = (index === 0 ? qx : fx) - o0 * nx;
-							p[1] = (index === 0 ? qy : fy) - o0 * ny;
-							p[3] = p[0] + nx;
-							p[4] = p[1] + ny;
-						} else {
-							p[index === 0 ? 0 : 3] = was[index === 0 ? 0 : 3] + qx - start[0];
-							p[index === 0 ? 1 : 4] = was[index === 0 ? 1 : 4] + qy - start[1];
-						}
-					},
-					end:	moved => {
-						if (moved)
-							this.commit();
-					},
-				};
-			}
-			return {
-				raw:	true,
-				move:	(_dx, _dy, ev) => {
-					const now = options.get();
-					if (now.kind !== 'gradient')
-						return;
-					const stops = now.stops.map(s => ({...s}));
-					// between its neighbours, which keeps the stops in order
-					stops[index].offset = Math.round(Math.min(stops[index + 1]?.offset ?? 1, Math.max(stops[index - 1]?.offset ?? 0, along(...here(ev)))) * 1000) / 1000;
-					options.set({...now, stops}, false);
-					moved = true;
-				},
-				end:	() => {
-					if (moved)
-						options.set(options.get(), true);
-				},
-			};
-		}
-
-		// the whole menu, over a stop or the axis: what the stop has, or adding one
-		menu(ed: PathEditor, px: number, py: number): CascadeItem[] | undefined {
-			const hit = this.hit(ed, px, py);
-			if (!hit)
-				return;
-			if (hit.index >= 0)
-				this.stop = hit.index;
-			ed.draw();
-			return this.items(hit.options, hit.index, hit.t);
-		}
-
-		private items(options: PaintOptions, index: number, at: number): CascadeItem[] {
-			const now 		= () => options.get(), prop = this.prop;
-			const stopNow	= () => { const p = now(); return p.kind === 'gradient' ? {p, i: Math.min(index, p.stops.length - 1)} : undefined; };
-			const g			= () => stopNow()!, the = () => g().p.stops[g().i];
-			const edit		= (change: (s: Stop, all: Stop[], i: number) => void, final: boolean) => {
-				const q = stopNow();
-				if (q) {
-					const stops = q.p.stops.map(s => ({...s}));
-					change(stops[q.i], stops, q.i);
-					options.set({...q.p, stops}, final);
-					editor.draw();
-				}
-			};
-			const op		= (id: string, icon: string, caption: string, run: () => void): CascadeItem => ({id, face: () => svgFace(icon), caption: () => caption, select: () => { run(); }});
-			const idp		= `${prop}-stop`;
-
-			if (!stopNow())
-				return [];
-			
-			if (index < 0)
-				return [op(`${idp}-add`, '<circle cx="8" cy="8" r="5"/><path d="M8 5.5V10.5M5.5 8H10.5"/>', 'Add a stop here', () => {
-					const q = g().p, more = withStop(q.stops, at);
-					this.stop = more.index;
-					options.set({...q, stops: more.stops}, true);
-					editor.draw();
-				})];
-			return [
-				{id: `${idp}-colour`, face: () => swatchFace(the().color), caption: () => `Stop colour ${the().color}`, children: () =>
-					colourItems(idp, () => the().color, (c, final) => edit(s => { s.color = c; }, final)),
-				},
-				{
-					...valueItem({
-						label:		'alpha',
-						caption:	'Stop opacity',
-						get:		() => Math.round(the().opacity * 100),
-						set:		v => { edit(s => { s.opacity = Math.round(v) / 100; }, false); settle(() => { options.set(now(), true); }); },
-						min:		0,
-						max:		100,
-						step:		(v, steps) => v + 5 * steps,
-						presets:	[0, 25, 50, 75, 100],
-						format:		v => `${Math.round(v)}%`,
-					}),
-					id:			`${idp}-opacity`,
-				},
-				// what a gradient does beyond its last stop (and before its first)
-				...(index === g().p.stops.length - 1 ? [choiceItem('Spread', (['pad', 'reflect', 'repeat'] as const).map(v => ({
-					value:		v,
-					face:		svgFace(`<rect x="2" y="3" width="12" height="10" fill="none"/><path d="${{pad: 'M6 8H2M10 8H14M6 5V11M10 5V11', reflect: 'M2 6L6 10L10 6L14 10', repeat: 'M2 10L6 6V10L10 6V10L14 6'}[v]}"/>`),
-					caption:	v,
-				})), () => { const q = now(); return q.kind === 'gradient' ? q.spread : 'pad'; }, v => { const q = now(); if (q.kind === 'gradient') options.set({...q, spread: v}, true); })] : []),
-				// the ends are the gradient's own, so only the stops between them can go
-				...(index > 0 && index < g().p.stops.length - 1 ? [op(`${idp}-remove`, '<circle cx="8" cy="8" r="5"/><path d="M5.5 8H10.5"/>', 'Remove this stop', () => {
-					const q = g().p, i = g().i;
-					options.set({...q, stops: q.stops.filter((_, k) => k !== i)}, true);
-					this.stop = Math.max(0, i - 1);
-					editor.draw();
-				})] : []),
-			];
-		}
 	}
 
-	class SvgEditor extends PathEditor {
+	class SvgPath extends PathEditor {
 		constructor() {
 			super(ui.view, ui.options);
 			this.extraViews = ui.views ?? [];
@@ -1399,7 +1188,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 				backend.status(lastStatus = text);
 		}
 
-		commit(label: string) {
+		commit(label: string, key?: string) {
 			if (mode)
 				return mode.commit();
 			if (!selected || !points)
@@ -1408,13 +1197,13 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			e.setAttribute('d', svgPath(points));
 			pointsD = svgPath(points);
 			syncAttributes(e);
-			save(label);
+			save(label, key === undefined ? undefined : `${indicesOf(selected).join('.')} ${key}`);
 			updateMatrix();
 		}
 
 		bounds() {
 			const v = viewBoxOf();
-			return {x0: v.x, y0: v.y, x1: v.x + v.w, y1: v.y + v.h};
+			return float2.extent.fromSize(float2(v.x, v.y), float2(v.w, v.h));
 		}
 
 		// the drawing is shown as the points are edited, which a shape that is not yet a path becomes
@@ -1444,15 +1233,14 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			if (mode)
 				return mode.overlay(this);
 			if (stroke?.length) {
-				const v = this.view;
-				return `<path class="insp-draw" d="M${stroke.map(([x, y]) => `${num(x * v.s + v.x)},${num(y * v.s + v.y)}`).join('L')}" fill="none"/>`;
+				return `<path class="insp-draw" d="M${stroke.map(w => { const p = this.worldToScreen(w); return `${num(p.x)},${num(p.y)}`; }).join('L')}" fill="none"/>`;
 			}
 			const d = selected && selected !== src?.documentElement && !points && !shapeOf(selected) ? dispOf.get(selected) as SVGGraphicsElement | undefined : undefined;
 			const box = d?.getBBox?.();
 			if (!box)
 				return '';
-			const corners = [[box.x, box.y], [box.x + box.width, box.y], [box.x + box.width, box.y + box.height], [box.x, box.y + box.height]]
-				.map(([x, y]) => this.toScreen(x, y).map(num).join(','));
+			const corners = float2.extent.fromSize(float2(box.x, box.y), float2(box.width, box.height)).corners()
+				.map(c => { const p = this.toScreen(c); return `${num(p.x)},${num(p.y)}`; });
 			return `<path class="insp-selected" d="M${corners.join('L')}Z" fill="none"/>`;
 		}
 
@@ -1487,7 +1275,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		protected extraTools(): ToolChoice[] {
 			return backend.fitStroke ? [{value: 'freehand', face: svgFace('<path d="M2 13C4 4 7 4 8 8S12 12 14 3"/>'), caption: 'Freehand (Shift moves the view)'}] : [];
 		}
-		protected addShape(kind: ShapeKind, x0: number, y0: number, x1: number, y1: number) { addDragged(kind, x0, y0, x1, y1); }
+		protected addShape(kind: ShapeKind, a: float2, b: float2) { addDragged(kind, a, b); }
 
 		protected defaultSize() {
 			const v = viewBoxOf();
@@ -1510,11 +1298,11 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 				return;
 			const base = transformOf(d), parent = worldMatrix(d.parentNode as SVGElement), inv = parent.inverse();
 			// the matrix is of the world, so it is taken to the element's parent's space and back
-			return (m, label) => moveElement(e, 0, 0, label, base, inv.mulAffine(m).mulAffine(parent));
+			return (m, label) => moveElement(e, float2(0, 0), label, base, inv.mulAffine(m).mulAffine(parent));
 		}
 
 		// a press on a drawn element selects it, and drags it if it goes on to move
-		protected grab(e: PointerEvent, x: number, y: number): DragHandler | undefined {
+		protected grab(e: PointerEvent, at: float2): DragHandler | undefined {
 			if (readOnly)
 				return;
 			const hit = elementOf(e.target as Node);
@@ -1524,56 +1312,55 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 				select(hit);
 			const target = selected && (hit === selected || selected.contains(hit)) ? selected : hit;
 			const d = dispOf.get(target) as SVGGraphicsElement | undefined, base = d ? transformOf(d) : undefined;
-			// dx, dy are the whole distance from the press, so they apply to the transform as it was then. Without Alt a move of the
+			// d is the whole distance from the press, so it applies to the transform as it was then. Without Alt a move of the
 			// pointer moves the element; with it, it turns the element about the middle of its box by the angle the pointer goes round
 			// it (Shift: in steps of 15 degrees). Both are kept, so Alt may be pressed and let go during the drag.
 			const here = (ev: PointerEvent) => {
 				const r = this.svg.getBoundingClientRect();
-				return this.toWorld(ev.clientX - r.left, ev.clientY - r.top);
+				return this.toWorld(float2(ev.clientX - r.left, ev.clientY - r.top));
 			};
-			let last = this.toWorld(x, y), lastD = [0, 0], t = [0, 0], angle = 0, turned = false;
+			let last = this.toWorld(at), lastD = float2(0, 0), t = float2(0, 0), angle = 0, turned = false;
 			const box = d?.getBBox?.();
 			const parent = d ? worldMatrix(d.parentNode as SVGElement).inverse() : float2x3.identity();
 			const c0 = base && box ? base.mulPos(float2(box.x + box.width / 2, box.y + box.height / 2)) : undefined;
 			return {
-				move: (dx, dy, ev) => {
+				move: (d, ev) => {
 					const now = here(ev);
 					if (ev.altKey && c0) {
-						const tp = inParent(target, t[0], t[1]), c = [c0.x + tp.x, c0.y + tp.y];
-						const a = parent.mulPos(float2(last[0], last[1])), b = parent.mulPos(float2(now[0], now[1]));
-						angle += Math.atan2(b.y - c[1], b.x - c[0]) - Math.atan2(a.y - c[1], a.x - c[0]);
+						const c = c0.add(inParent(target, t));
+						angle += parent.mulPos(now).sub(c).atan2() - parent.mulPos(last).sub(c).atan2();
 					} else {
-						t = [t[0] + dx - lastD[0], t[1] + dy - lastD[1]];
+						t = t.add(d.sub(lastD));
 					}
 					last = now;
-					lastD = [dx, dy];
-					let by = float2.translate(inParent(target, t[0], t[1]));
+					lastD = d;
+					let by = float2.translate(inParent(target, t));
 					if (c0 && angle !== 0) {
-						const th = ev.shiftKey ? Math.round(angle / (Math.PI / 12)) * Math.PI / 12 : angle, cos = Math.cos(th), sin = Math.sin(th), tp = inParent(target, t[0], t[1]);
+						const th = ev.shiftKey ? Math.round(angle / (Math.PI / 12)) * Math.PI / 12 : angle, cos = Math.cos(th), sin = Math.sin(th), tp = inParent(target, t);
 						by = float2x3(float2(cos, sin), float2(-sin, cos), float2(c0.x - (cos * c0.x - sin * c0.y) + tp.x, c0.y - (sin * c0.x + cos * c0.y) + tp.y));
 						turned = th !== 0;
 					}
-					moveElement(target, dx, dy, undefined, base, by);
+					moveElement(target, d, undefined, base, by);
 				},
 				end: moved => {
 					if (moved)
-						moveElement(target, 0, 0, turned ? 'Rotate element' : 'Move element');
+						moveElement(target, float2(0, 0), turned ? 'Rotate element' : 'Move element');
 				},
 			};
 		}
 
 
 		// with the pen, a press anywhere starts a stroke (unless Shift is held, which moves the view); the stroke is shown as it is drawn
-		protected capture(e: PointerEvent, x: number, y: number): DragHandler | undefined {
+		protected capture(e: PointerEvent, at: float2): DragHandler | undefined {
 			if (mode && !readOnly)
-				return mode.capture(this, x, y);
+				return mode.capture(this, at);
 			if (this.tool !== 'freehand' || readOnly || e.shiftKey)
 				return;
-			const [wx, wy] = this.toWorld(x, y);
-			const mine: [number, number][] = stroke = [[wx, wy]];
+			const w = this.toWorld(at);
+			const mine: float2[] = stroke = [w];
 			return {
 				raw:	true,
-				move:	(dx, dy) => { mine.push([wx + dx, wy + dy]); },
+				move:	d => { mine.push(w.add(d)); },
 				end:	moved => {
 					stroke = undefined;
 					this.draw();
@@ -1588,8 +1375,8 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		}
 
 		// over the stops of a gradient, the menu is only for the stop there (or for adding one)
-		protected menuOnly(here: {x: number, y: number}): CascadeItem[] | undefined {
-			return mode && !readOnly ? mode.menu(this, here.x, here.y) : undefined;
+		protected menuOnly(here: float2): CascadeItem[] | undefined {
+			return mode && !readOnly ? mode.menu(this, here) : undefined;
 		}
 
 		protected pageItems(): CascadeItem[] {
@@ -1602,20 +1389,20 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 					for (const prop of ['fill', 'stroke'] as const) {
 						const paint		= paintOptions(e, prop), now = () => paint.get();
 						const set		= (p: Paint) => { paint.set(p, true); };
-						const isGradient = (p: Paint, type: 'linear' | 'radial') => p.kind === 'gradient' && p.type === type;
+						const isGradient = (p: Paint, type: 'linear' | 'radial') => p.type === type;
 						const setGradient = (type: 'linear' | 'radial') => {
 							const p			= now();
-							const color		= p.kind === 'color' ? p.color : '#808080';
-							const stops		= p.kind === 'gradient' ? p.stops : defaultStops(color);
-							const spread	= p.kind === 'gradient' ? p.spread : 'pad';
-							set({kind: 'gradient', type, stops, spread});
+							const color		= p.type === 'color' ? p.color : GREY;
+							const stops		= 'stops' in p ? p.stops : defaultStops(color);
+							const spread	= 'stops' in p ? p.spread : 'pad';
+							set({type, stops, spread});
 							paint.handles!.set(true);
 						}
-						const defaultStops = (color: string) => [{offset: 0, color, opacity: 1}, {offset: 1, color, opacity: 0}];
+						const defaultStops = (color: RGB) => [{offset: 0, color, opacity: 1}, {offset: 1, color, opacity: 0}];
 						const svgGradient = (prefix: string, type: 'linear' | 'radial', stops: Stop[]) => {
 							// the icon is inline in the page, so the gradient's id has to be unique there: one per property
 							const id		= `${prefix}-${prop}-${type}`;
-							const stops2	= stops.map(s => `<stop offset="${s.offset}" stop-color="${s.color}" stop-opacity="${s.opacity}"/>`).join('');
+							const stops2	= stops.map(s => `<stop offset="${s.offset}" stop-color="${toHex(s.color)}" stop-opacity="${s.opacity}"/>`).join('');
 							const grad		= type === 'radial'
 								? `<radialGradient id="${id}" cx="0.5" cy="0.5" r="0.5">${stops2}</radialGradient>`
 								: `<linearGradient id="${id}" x1="0" y1="0" x2="1" y2="0">${stops2}</linearGradient>`;
@@ -1626,35 +1413,36 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 							id:			prop,
 							face:		() => {
 								const p = now();
-								switch (p.kind) {
-									case 'color':		return swatchFace(p.color);
+								switch (p.type) {
+									case 'color':		return swatchFace(toHex(p.color));
 									case 'none':		return svgFace('<rect x="2" y="2" width="12" height="12"/><path d="M2 14L14 2"/>');
-									case 'gradient':	return svgGradient('face', p.type, p.stops);
+									case 'linear': case 'radial':	return svgGradient('face', p.type, p.stops);
 									default: 			return svgFace(`<rect x="2" y="2" width="12" height="12" ${prop === 'fill' ? 'fill="currentColor" fill-opacity="0.35"' : 'stroke-dasharray="2 1.5"'}/>`);
 								}
 								//return p.kind === 'color' ? swatchFace(p.color) : svgFace(p.kind === 'none' ? '<rect x="2" y="2" width="12" height="12"/><path d="M2 14L14 2"/>' : `<rect x="2" y="2" width="12" height="12" ${prop === 'fill' ? 'fill="currentColor" fill-opacity="0.35"' : 'stroke-dasharray="2 1.5"'}/>`);
 							},
 							caption:	() => {
 								const p = now();
-								return `${prop === 'fill' ? 'Fill' : 'Stroke'}: ${p.kind === 'color' ? p.color : p.kind === 'unset' ? 'default' : p.kind === 'other' ? p.text : p.kind}`;
+								return `${prop === 'fill' ? 'Fill' : 'Stroke'}: ${p.type === 'color' ? toHex(p.color) : p.type === 'unset' ? 'default' : p.type === 'other' ? p.text : p.type}`;
 							},
 							// the icon itself stands for what is there: a gradient is edited on the drawing
 							click:		() => {
-								if (now().kind !== 'gradient')
-									return false;
-								enterGradient(e, prop);
-								return true;
+								if ('stops' in now()) {
+									enterGradient(e, prop);
+									return true;
+								}
+								return false;
 							},
 							children:	() => {
-								const colourNow = () => { const p = now(); return p.kind === 'color' ? p.color : '#808080'; };
+								const colourNow = () => { const p = now(); return p.type === 'color' ? p.color : GREY; };
 								const children: CascadeItem[] = [
-									{id: `${prop}-none`, face: () => svgFace('<rect x="2" y="2" width="12" height="12"/><path d="M2 14L14 2"/>'), caption: () => 'None', active: () => now().kind === 'none', select: () => set({kind: 'none'})},
-									{id: `${prop}-unset`, face: () => svgFace('<rect x="2" y="2" width="12" height="12" stroke-dasharray="2 1.5"/>'), caption: () => 'Default (inherited)', active: () => now().kind === 'unset', select: () => set({kind: 'unset', effective: ''})},
+									{id: `${prop}-none`, face: () => svgFace('<rect x="2" y="2" width="12" height="12"/><path d="M2 14L14 2"/>'), caption: () => 'None', active: () => now().type === 'none', select: () => set({type: 'none'})},
+									{id: `${prop}-unset`, face: () => svgFace('<rect x="2" y="2" width="12" height="12" stroke-dasharray="2 1.5"/>'), caption: () => 'Default (inherited)', active: () => now().type === 'unset', select: () => set({type: 'unset', effective: ''})},
 									{id: `${prop}-solid`, face: () => svgFace('<rect x="2" y="2" width="12" height="12" fill="currentColor"/>'), caption: () => 'Solid colour', children: () =>
-										colourItems(prop, colourNow, (c, final) => paint.set({kind: 'color', color: c}, final), () => now().kind === 'color'),
+										colourItems(prop, colourNow, (c, final) => paint.set({type: 'color', color: c}, final), () => now().type === 'color'),
 									},
-									{id: `${prop}-linear`, face: () => svgGradient('sel', 'linear', defaultStops('#808080')), caption: () => 'Linear gradient', active: () => isGradient(now(), 'linear'), select: () => setGradient('linear')},
-									{id: `${prop}-radial`, face: () => svgGradient('sel', 'radial', defaultStops('#808080')), caption: () => 'Radial gradient', active: () => isGradient(now(), 'radial'), select: () => setGradient('radial')},
+									{id: `${prop}-linear`, face: () => svgGradient('sel', 'linear', defaultStops(GREY)), caption: () => 'Linear gradient', active: () => isGradient(now(), 'linear'), select: () => setGradient('linear')},
+									{id: `${prop}-radial`, face: () => svgGradient('sel', 'radial', defaultStops(GREY)), caption: () => 'Radial gradient', active: () => isGradient(now(), 'radial'), select: () => setGradient('radial')},
 								];
 								if (prop === 'stroke')
 									children.unshift({
@@ -1676,13 +1464,13 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 										}),
 										id:			'stroke-width',
 									});
-								// opacity, and the red, green and blue of a colour, adjusted as they are turned and recorded once they have settled
+								// opacity, and the red, green and blue of a colour, adjusted as they are turned: the turning is one edit
 								children.push({
 									...valueItem({
 										label:		'alpha',
 										caption:	`${prop === 'fill' ? 'Fill' : 'Stroke'} opacity`,
 										get:		() => Math.round(paint.opacity!.get() * 100),
-										set:		v => { paint.opacity!.set(Math.round(v) / 100, false); settle(() => { paint.opacity!.set(paint.opacity!.get(), true); }); },
+										set:		v => paint.opacity!.set(Math.round(v) / 100, false),
 										min:		0,
 										max:		100,
 										step:		(v, steps) => v + 5 * steps,
@@ -1771,7 +1559,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			return items;
 		}
 	}
-	const editor = new SvgEditor();
+	const editor = new SvgPath();
 
 
 	//--- the host's ---------------------------------------------------------------------------------------------
@@ -1779,6 +1567,11 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	// the drawing from its text, with what was selected still so when it is there; a drawing that is read only has its
 	// controls shown and nothing to change them with
 	function load(text: string, file: string, only = false) {
+		// (steps not yet sent are of the drawing as it was: an undo, say, has taken it back)
+		if (continuing)
+			clearTimeout(continuing.timer);
+		continuing = undefined;
+		steps.end();
 		const keep = file === fileName && selected && indicesOf(selected);
 		const first = !src;
 		try {
@@ -1814,7 +1607,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		else if (selected && selected !== src.documentElement && ['Delete', 'Backspace'].includes(e.key))
 			deleteElement();
 		else if (selected && selected !== src.documentElement && e.key.startsWith('Arrow'))
-			moveElement(selected, e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0, e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0, 'Move element');
+			moveElement(selected, float2(e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0, e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0), 'Move element');
 		else if (e.key === 'Escape' && selected)
 			select(undefined);
 		else
@@ -1831,44 +1624,16 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 // them in attributes, the font viewer in a colour font's palette, and each describes its own as a PaintOptions.
 //-----------------------------------------------------------------------------
 
-export interface Stop {
-	offset:		number;			// 0 to 1 along the gradient
-	color:		string;			// #rrggbb
-	opacity:	number;
-}
-
-export type Spread = 'pad' | 'reflect' | 'repeat';
-
-export type Paint =
-	| {kind: 'unset', effective?: string}		// inherited, as the page shows it
-	| {kind: 'none'}
-	| {kind: 'color', color: string}
-	| {kind: 'gradient', type: 'linear' | 'radial', stops: Stop[], spread: Spread}
-	| {kind: 'other', text: string};			// currentColor, a pattern: something the controls do not make
-
-export type PaintMode = 'unset' | 'none' | 'color' | 'linear' | 'radial';
-
-export interface PaintOptions {
-	label:		string;
-	modes:		PaintMode[];						// which the shape may be given
-	get():		Paint;
-	// final is false while a control is still being dragged, and true when it is let go
-	set(paint: Paint, final: boolean): void;
-	opacity?:	{get(): number, set(value: number, final: boolean): void};
-	// the gradient's geometry is edited on the drawing, which the page shows or hides
-	handles?:	{get(): boolean, set(on: boolean): void};
-	// where a colour is the editable part of the paint, as a colour font's layers are
-	editable?:	boolean;
-}
-
 const MODE_NAMES: Record<PaintMode, string> = {unset: 'Inherit', none: 'None', color: 'Colour', linear: 'Linear', radial: 'Radial'};
 
 let probe: HTMLElement | undefined;
 
-/** A CSS colour as #rrggbb and an opacity, or undefined for what is not a colour (none, a url, currentColor). */
-export function parseColour(text: string): {color: string, opacity: number} | undefined {
+const GREY: RGB = {r: 128, g: 128, b: 128};
+
+/** A CSS colour and an opacity, or undefined for what is not a colour (none, a url, currentColor). */
+export function parseColour(text: string): {color: RGB, opacity: number} | undefined {
 	if (!text || /^(none|currentcolor|inherit|transparent)$/i.test(text) || text.startsWith('url('))
-		return /^transparent$/i.test(text) ? {color: '#000000', opacity: 0} : undefined;
+		return /^transparent$/i.test(text) ? {color: {r: 0, g: 0, b: 0}, opacity: 0} : undefined;
 	probe ??= document.body.appendChild(createElement('span', {hidden: true}));
 	probe.style.color = '';
 	probe.style.color = text;
@@ -1877,15 +1642,9 @@ export function parseColour(text: string): {color: string, opacity: number} | un
 	const m = /rgba?\(\s*([\d.]+)[ ,]+([\d.]+)[ ,]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?/.exec(getComputedStyle(probe).color);
 	if (!m)
 		return;
-	const hex = (v: string) => Math.round(+v).toString(16).padStart(2, '0');
 	const a = m[4] === undefined ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4];
-	return {color: `#${hex(m[1])}${hex(m[2])}${hex(m[3])}`, opacity: a};
+	return {color: {r: Math.round(+m[1]), g: Math.round(+m[2]), b: Math.round(+m[3])}, opacity: a};
 }
-
-export const cssOf = (s: Stop) => {
-	const r = parseInt(s.color.slice(1, 3), 16), g = parseInt(s.color.slice(3, 5), 16), b = parseInt(s.color.slice(5, 7), 16);
-	return `rgba(${r},${g},${b},${s.opacity})`;
-};
 
 function number(value: number, min: number, max: number, step: number, on: (v: number, final: boolean) => void, className = 'fill-num') {
 	// type, min, max and step come before value, which they constrain
@@ -1896,10 +1655,10 @@ function number(value: number, min: number, max: number, step: number, on: (v: n
 	return input;
 }
 
-function colour(value: string, on: (v: string, final: boolean) => void) {
-	const input = createElement('input', {className: 'fill-colour', type: 'color', value});
-	input.addEventListener('input', () => on(input.value, false));
-	input.addEventListener('change', () => on(input.value, true));
+function colour(value: RGB, on: (v: RGB, final: boolean) => void) {
+	const input = createElement('input', {className: 'fill-colour', type: 'color', value: toHex(value)});
+	input.addEventListener('input', () => on(fromHex(input.value), false));
+	input.addEventListener('change', () => on(fromHex(input.value), true));
 	return input;
 }
 
@@ -1912,8 +1671,7 @@ function gradientBar(stops: Stop[]) {
 
 // a stop between two others, in the colours between theirs
 function between(a: Stop, b: Stop): Stop {
-	const mix = (x: string, y: string) => '#' + [1, 3, 5].map(i => Math.round((parseInt(x.slice(i, i + 2), 16) + parseInt(y.slice(i, i + 2), 16)) / 2).toString(16).padStart(2, '0')).join('');
-	return {offset: (a.offset + b.offset) / 2, color: mix(a.color, b.color), opacity: (a.opacity + b.opacity) / 2};
+	return {offset: (a.offset + b.offset) / 2, color: mixColour(a.color, b.color, 0.5), opacity: (a.opacity + b.opacity) / 2};
 }
 
 /** The controls for one paint: its mode, and what that mode takes. */
@@ -1929,21 +1687,21 @@ export function paintControl(o: PaintOptions): HTMLElement {
 
 	const draw = () => {
 		body.textContent = '';
-		if (paint.kind === 'unset') {
+		if (paint.type === 'unset') {
 			const note = createElement('div', {className: 'fill-note'});
 			note.append(createElement('span', {className: 'fill-swatch'}), 'inherited');
 			if (paint.effective)
 				(note.firstChild as HTMLElement).style.background = paint.effective;
 			body.append(note);
-		} else if (paint.kind === 'color') {
+		} else if (paint.type === 'color') {
 			const row = createElement('div', {className: 'fill-row'});
-			row.append(colour(paint.color, (color, final) => change({kind: 'color', color}, final)));
+			row.append(colour(paint.color, (color, final) => change({type: 'color', color}, final)));
 			if (o.opacity)
 				row.append(createElement('label', {textContent: 'Opacity'}), number(o.opacity.get(), 0, 1, 0.05, o.opacity.set));
 			body.append(row);
-		} else if (paint.kind === 'other') {
+		} else if (paint.type === 'other') {
 			body.append(createElement('div', {className: 'fill-note', textContent: paint.text}));
-		} else if (paint.kind === 'gradient') {
+		} else if (paint.type === 'linear' || paint.type === 'radial') {
 			const g = paint;
 			body.append(gradientBar(g.stops));
 			const list = createElement('div', {className: 'fill-stops'});
@@ -1995,22 +1753,22 @@ export function paintControl(o: PaintOptions): HTMLElement {
 	};
 
 	const modes = createElement('select', {className: 'fill-mode'});
-	const current = (): PaintMode => paint.kind === 'gradient' ? paint.type : paint.kind === 'other' ? 'color' : paint.kind;
+	const current = (): PaintMode => paint.type === 'other' ? 'color' : paint.type;
 	for (const mode of o.modes)
 		modes.add(new Option(MODE_NAMES[mode], mode));
 	const mark = () => { modes.value = current(); };
 	modes.addEventListener('change', () => {
 		const mode = modes.value as PaintMode;
-		if (mode === current() && paint.kind !== 'other')
+		if (mode === current() && paint.type !== 'other')
 			return;
 		const was = paint;
-		const colourOf = was.kind === 'color' ? was.color : was.kind === 'gradient' ? was.stops[0].color : '#808080';
+		const colourOf = was.type === 'color' ? was.color : 'stops' in was ? was.stops[0].color : GREY;
 		if (mode === 'unset' || mode === 'none')
-			change({kind: mode}, true);
+			change({type: mode}, true);
 		else if (mode === 'color')
-			change({kind: 'color', color: colourOf}, true);
+			change({type: 'color', color: colourOf}, true);
 		else
-			change({kind: 'gradient', type: mode, spread: 'pad', stops: was.kind === 'gradient' ? was.stops : [{offset: 0, color: colourOf, opacity: 1}, {offset: 1, color: colourOf, opacity: 0}]}, true);
+			change({type: mode, spread: 'pad', stops: 'stops' in was ? was.stops : [{offset: 0, color: colourOf, opacity: 1}, {offset: 1, color: colourOf, opacity: 0}]}, true);
 		mark();
 		draw();
 	});

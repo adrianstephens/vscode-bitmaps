@@ -1,7 +1,7 @@
 // The scad viewer's page for real, in headless Chrome, as meshview.js does the mesh viewer's: a model evaluated and
 // generated as ScadViewer does, the page's picture checked, its picker asked what is under the cursor, and its camera
 // (the orbit the two viewers share) zoomed and turned.
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
 const { openPage, asset, pause } = require('./pagehost.js');
@@ -18,7 +18,7 @@ function sdfMessage(source) {
 	return {
 		command:	'sdf',
 		code:		[...helpers, 'vec2 map(vec3 p) {', ...body, '\treturn d;', '}'].join('\n'),
-		batch:		Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('base64'),
+		data,
 		center:		plain(box.max.add(box.min).scale(0.5)),
 		half:		plain(box.max.sub(box.min).scale(0.5)),
 		info:		'test', warnings, camera,

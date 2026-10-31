@@ -3,7 +3,7 @@
 // so a divergence here is the generator's, not a gap in a second, independently-buggy GLSL.
 const fs = require('fs');
 const { makeShader, close } = require('./webgl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
 const bounds3 = s => new SDF(s).bounds();

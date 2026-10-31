@@ -12,10 +12,10 @@ import type { MessageOut, MessageIn } from '../webview/sdf';
 import { evaluate, evaluateCsg } from './scad/evaluate';
 import { buildIndex } from './fonts';
 import * as SDF from './scad/sdf';
-import { float3 } from '@isopodlabs/maths/vector';
+import { float3, float4 } from '@isopodlabs/maths/vector';
 
-import { meshAdaptive, checkMesh, Cancelled } from './scad/mesher';
-import { STL } from '@isopodlabs/binary_meshes';
+import { modelOf, checkMesh, mesher, type Material } from '@isopodlabs/binary_meshes';
+import { openModel } from './MeshViewer';
 
 const DEBOUNCE = 250;		// ms of quiet before a keystroke is evaluated
 
@@ -225,7 +225,21 @@ export class ScadViewerProvider implements vscode.CustomTextEditorProvider {
 	}
 }
 
-export async function exportStl(target: vscode.Uri, destination: vscode.Uri, name: string) {
+// The file's materials as a mesh file gives them: each colour (with its alpha), and the rest of what the viewer draws it
+// with as properties, which a 3MF has no place for. The viewer's own grey is 'default', for what no color() reaches.
+function meshMaterial(m: SDF.Material, i: number): Material {
+	const hex = (v: number) => Math.round(Math.min(Math.max(v, 0), 1) * 255).toString(16).padStart(2, '0');
+	return {
+		name:		i === 0 ? 'default' : `#${hex(m.rgb.x)}${hex(m.rgb.y)}${hex(m.rgb.z)}`,
+		color:		float4(m.rgb.x, m.rgb.y, m.rgb.z, m.opacity),
+		properties:	{specular: m.specular, roughness: m.roughness, ior: m.ior, metallic: m.metallic},
+	};
+}
+
+// The mesh of the file, opened in the mesh viewer as it is made, with the colours it has and the seams between them kept as
+// edges. Nothing is written until it is saved from there, where the file name's extension is what chooses the format.
+export async function exportMesh(target: vscode.Uri) {
+	const format	= 'mesh';
 	// what the file says now, saved or not -- the same text the preview draws
 	const document = await vscode.workspace.openTextDocument(target);
 
@@ -251,7 +265,7 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 			{label: 'Fine', tolerance: 0.005, detail: 'smooth curves; slower, and a larger file'},
 		].map(c => ({...c, description: `within ${c.tolerance} mm`}));
 		const picked = await vscode.window.showQuickPick(choices, {
-			title: `Export STL -- ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)} mm`,
+			title: `Mesh -- ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)} mm`,
 			placeHolder: 'How finely to mesh the model',
 		});
 		if (!picked)
@@ -260,23 +274,44 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 		// next to the source, as OpenSCAD puts it, and replaced each time: it is an output of the file, not something to keep
 
 		const started	= Date.now();
-		const mesh		= await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: 'Exporting STL', cancellable: true}, (progress, token) =>
-			meshAdaptive(sdf, {
+		// only a file with a color() (or a $ material) in it has anything to say about colour
+		const palette	= sdf.materials();
+		const materials	= palette.length > 1;
+		const mesh		= await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: 'Meshing', cancellable: true}, (progress, token) => {
+			// (the notification's bar goes by increments, of the share of the refining that is done since the last)
+			let shown = 0;
+			return mesher.meshAdaptive(sdf, {
+				materials,
 				// the smallest cells, a few times the tolerance
 				cells: Math.min(8192, Math.max(256, Math.ceil(longest / (picked.tolerance * 4)))),
 				tolerance: picked.tolerance,
-				progress: message => progress.report({message}),
+				progress: (message, fraction) => {
+					const percent = fraction === undefined ? shown : Math.floor(fraction * 100);
+					progress.report({message: fraction === undefined ? message : `${message} ${percent}%`, increment: Math.max(0, percent - shown)});
+					shown = Math.max(shown, percent);
+				},
 				cancelled: () => token.isCancellationRequested,
-			})
-		);
+			});
+		});
 		
 		if (!mesh.faces.length)
 			throw 'the model produced no surface. Try a finer setting.';
 
-		await vscode.workspace.fs.writeFile(destination, STL.save(mesh, name));
+		// the materials the faces have, in the order of the palette, and no others
+		const used = materials ? palette.map((_, i) => i).filter(i => mesh.faceMaterials!.includes(i)) : [];
+		const index = new Map(used.map((m, k) => [m, k]));
+		if (materials)
+			mesh.faceMaterials = mesh.faceMaterials!.map(m => index.get(m) ?? -1);
+		const fns = used.filter(i => palette[i].colorFn).length;
+		const model = modelOf(mesh, path.basename(target.fsPath, '.scad'));
+		model.materials = used.map(i => meshMaterial(palette[i], i));
+		model.unit = 'mm';
+		let extra = used.length ? ` in ${used.length} material${used.length > 1 ? 's' : ''}` : '';
+		if (fns)
+			extra += ` (${fns > 1 ? `${fns} colours that are` : 'a colour that is'} a function of the point, as one colour each)`;
 
-		// shown beside the source, in whatever editor is registered for .stl
-		await vscode.commands.executeCommand('vscode.open', destination, {viewColumn: vscode.ViewColumn.Beside, preview: false});
+		// (shown beside the source, as an unsaved .stl until it is given a name)
+		await openModel(path.basename(target.fsPath, '.scad') + '.stl', model);
 
 		const stats		= checkMesh(mesh);
 		const seconds	= ((Date.now() - started) / 1000).toFixed(1);
@@ -286,7 +321,7 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 			stats.inconsistent	? `${stats.inconsistent} flipped edges` : '',
 		].filter(Boolean);
 
-		const summary = `Exported ${stats.triangles.toLocaleString()} triangles (within ${picked.tolerance} mm, ${seconds} s) to ${name}`;
+		const summary = `Meshed ${stats.triangles.toLocaleString()} triangles${extra} (within ${picked.tolerance} mm, ${seconds} s); Save As to write it`;
 		// a wall or gap thinner than the finest cell passes between its corners, and is left out rather than drawn wrong
 		const thin = mesh.thin ? ` ${mesh.thin.toLocaleString()} of the finest cells (${mesh.cell.toPrecision(2)} mm) hold a wall or gap thinner than they are, which the mesh leaves out; a finer setting would keep it.` : '';
 		if (problems.length)
@@ -297,10 +332,12 @@ export async function exportStl(target: vscode.Uri, destination: vscode.Uri, nam
 			vscode.window.showInformationMessage(`${summary}. Closed surface, volume ${stats.volume.toFixed(1)} mm³.`);
 
 	} catch (error: any) {
-		if (error instanceof Cancelled)
-			vscode.window.showInformationMessage('Export STL cancelled.');
+		if (error instanceof mesher.TooFine)
+			vscode.window.showErrorMessage(`Mesh: this model is too detailed to mesh that finely (${error.message}). Try a coarser setting.`);
+		else if (error instanceof mesher.Cancelled)
+			vscode.window.showInformationMessage('Mesh cancelled.');
 		else
-			vscode.window.showErrorMessage(`Export STL: ${error?.message ?? error}`);
+			vscode.window.showErrorMessage(`Mesh: ${error?.message ?? error}`);
 	}
 }
 

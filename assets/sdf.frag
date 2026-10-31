@@ -14,6 +14,7 @@ out vec4		fragColor;
 // how much work the pixel cost: the marching steps taken
 int				g_steps = 0;
 vec3			g_hit = vec3(0.0);	// the point being shaded, for a colour that is a function of the point (see matColor)
+vec3			g_normal = vec3(0.0);	// and the surface's normal there
 
 //@floor
 
@@ -158,9 +159,12 @@ vec3 seen(vec3 ro, vec3 rd, int budget) {
 	vec3	hit;
 	float	mat;
 	float	t = trace(ro, rd, hit, mat, budget);
-	g_hit = hit;
-	vec3	model = t < 0.0 ? background(rd)
-		: localLight(normalAt(hit, max(max(u_half.x, u_half.y), u_half.z) * 5e-4), -rd, mat, 1.0);
+	vec3	model = background(rd);
+	if (t >= 0.0) {
+		g_hit		= hit;
+		g_normal	= normalAt(hit, max(max(u_half.x, u_half.y), u_half.z) * 5e-4);
+		model		= localLight(g_normal, -rd, mat, 1.0);
+	}
 	if (u_floorOn > 0.5) {
 		vec3	at;
 		float	ft = floorHit(ro, rd, at);
@@ -243,6 +247,7 @@ vec3 throughMedium(vec3 at, vec3 n, vec3 rd, float ior, vec3 base, float eps, fl
 vec3 shadeHit(vec3 rd, vec3 hit, float mat, float scale, float eps) {
 	g_hit			= hit;
 	vec3	n		= normalAt(hit, scale * 5e-4);
+	g_normal		= n;
 	vec3	view	= -rd;
 	vec3	base	= matColor(mat);
 	float	opacity	= clamp(matOpacity(mat), 0.0, 1.0);

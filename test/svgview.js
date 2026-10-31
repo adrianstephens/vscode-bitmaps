@@ -18,7 +18,7 @@ const { shapePoints, simplifyPoints, fitStroke } = require('../out/src/FontViewe
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };
-const { menu, strips } = require('./cascadehost');
+const { menu, strips, aim } = require('./cascadehost');
 const pause = ms => new Promise(r => setTimeout(r, ms));
 
 const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), 'utf8');
@@ -30,7 +30,7 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 			res.writeHead(200, {'content-type': 'text/html'});
 			res.end(`<!DOCTYPE html><html><head>
 				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'}})}</script>
-				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
+				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/pathedit.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
 				<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 			</head><body class="tensors">
 				<div id="svg-body"><div id="svg-side"><div id="svg-tree" class="layer-tree"></div><div id="svg-props" class="layer-props"></div></div><div id="svg-splitter" class="splitter"></div>
@@ -170,44 +170,33 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 	await page.evaluate(() => [...document.querySelectorAll('#svg-tree .select')].find(x => x.textContent.includes('#wave')).click());
 	await pause(300);
 
-	//--- inserting into a curve leaves its shape; deleting joins its neighbours; segments are made straight or curved
+	//--- inserting into a curve leaves its shape; deleting the point leaves its controls, which go on as a chain of cubics
 	const sample = () => page.$eval('.svg-doc #sd-wave', e => { const L = e.getTotalLength(); return Array.from({length: 21}, (_, i) => { const q = e.getPointAtLength(L * i / 20); return [q.x, q.y]; }); });
 	const same = (a, b) => a.every((q, i) => Math.hypot(q[0] - b[i][0], q[1] - b[i][1]) < 0.05);
 	const count = () => page.$$eval('#insp-view .insp-pt', p => p.length);
-	const s0 = await sample();
-	let q0 = await point(0);
-	await page.mouse.click(q0.x, q0.y);
-	await page.keyboard.press('i');
-	await pause(200);
-	check(await count() === n0 + 3 && edits.at(-1) === 'Insert point', `splitting a cubic adds a point and its two controls: ${await count()} from ${n0}`);
-	check(same(s0, await sample()), 'and leaves the curve where it was');
-	await page.keyboard.press('Delete');
-	await pause(200);
-	check(await count() === n0, 'deleting an on-curve point takes its controls with it');
+	// the drawing sent back as it was, as the host does for an undo
+	const undoTo = async t => { text = t; await page.evaluate(t => window.postMessage({command: 'svg', text: t, file: 'sample.svg'}, '*'), t); await pause(300); };
+	const wave0 = text, s1 = await sample();
 	// a point is inserted where the menu was opened along the curve
-	const s1 = await sample();
 	const onCurve = await page.$eval('.svg-doc #sd-wave', e => { const q = e.getPointAtLength(e.getTotalLength() * 0.37), m = e.getScreenCTM(); return {x: m.a * q.x + m.c * q.y + m.e, y: m.b * q.x + m.d * q.y + m.f}; });
 	await menu(page, onCurve.x, onCurve.y, ['edit', 'insert-here']);
 	await pause(200);
-	check(await count() === n0 + 3 && edits.at(-1) === 'Insert point', `the menu over a curve inserts a point there: ${await count()} from ${n0}`);
+	check(await count() === n0 + 3 && edits.at(-1) === 'Insert point', `the menu over a cubic inserts a point and its two controls there: ${await count()} from ${n0}`);
 	check(same(s1, await sample()), 'and leaves the curve where it was');
 	await page.keyboard.press('Delete');
 	await pause(200);
-	check(await count() === n0, 'and it deletes again');
-	q0 = await point(0);
+	check(await count() === n0 + 2 && edits.at(-1) === 'Delete point', `deleting the on-curve point leaves its controls: ${await count()} from ${n0}`);
+	await undoTo(wave0);
+	check(await count() === n0 && await page.$eval('#svg-props .tree-heading', e => e.textContent) === '<path>', 'the drawing sent back keeps the path selected, with its points as they were');
+	// the menu over a point edits the point
+	let q0 = await point(0);
 	await page.mouse.click(q0.x, q0.y);
 	const out = await strips(page, q0.x, q0.y, ['edit']);
-	check(out[1].includes('straight') && out[1].includes('curved') && !out[1].includes('toggle'), `the menu offers segments: ${out.map(s => s.join(',')).join(' | ')}`);
+	check(out[1].includes('delete-point') && out[1].includes('toggle') && !out[1].includes('insert-here'), `the menu over a point edits the point: ${out.map(s => s.join(',')).join(' | ')}`);
 	check(out[0].includes('element') && out[0].includes('tool') && !out[0].includes('add') && out[0].includes('view'), 'and the element, the tools and the view');
 	const spread = await page.$$eval('.cascade:not(.hidden) .cascade-strip.shown', ss => ss.every(st => { const r = [...st.children].filter(b => b.classList.contains('cascade-button')).map(b => b.getBoundingClientRect()); return r.every((a, i) => r.every((b, j) => i >= j || Math.abs(a.x - b.x) > 8 || Math.abs(a.y - b.y) > 8)) && r.every(a => a.width > 20 && a.width < 60); }));
 	check(spread, 'the icons of a strip are in separate tiles of their own size');
 	await page.keyboard.press('Escape');
-	await menu(page, q0.x, q0.y, ['edit', 'straight']);
-	await pause(200);
-	check(await count() === n0 - 2 && /d="M10,40L/.test(text.replace(/\s+/g, ' ')), `a segment made straight: ${await count()}`);
-	await menu(page, q0.x, q0.y, ['edit', 'curved']);
-	await pause(200);
-	check(await count() === n0 && edits.at(-1) === 'Make segment curved', 'and curved again');
 
 	// the pointer says what a press would do: a cross on a point, a four-way arrow along the curve, a hand elsewhere
 	const cursor = () => page.$eval('#insp-view > svg', e => e.style.cursor || getComputedStyle(e).cursor);
@@ -220,18 +209,22 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 	await page.mouse.move(along.x + 120, along.y - 160);
 	check(await cursor() === 'grab', `elsewhere: ${await cursor()}`);
 
-	// the view's options are in the menu, which stays open for a toggle
+	// the view's options are in the menu, which stays open for a toggle (the path selected again in the outline, so that no
+	// point is picked, whose contour would stay shown)
+	await page.evaluate(() => [...document.querySelectorAll('#svg-tree .select')].find(x => x.textContent.includes('#wave')).click());
+	await pause(300);
 	check(await page.$$eval('#svg-main button, #svg-main input, #svg-main select', e => e.length) === 0, 'there are no permanent buttons over the drawing');
 	await page.mouse.click(q0.x + 200, q0.y + 150, {button: 'right'});
 	await pause(250);
-	const v = await page.$eval('.cascade:not(.hidden) [data-id="view"]', e => { const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; });
-	await page.mouse.move(...v);
+	await aim(page, 'view');
 	await pause(250);
-	const tg = await page.$eval('.cascade:not(.hidden) [data-id="view-points"]', e => { const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; });
-	await page.mouse.click(...tg);
+	await aim(page, 'view-points');
+	await page.mouse.down();
+	await page.mouse.up();
 	await pause(150);
 	check(await count() === 0 && !await page.$eval('.cascade', e => e.classList.contains('hidden')), 'turning points off hides them and leaves the menu open');
-	await page.mouse.click(...tg);
+	await page.mouse.down();
+	await page.mouse.up();
 	await pause(150);
 	check(await count() === n0, 'and on again');
 	await page.keyboard.press('Escape');

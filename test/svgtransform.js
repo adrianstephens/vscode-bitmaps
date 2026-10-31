@@ -28,7 +28,7 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 			res.writeHead(200, {'content-type': 'text/html'});
 			res.end(`<!DOCTYPE html><html><head>
 				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'}})}</script>
-				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
+				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/pathedit.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
 				<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 			</head><body class="tensors">
 				<div id="svg-body"><div id="svg-side"><div id="svg-tree" class="layer-tree"></div><div id="svg-props" class="layer-props"></div></div><div id="svg-splitter" class="splitter"></div>
@@ -105,6 +105,20 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 	await rotateBox();
 	const t1 = text.match(/<path[^>]*id="tri"[^>]*/)[0];
 	check(t1.match(/ d="[^"]*"/)[0] !== t0.match(/ d="[^"]*"/)[0] && t1.match(/transform="[^"]*"/)[0] === t0.match(/transform="[^"]*"/)[0], `over its outline its points: ${t1}`);
+	// a warp of the outline: its grid shows (the corners and the handles beside them), and dragged in the middle the outline, cut finer,
+	// bends, straight sides and all
+	await select('tri');
+	const on = await page.$eval('.svg-doc #sd-tri', e => { const q = e.getPointAtLength(e.getTotalLength() * 0.17), m = e.getScreenCTM(); return {x: m.a * q.x + m.c * q.y + m.e, y: m.b * q.x + m.d * q.y + m.f}; });
+	await menu(page, on.x, on.y, ['transform', 'transform-free', 'transform-mode', 'warp']);
+	await pause(200);
+	const grid = await page.$$eval('.insp-xf-handle', hs => hs.map(h => { const r = h.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }));
+	check(grid.length === 12, `the warp's handles show (${grid.length})`);
+	const middle = [0, 3, 8, 11].reduce((m, k) => [m[0] + grid[k][0] / 4, m[1] + grid[k][1] / 4], [0, 0]);
+	await page.mouse.move(...middle); await page.mouse.down();
+	await page.mouse.move(middle[0], middle[1] + 30, {steps: 8}); await page.mouse.up(); await pause(300);
+	await page.keyboard.press('Enter'); await pause(300);
+	const t2 = text.match(/<path[^>]*id="tri"[^>]*/)[0], d2 = t2.match(/ d="([^"]*)"/)[1];
+	check(/C/.test(d2) && (d2.match(/C/g) ?? []).length >= 12 && t2.match(/transform="[^"]*"/)?.[0] === t1.match(/transform="[^"]*"/)?.[0], `warped, its sides are curves: ${t2}`);
 	// a rect over its fill: it stays a rect
 	await select('box');
 	c = await centre('.svg-doc #sd-box');

@@ -14,16 +14,19 @@
 // hits against another model's box, which silently makes it find nothing and the test check nothing.
 const fs = require('fs');
 const { makeMap } = require('./glsl.js');
-const { evaluate } = require('../out/src/scad/evaluate.js');
+const { evaluate } = require('./scadhost.js');
 const { emitGlsl, SDF } = require('../out/src/scad/sdf.js');
 const bounds3 = s => new SDF(s).bounds();
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };
 
-const TEMPLATE = fs.readFileSync(__dirname + '/../assets/sdf.frag', 'utf8');
+// (the template as the page has it, the floor's functions in it)
+const TEMPLATE = fs.readFileSync(__dirname + '/../assets/sdf.frag', 'utf8').replace('//@floor', fs.readFileSync(__dirname + '/../assets/floor.frag', 'utf8'));
+// a function of the template: where it is defined (a type and its name at the start of a line), not where it is called
 function fromTemplate(name) {
-	const at = TEMPLATE.indexOf(`${name}(`);
+	const def = new RegExp(`^\\w+\\s+${name}\\(`, 'm').exec(TEMPLATE);
+	const at = def ? def.index + def[0].length - name.length - 1 : -1;
 	if (at < 0)
 		throw new Error(`${name} is not in the template`);
 	const start = TEMPLATE.lastIndexOf('\n', TEMPLATE.lastIndexOf('\n', at) - 1) + 1;
@@ -40,8 +43,8 @@ function scene(src, probe) {
 	const { sdf } = evaluate(src, 'glass.js');
 	const g = emitGlsl(sdf);
 	const box = bounds3(sdf);
-	const half = box.max.map((v, i) => (v - box.min[i]) / 2);
-	const centre = box.max.map((v, i) => (v + box.min[i]) / 2);
+	const half = (['x', 'y', 'z']).map(c => (box.max[c] - box.min[c]) / 2);
+	const centre = (['x', 'y', 'z']).map(c => (box.max[c] + box.min[c]) / 2);
 	const scale = Math.max(...half);
 	const eps = scale * 2e-4;
 	const v3 = (v) => `vec3(${v.map(x => x.toFixed(9)).join(', ')})`;
@@ -53,7 +56,8 @@ function scene(src, probe) {
 		.replace(/u_floorOn/g, '0.0')
 		.replace(/u_center/g, v3(centre))
 		.replace(/u_half/g, v3(half));
-	const code = [...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}',
+	// (and the template's globals, which its functions keep what they find in)
+	const code = ['int g_steps = 0;', 'vec3 g_hit = vec3(0.0);', 'vec3 g_normal = vec3(0.0);', ...g.helpers, 'vec2 map(vec3 p) {', ...g.body, '\treturn d;', '}',
 		template, probe(eps.toFixed(9), scale.toFixed(9))].join('\n');
 	return {probe: makeMap(code, 'probe'), eps, scale, half};
 }

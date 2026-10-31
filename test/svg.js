@@ -4,11 +4,11 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { evaluate } = require('../out/src/scad/evaluate.js');
-const { FileReader } = require('../out/src/scad/filereader.js');
+const { evaluate } = require('./scadhost.js');
+const { FileReader } = require('../out/src/filereader.js');
 const { SDF } = require('../out/src/scad/sdf.js');
 const evalSdf3 = (s, p) => new SDF(s).eval(p);
-const { meshUniform, checkMesh } = require('../out/src/scad/mesher.js');
+const { meshUniform, checkMesh } = require('./scadhost.js');
 const { float3 } = require('@isopodlabs/maths/vector');
 
 const evalSdf = (sdf, p) => evalSdf3(sdf, float3(p[0], p[1], p[2]));

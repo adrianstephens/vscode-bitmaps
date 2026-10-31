@@ -118,6 +118,12 @@
 						"filenamePattern": "*.3mf"
 					},
 					{
+						"filenamePattern": "*.gltf"
+					},
+					{
+						"filenamePattern": "*.glb"
+					},
+					{
 						"filenamePattern": "*.dxf"
 					},
 					{
@@ -190,8 +196,8 @@
 				"icon": "$(preview)"
 			},
 			{
-				"command": "scad.exportStl",
-				"title": "Export STL…",
+				"command": "scad.openMesh",
+				"title": "Open Mesh (save as STL, 3MF, OBJ, GLB, PLY…)",
 				"icon": "$(package)"
 			},
 			{
@@ -283,7 +289,7 @@
 					"group": "navigation@1"
 				},
 				{
-					"command": "scad.exportStl",
+					"command": "scad.openMesh",
 					"when": "resourceExtname == .scad",
 					"group": "navigation@2"
 				},
@@ -385,8 +391,22 @@
 			]
 		},
 		"configuration": {
-			"title": "OpenSCAD SDF Viewer",
+			"title": "Bitmaps",
 			"properties": {
+				"bitmaps.cascadeIconSize": {
+					"type": "number",
+					"default": 32,
+					"minimum": 16,
+					"maximum": 96,
+					"description": "Size in pixels of the icons in the pop-up (cascade) menus of the editors. Applies to editors opened afterwards."
+				},
+				"bitmaps.cascadeMagnify": {
+					"type": "number",
+					"default": 1.6,
+					"minimum": 1,
+					"maximum": 3,
+					"description": "How much the icons of the pop-up (cascade) menus grow as the pointer passes along them, as the Mac's dock does: 1 turns it off. Applies to editors opened afterwards."
+				},
 				"scad.libraryPath": {
 					"type": "array",
 					"items": {

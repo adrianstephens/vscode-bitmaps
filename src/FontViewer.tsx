@@ -235,6 +235,10 @@ export class FontDocument implements vscode.CustomDocument {
 	private readonly changed = new vscode.EventEmitter<{kind: 'glyph', id: number, own?: boolean} | {kind: 'reload'}>();
 	readonly onDidChange = this.changed.event;
 	readonly edited = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<FontDocument>>();
+	// The last edit of a glyph's outline or drawing, while nothing has been done since, which a later step of it (a nudge, a value still
+	// being turned) changes. 'shown' after an undo, a redo or a reload: the page has been shown the glyph again, so a step of it on
+	// its way is dropped. (after an edit from elsewhere, as of a bitmap, a step is an edit of its own)
+	private latest?: {kind: 'outline' | 'svg', id: number, redo: () => void} | 'shown';
 
 	constructor(public readonly uri: vscode.Uri, private readonly backup?: vscode.Uri) {
 		this.onDidChange(() => this.syncBitmaps());
@@ -247,6 +251,7 @@ export class FontDocument implements vscode.CustomDocument {
 	}
 
 	async load(bytes?: Uint8Array) {
+		this.latest = 'shown';
 		const data = bytes ?? await vscode.workspace.fs.readFile(this.uri);
 		const result = await load(data);
 		if (!result)
@@ -293,38 +298,47 @@ export class FontDocument implements vscode.CustomDocument {
 			this.changed.fire({kind: 'reload'});
 		};
 		this.dirty = true;
+		this.latest = undefined;
 		swap(converted, true);
 		this.edited.fire({document: this, label: 'Convert to TrueType outlines', undo: () => swap(before, false), redo: () => swap(converted, true)});
 	}
 
-	// replaces a glyph's outline, and says how to undo that
-	edit(id: number, points: curveVertex[], label: string) {
-		const font = this.fonts[0];
-		if (!this.editable || !font.glyphdata || !(id >= 0 && id < font.glyphdata.length))
-			throw new Error('this font cannot be edited');
+	// An edit of a glyph, which `make` makes and says how to undo and redo. A later step of the last edit changes that edit: it undoes
+	// to what was before the first step, and redoes to this one.
+	private glyphEdit(kind: 'outline' | 'svg', id: number, label: string, continues: boolean, make: () => {undo: () => void, redo: () => void}) {
+		const latest = this.latest;
+		if (continues && latest === 'shown')
+			return;
+		if (continues && typeof latest === 'object' && latest.kind === kind && latest.id === id) {
+			latest.redo = make().redo;
+			this.changed.fire({kind: 'glyph', id, own: true});
+			return;
+		}
+		const {undo, redo} = make();
+		const made = this.latest = {kind, id, redo};
 		this.dirty = true;
-
-		const {undo, redo} = font.setGlyph(id, {curve: curveOf(points)})!;
 		const apply = (f: ()=>void) => {
+			this.latest = 'shown';
 			f();
 			this.changed.fire({kind: 'glyph', id});
 		};
-		this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(redo)});
-		this.changed.fire({kind: 'glyph', id});
+		this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(made.redo)});
+		this.changed.fire({kind: 'glyph', id, own: true});
+	}
+
+	// replaces a glyph's outline
+	edit(id: number, points: curveVertex[], label: string, continues = false) {
+		const font = this.fonts[0];
+		if (!this.editable || !font.glyphdata || !(id >= 0 && id < font.glyphdata.length))
+			throw new Error('this font cannot be edited');
+		this.glyphEdit('outline', id, label, continues, () => font.setGlyph(id, {curve: curveOf(points)})!);
 	}
 
 	// a glyph's SVG drawing replaced by an edited one, which goes into the document of the SVG table that has it
-	editSvg(id: number, text: string, label: string) {
+	editSvg(id: number, text: string, label: string, continues = false) {
 		const font = this.fonts[0];
 		try {
-			const {undo, redo} = font.setGlyphSVG(id, text);
-			this.dirty = true;
-			const apply = (f: ()=>void) => {
-				f();
-				this.changed.fire({kind: 'glyph', id});
-			};
-			this.edited.fire({document: this, label, undo: () => apply(undo), redo: () => apply(redo)});
-			this.changed.fire({kind: 'glyph', id, own: true});
+			this.glyphEdit('svg', id, label, continues, () => font.setGlyphSVG(id, text));
 		} catch (e) {
 			throw new Error('the SVG drawing of this glyph cannot be edited');
 		}
@@ -336,6 +350,7 @@ export class FontDocument implements vscode.CustomDocument {
 		const was = font.getGlyphImage(id, ppem);
 		const {undo, redo} = font.setGlyphImage(id, ppem, {type: 'png ', originOffset: was?.originOffset ?? float2(0, 0), data});
 		this.dirty = true;
+		this.latest = undefined;
 		const apply = (f: ()=>void) => {
 			f();
 			this.changed.fire({kind: 'glyph', id});
@@ -447,7 +462,7 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 				</div>
 			</div>,
 			<pre id="scad-error" class="hidden" />,
-		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
+		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/pathedit.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
 
 		const file = document.uri.fsPath;
 		const watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
@@ -506,7 +521,7 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 			}
 			case 'editGlyph':
 				try {
-					this.document.edit(message.id, message.points, message.label);
+					this.document.edit(message.id, message.points, message.label, message.continues);
 				} catch (error: any) {
 					vscode.window.showErrorMessage(`Font editor: ${error?.message ?? error}`);
 				}
@@ -521,7 +536,7 @@ class FontViewer extends webview.Panel<MessageOut, MessageIn> {
 			}
 			case 'editGlyphSvg':
 				try {
-					this.document.editSvg(message.id, message.text, message.label);
+					this.document.editSvg(message.id, message.text, message.label, message.continues);
 				} catch (error: any) {
 					vscode.window.showErrorMessage(`Font editor: ${error?.message ?? error}`);
 				}

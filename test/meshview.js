@@ -6,7 +6,12 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { renderData } = require('../out/src/meshdata.js');
+// (renderData is the mesh viewer's, which needs vscode only to be loaded: anything stands in for it)
+const Module = require('module');
+const loadModule = Module._load;
+const anything = new Proxy(function () {}, {get: (_, k) => k === '__esModule' ? true : anything, apply: () => anything, construct: () => anything});
+Module._load = function (request, ...rest) { return request === 'vscode' ? anything : loadModule.call(this, request, ...rest); };
+const { renderData } = require('../out/src/MeshViewer.js');
 const meshes = require('@isopodlabs/binary_meshes');
 const { openPage, asset, pause } = require('./pagehost.js');
 
@@ -56,7 +61,7 @@ function png2x2() {
 		await readyPromise;
 		// a new model keeps the camera, as a reload of the same file does; fit, as the toolbar's button does, to see it
 		const show = async (model, format, name, fit = false) => {
-			const message = await renderData(model, format);
+			const message = {command: 'model', ...await renderData(await model, format)};		// (a reader's model may be on its way)
 			await view.send(message);
 			if (fit)
 				await view.send({command: 'fitToWindow'});

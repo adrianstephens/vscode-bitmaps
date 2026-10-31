@@ -5,7 +5,9 @@ import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
 import { PathEditor, ViewOptions, svgPath } from './pathedit.js';
 import { svgFace, toggleItem, type CascadeItem } from './cascade.js';
 import { createSession } from './svgsession.js';
+import { Steps } from './history.js';
 import type { curveVertex } from '@isopodlabs/binary_fonts';
+import { float2 } from '@isopodlabs/maths/vector';
 
 export interface FontInfo {
 	file:		string;
@@ -54,8 +56,8 @@ export type MessageOut =
 	| {command: 'getGlyphDetail', id: number}
 	| {command: 'status', text: string}
 	| {command: 'convertFont'}
-	| {command: 'editGlyph', id: number, points: curveVertex[], label: string}
-	| {command: 'editGlyphSvg', id: number, text: string, label: string}
+	| {command: 'editGlyph', id: number, points: curveVertex[], label: string, continues?: boolean}
+	| {command: 'editGlyphSvg', id: number, text: string, label: string, continues?: boolean}
 	| {command: 'editGlyphBitmap', id: number}
 	| {command: 'shapePoints', name: string, attributes: Record<string, string>}
 	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean}
@@ -259,6 +261,7 @@ const inspStatus = {
 let inspecting	= -1;
 let glyph:		GlyphDetail | undefined;
 let colourMode	= false;		// whether the glyph's drawing in colour is what is edited, and not its outline
+const outlineSteps = new Steps;	// the steps of what is done to the outline a step at a time (nudges), which are one edit
 
 // the glyph's outline, drawn over its metrics in the view the SVG editor shares, and edited as points
 class GlyphEditor extends PathEditor {
@@ -272,9 +275,14 @@ class GlyphEditor extends PathEditor {
 	active()				{ return !!info && inspecting >= 0 && !colourMode; }
 	status(text: string)	{ inspStatus.textContent = text; }
 
-	commit(label: string) {
-		if (inspecting >= 0 && glyph)
-			post({command: 'editGlyph', id: inspecting, points: glyph.points, label});
+	// (a step of a nudge, say, of the same thing as the one before it changes that edit)
+	commit(label: string, key?: string) {
+		if (inspecting >= 0 && glyph) {
+			const continues = key !== undefined && outlineSteps.step(`${inspecting} ${key}`, label);
+			if (key === undefined)
+				outlineSteps.end();
+			post({command: 'editGlyph', id: inspecting, points: glyph.points, label, continues});
+		}
 	}
 
 	draw() {
@@ -284,15 +292,8 @@ class GlyphEditor extends PathEditor {
 	// the extent of what the glyph occupies: its advance and the font's vertical metrics, and any ink outside them
 	bounds() {
 		const f = info!;
-		let x0 = 0, x1 = f.advances[inspecting] || f.unitsPerEm, y0 = -f.ascent, y1 = -f.descent;
-		const p = glyph?.points ?? [];
-		for (const v of p) {
-			x0 = Math.min(x0, v.x);
-			x1 = Math.max(x1, v.x);
-			y0 = Math.min(y0, v.y);
-			y1 = Math.max(y1, v.y);
-		}
-		return {x0, y0, x1, y1};
+		return float2.extent.from([float2(0, -f.ascent), float2(f.advances[inspecting] || f.unitsPerEm, -f.descent)])
+			.addFrom((glyph?.points ?? []).map(v => float2(v.x, v.y)));
 	}
 
 	metricGuides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) {
@@ -378,7 +379,7 @@ function glyphItems(): CascadeItem[] {
 	return items;
 }
 
-const viewOptions = new ViewOptions({snap: true});
+const viewOptions = new ViewOptions({snap: true, grid: true});
 const editor = new GlyphEditor(inspView, viewOptions);
 
 // a glyph drawn in colour is edited as the SVG it is, by the editor the SVG viewer is: its elements as layers, each with a
@@ -394,7 +395,7 @@ const colour = createSession({
 	home:			() => `glyph${inspecting}`,
 	guides:			(X, Y, w, h) => editor.metricGuides(X, Y, w, h),
 }, {
-	save:			(text, label)		=> post({command: 'editGlyphSvg', id: inspecting, text, label}),
+	save:			(text, label, continues) => post({command: 'editGlyphSvg', id: inspecting, text, label, continues}),
 	shapePoints:	(name, attributes)	=> RPC<curveVertex[]>({command: 'shapePoints', name, attributes}),
 	simplifyPoints:	(points, tol)		=> RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}),
 	fitStroke:		(stroke, tol)		=> RPC<curveVertex[]>({command: 'fitStroke', stroke, tol}),
@@ -437,8 +438,11 @@ function inspect(id: number) {
 		.catch(error => showError(String(error?.message ?? error)));
 }
 
-// a glyph was changed, here or by an undo or redo: whatever shows it is drawn again from the font
+// a glyph was changed, here or by an undo or redo: whatever shows it is drawn again from the font (and a change not made here ends
+// a run of steps, which the font no longer has as its last edit)
 function glyphChanged(id: number, own = false) {
+	if (!own)
+		outlineSteps.end();
 	markup.delete(id);
 	// a drawing of the SVG table may share what it draws with others
 	if (colourMode) {
@@ -723,6 +727,7 @@ window.addEventListener('message', event => {
 	const message = event.data as MessageIn;
 	switch (message.command) {
 		case 'font':
+			outlineSteps.end();
 			setFont(message.info);
 			break;
 		case 'glyphChanged':

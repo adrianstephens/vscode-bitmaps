@@ -108,32 +108,8 @@ body.tensors { display: flex; flex-direction: column; }
 #insp-view > svg { position: absolute; inset: 0; display: block; cursor: grab; touch-action: none; user-select: none; }
 #insp-view > svg:active { cursor: grabbing; }
 
-.insp-minor { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.12; fill: none; }
-.insp-major { stroke: var(--vscode-editorLineNumber-foreground); stroke-opacity: 0.3; fill: none; }
-.insp-labels text { font-size: 9px; fill: var(--vscode-editorLineNumber-foreground); }
-.insp-labels text.right { text-anchor: end; }
-.insp-base { stroke: var(--vscode-charts-blue); }
-.insp-metric-line { stroke: var(--vscode-charts-purple); stroke-dasharray: 4 3; stroke-opacity: 0.8; }
-.insp-metric { font-size: 10px; fill: var(--vscode-charts-purple); }
-.insp-fill { color: var(--vscode-editor-foreground); opacity: 0.28; }
-.insp-outline { fill: none; stroke: var(--vscode-editor-foreground); stroke-width: 1.5; }
-.insp-polygon { fill: none; stroke: var(--vscode-charts-orange); stroke-width: 1; stroke-opacity: 0.7; stroke-dasharray: 3 2; }
-.insp-pt { stroke: var(--vscode-editor-background); stroke-width: 1; }
-.insp-pt.k0, .insp-pt.k1 { fill: var(--vscode-charts-green); }
-.insp-pt.k0, .insp-pt.k4 { fill: var(--vscode-charts-red); }
-.insp-pt.k2, .insp-pt.k3 { fill: var(--vscode-charts-orange); }
-.insp-pt.hover, .insp-pt.picked { stroke: var(--vscode-editor-foreground); stroke-width: 1.5; }
-.insp-num { font-size: 9px; fill: var(--vscode-editor-foreground); opacity: 0.8; pointer-events: none; }
 
 #insp-edit { display: flex; align-items: center; gap: 8px; }
 #insp-edit.hidden { display: none; }
 
-.insp-hit { fill: none; stroke: transparent; stroke-width: 10; pointer-events: stroke; cursor: inherit; }
-.insp-pt { cursor: inherit; }
-.insp-xf-box { fill: var(--vscode-focusBorder); fill-opacity: 0.05; stroke: var(--vscode-focusBorder); stroke-width: 1; pointer-events: none; }
-.insp-xf-grid { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 1; stroke-opacity: 0.4; pointer-events: none; }
-.insp-xf-handle { fill: var(--vscode-editor-background); stroke: var(--vscode-focusBorder); stroke-width: 1.5; pointer-events: none; }
-.insp-selected { fill: none; stroke: var(--vscode-focusBorder); stroke-width: 3; opacity: 0.8; pointer-events: none; }
-.insp-pt.in-contour { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
 
-.insp-fill.colored { opacity: 0.9; }
