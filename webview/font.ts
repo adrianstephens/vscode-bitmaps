@@ -2,11 +2,11 @@
 // view, a line of sample text set in the font, and the metrics of the glyph that is selected.
 import { vscode, createElement, createSVGElement, RPC, handleResult, Splitter } from '@isopodlabs/vscode_utils/webview/shared.js';
 import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
-import { PathEditor, ViewOptions, svgPath } from './pathedit.js';
+import { PathEditor, ViewOptions, svgPath, simplifyPoints, fitStroke, gridSpacing, gridDraw, View, DEFAULT_OPTIONS } from './pathedit.js';
 import { svgFace, toggleItem, type CascadeItem } from './cascade.js';
 import { createSession } from './svgsession.js';
 import { Steps } from './history.js';
-import type { curveVertex } from '@isopodlabs/binary_fonts';
+import type { curveVertex } from '@isopodlabs/binary_fonts/curves';
 import { float2 } from '@isopodlabs/maths/vector';
 
 export interface FontInfo {
@@ -59,9 +59,7 @@ export type MessageOut =
 	| {command: 'editGlyph', id: number, points: curveVertex[], label: string, continues?: boolean}
 	| {command: 'editGlyphSvg', id: number, text: string, label: string, continues?: boolean}
 	| {command: 'editGlyphBitmap', id: number}
-	| {command: 'shapePoints', name: string, attributes: Record<string, string>}
-	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean}
-	| {command: 'fitStroke', stroke: number[], tol: number};
+	| {command: 'shapePoints', name: string, attributes: Record<string, string>};
 
 export type MessageIn =
 	| {command: 'font', info: FontInfo}
@@ -269,7 +267,7 @@ class GlyphEditor extends PathEditor {
 	protected yUp = true;
 	
 	points()				{ return glyph?.points; }
-	simplifyPoints(points: curveVertex[], tol: number) { return RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: false}); }
+	simplifyPoints(points: curveVertex[], tol: number) { return simplifyPoints(points, tol, false); }
 	// a glyph is edited when the font can be written and the glyph is a plain outline (not made of other glyphs)
 	canEdit()				{ return !!(info?.editable && glyph && !glyph.components.length && !glyph.error); }
 	active()				{ return !!info && inspecting >= 0 && !colourMode; }
@@ -289,6 +287,21 @@ class GlyphEditor extends PathEditor {
 		super.draw();
 	}
 
+	protected paper(view: View, w: number, h: number) {
+		let back = '';
+
+		if (this.option('grid')) {
+			this.gridStep	= gridSpacing(view.s);
+			back += gridDraw(view, w, h, this.gridStep, this.yUp);
+		}
+
+		if (this.option('metrics'))
+			back += this.metricGuides(view, w, h);
+			
+		return back;
+		
+	}
+
 	// the extent of what the glyph occupies: its advance and the font's vertical metrics, and any ink outside them
 	bounds() {
 		const f = info!;
@@ -296,11 +309,9 @@ class GlyphEditor extends PathEditor {
 			.addFrom((glyph?.points ?? []).map(v => float2(v.x, v.y)));
 	}
 
-	metricGuides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) {
-		return this.guides(X, Y, w, h);
-	}
-
-	protected guides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) {
+	metricGuides(view: View, w: number, h: number) {
+		const {s, t} = view;
+		const X = (x: number) => x * s + t.x, Y = (y: number) => y * s + t.y;
 		const f = info!, adv = f.advances[inspecting] ?? 0;
 		const line = (cls: string, x1: number, y1: number, x2: number, y2: number, label: string, lx: number, ly: number) =>
 			`<line class="${cls}" x1="${num(x1)}" y1="${num(y1)}" x2="${num(x2)}" y2="${num(y2)}"/><text class="insp-metric" x="${num(lx)}" y="${num(ly)}">${label}</text>`;
@@ -379,7 +390,7 @@ function glyphItems(): CascadeItem[] {
 	return items;
 }
 
-const viewOptions = new ViewOptions({snap: true, grid: true});
+const viewOptions = new ViewOptions({...DEFAULT_OPTIONS, snap: true, grid: true, metrics: true});
 const editor = new GlyphEditor(inspView, viewOptions);
 
 // a glyph drawn in colour is edited as the SVG it is, by the editor the SVG viewer is: its elements as layers, each with a
@@ -387,18 +398,17 @@ const editor = new GlyphEditor(inspView, viewOptions);
 const colour = createSession({
 	view:			inspView,
 	options:		viewOptions,
-	views:			['metrics'],
 	pageItems: 	() => glyphItems(),
 	tree:			$('font-layer-tree'),
 	props:			$('font-layer-props'),
 	active:			() => colourMode && inspecting >= 0,
 	home:			() => `glyph${inspecting}`,
-	guides:			(X, Y, w, h) => editor.metricGuides(X, Y, w, h),
+	guides:			(view, w, h) => editor.metricGuides(view, w, h),
 }, {
 	save:			(text, label, continues) => post({command: 'editGlyphSvg', id: inspecting, text, label, continues}),
 	shapePoints:	(name, attributes)	=> RPC<curveVertex[]>({command: 'shapePoints', name, attributes}),
-	simplifyPoints:	(points, tol)		=> RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}),
-	fitStroke:		(stroke, tol)		=> RPC<curveVertex[]>({command: 'fitStroke', stroke, tol}),
+	simplifyPoints:	(points, tol)		=> simplifyPoints(points, tol, true),
+	fitStroke,
 	status:			text				=> { inspStatus.textContent = text; },
 	error:			message				=> message ? showError(message) : errorBox.classList.add('hidden'),
 });

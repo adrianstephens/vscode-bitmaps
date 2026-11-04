@@ -5,17 +5,19 @@ import * as vscode from 'vscode';
 import * as webview from '@isopodlabs/vscode_utils/webview';
 import * as path from 'path';
 
-import { parse, type UserModule } from './scad/parser';
 import { files, setActiveViewer, readShader, digitAtlas } from './extension';
 import { webviewPage } from './BitmapViewer';
 import type { MessageOut, MessageIn } from '../webview/sdf';
+import { parse } from './scad/parser';
 import { evaluate, evaluateCsg } from './scad/evaluate';
+import { renderScad } from './scad/render';
 import { buildIndex } from './fonts';
 import * as SDF from './scad/sdf';
-import { float3, float4 } from '@isopodlabs/maths/vector';
+import { float4 } from '@isopodlabs/maths/vector';
+import { Yielder } from '@isopodlabs/binary_bitmaps';
 
-import { modelOf, checkMesh, mesher, type Material } from '@isopodlabs/binary_meshes';
-import { openModel } from './MeshViewer';
+import { modelOf, checkMesh, fillHoles, mesher, type Material } from '@isopodlabs/binary_meshes';
+import { MeshViewerProvider } from './MeshViewer';
 
 const DEBOUNCE = 250;		// ms of quiet before a keystroke is evaluated
 
@@ -66,90 +68,13 @@ class ScadViewer extends webview.Panel<MessageOut, MessageIn> {
 	// what the current text says the model is
 	private async render() {
 		const which		= ++this.renders;
-		const source	= this.document.getText();
-		const name		= this.document.uri.fsPath;
 		try {
-			const file		= await files.with(() => parse(source, name, files));
-			const modules	= [...file.scope.modules.values()];
-			const callable	= (m: UserModule) => m.parameters.every(p => p.expr);
-			const names		= [...modules.filter(callable), ...modules.filter(m => !callable(m))].map(m => m.name);
-
-			if (this.run && !names.includes(this.run))
-				this.run = undefined;
-
-			//const text = this.run ? `${source}\n${this.run}();\n` : source;
-			const {sdf, warnings, box, camera} = await files.with(() => evaluate(file, name, files, {$preview: true, $entry: this.run}));
-
-			this.postMessage({command: 'modules', names: !box || this.run ? names : [], running: this.run});
-
-			if (!box || !Number.isFinite(box.min.x) || !Number.isFinite(box.min.y) || !Number.isFinite(box.min.z)) {
-				//this.postMessage({command: 'error', message: `nothing is drawn: ${!box ? 'no geometry reached the top level (check the conditions around it)' : 'the geometry has no finite extent'}.${warnings.length ? `\n\nThe evaluator also reported:\n  ${warnings.join('\n  ')}` : ''}`});
-				return;
-			}
-		
-			const center	= box.max.add(box.min).scale(0.5);
-			const size		= box.max.sub(box.min);
-			
-			let stripped = false;
-			let sdf2 = sdf.walk((sdf, process) => {
-				switch (sdf.k) {
-					case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
-						stripped = true;
-						return SDF.empty;
-					case 'offset': case 'extrude': case 'revolve':
-						return sdf;			// these are what a 2-D shape is for
-					default:
-						return process(sdf);
-				}
-			});
-
-			if (stripped) {
-				warnings.push('a 2-D shape (circle, square or polygon) outside linear_extrude/rotate_extrude, which the viewer draws as a flat sheet and an export leaves out');
-
-				const thickness = Math.max(size.x, size.y, size.z) * 1e-3;
-				const sheet = (body: SDF.Sdf): SDF.Sdf => ({k: 'extrude', h: thickness, center: true, body});
-
-				const flat = sdf.walk((s, process) => {
-					switch (s.k) {
-						case 'circle2': case 'square2': case 'polygon2': case 'curvepath2': case 'stadium2': case 'offset':
-							return sheet(s);
-						case 'union':
-							// one sheet for a union of shapes, as one extrude takes them, so a big union is still one the batch can hold
-							return s.children.every(SDF.is2d) ? sheet(s) : process(s);
-						case 'intersection':
-							return s.children.every(SDF.is2d) ? sheet(s) : SDF.empty;
-						case 'difference':
-							return SDF.is2d(s.base) ? sheet(s) : SDF.empty;
-						case 'domain':
-							return SDF.is2d(s.body) ? sheet(s) : SDF.empty;
-						case 'material':
-							return process(s);
-						default:
-							return SDF.empty;
-					}
-				});
-				
-				sdf2 = SDF.union([sdf2, flat]);
-			}
-
-			const palette	= SDF.materials(sdf2);
-
-			const {helpers, body, data} = SDF.emitGlsl(sdf2);
-			// map() returns the distance and the material together, so both come out of the one evaluation
-			const code		= [...helpers, 'vec2 map(vec3 p) {', ...body, '\treturn d;', '}'].join('\n');
-			const count		= SDF.countPrimitives(sdf2);
-
-			if (which !== this.renders || this.disposed)
-				return;
-
-			this.postMessage({
-				command:	'sdf',
-				code, data, center,
-				half:		size.scale(0.5).add(float3(1e-3, 1e-3, 1e-3)),
-				info:		`${count} primitives, ${size._values.map(v => v.toFixed(1)).join(' x ')} mm, ${helpers.length} generated functions${palette.length > 1 ? `, ${palette.length - 1} material${palette.length === 2 ? '' : 's'}` : ''}`,
-				warnings,
-				camera,
-			});
+			const {run, names, drawn, model} = await renderScad(this.document.getText(), this.document.uri.fsPath, files, this.run, () => which !== this.renders || this.disposed);
+			this.run = run;
+			// a text that draws something of itself has no need of the modules to be offered, unless one is being run
+			this.postMessage({command: 'modules', names: !drawn || run ? names : [], running: run});
+			if (model)
+				this.postMessage({command: 'sdf', ...model});
 		} catch (error: any) {
 			this.postMessage({command: 'error', message: `${error?.message ?? error}`});
 		}
@@ -277,25 +202,39 @@ export async function exportMesh(target: vscode.Uri) {
 		// only a file with a color() (or a $ material) in it has anything to say about colour
 		const palette	= sdf.materials();
 		const materials	= palette.length > 1;
-		const mesh		= await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: 'Meshing', cancellable: true}, (progress, token) => {
-			// (the notification's bar goes by increments, of the share of the refining that is done since the last)
-			let shown = 0;
-			return mesher.meshAdaptive(sdf, {
+		// (the notification's bar goes by increments, of the share of the stage that is done since the last)
+		const reporter = (progress: vscode.Progress<{message?: string; increment?: number}>) => {
+			let shown = 0, digits = 1;
+			return (message: string, fraction?: number) => {
+				const percent = fraction === undefined ? shown : fraction * 100;
+				if (Math.floor(percent * digits) === Math.floor(shown * digits))
+					digits *= 10;
+				else if (digits > 100)
+					digits /= 10;
+				progress.report({message: fraction === undefined ? message : `${message} ${Math.floor(percent * digits) / digits}%`, increment: Math.max(0, percent - shown)});
+				shown = Math.max(shown, percent);
+			};
+		};
+		const meshed	= await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: 'Meshing', cancellable: true}, (progress, token) =>
+			mesher.meshAdaptive(sdf, {
 				materials,
 				// the smallest cells, a few times the tolerance
 				cells: Math.min(8192, Math.max(256, Math.ceil(longest / (picked.tolerance * 4)))),
 				tolerance: picked.tolerance,
-				progress: (message, fraction) => {
-					const percent = fraction === undefined ? shown : Math.floor(fraction * 100);
-					progress.report({message: fraction === undefined ? message : `${message} ${percent}%`, increment: Math.max(0, percent - shown)});
-					shown = Math.max(shown, percent);
-				},
-				cancelled: () => token.isCancellationRequested,
-			});
-		});
-		
-		if (!mesh.faces.length)
+				progress: reporter(progress),
+				yield: Yielder(15, () => token.isCancellationRequested)
+			})
+		);
+
+		if (!meshed.faces.length)
 			throw 'the model produced no surface. Try a finer setting.';
+
+		// A cube holds one vertex, so where the surface passes through it twice (a filament, a sheet thinner than the cube, a
+		// pinch) the mesh is left with holes and folds. Shut the holes; what is left is the folds.
+		const openBefore = checkMesh(meshed).open;
+		const mesh = await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: 'Filling holes', cancellable: true}, (progress, token) =>
+			fillHoles(meshed, {progress: reporter(progress), yield: Yielder(15, () => token.isCancellationRequested)})
+		) as typeof meshed;
 
 		// the materials the faces have, in the order of the palette, and no others
 		const used = materials ? palette.map((_, i) => i).filter(i => mesh.faceMaterials!.includes(i)) : [];
@@ -311,9 +250,10 @@ export async function exportMesh(target: vscode.Uri) {
 			extra += ` (${fns > 1 ? `${fns} colours that are` : 'a colour that is'} a function of the point, as one colour each)`;
 
 		// (shown beside the source, as an unsaved .stl until it is given a name)
-		await openModel(path.basename(target.fsPath, '.scad') + '.stl', model);
+		await MeshViewerProvider.open(path.basename(target.fsPath, '.scad'), model);
 
 		const stats		= checkMesh(mesh);
+		const filled	= openBefore - stats.open;
 		const seconds	= ((Date.now() - started) / 1000).toFixed(1);
 		const problems	= [
 			stats.open			? `${stats.open} open edges` : '',
@@ -321,7 +261,7 @@ export async function exportMesh(target: vscode.Uri) {
 			stats.inconsistent	? `${stats.inconsistent} flipped edges` : '',
 		].filter(Boolean);
 
-		const summary = `Meshed ${stats.triangles.toLocaleString()} triangles${extra} (within ${picked.tolerance} mm, ${seconds} s); Save As to write it`;
+		const summary = `Meshed ${stats.triangles.toLocaleString()} triangles${extra} (within ${picked.tolerance} mm, ${seconds} s${filled > 0 ? `; ${filled.toLocaleString()} open edges filled` : ''}); Save As to write it`;
 		// a wall or gap thinner than the finest cell passes between its corners, and is left out rather than drawn wrong
 		const thin = mesh.thin ? ` ${mesh.thin.toLocaleString()} of the finest cells (${mesh.cell.toPrecision(2)} mm) hold a wall or gap thinner than they are, which the mesh leaves out; a finer setting would keep it.` : '';
 		if (problems.length)
@@ -334,8 +274,6 @@ export async function exportMesh(target: vscode.Uri) {
 	} catch (error: any) {
 		if (error instanceof mesher.TooFine)
 			vscode.window.showErrorMessage(`Mesh: this model is too detailed to mesh that finely (${error.message}). Try a coarser setting.`);
-		else if (error instanceof mesher.Cancelled)
-			vscode.window.showInformationMessage('Mesh cancelled.');
 		else
 			vscode.window.showErrorMessage(`Mesh: ${error?.message ?? error}`);
 	}
@@ -355,3 +293,4 @@ export async function exportCsg(target: vscode.Uri, destination: vscode.Uri) {
 		vscode.window.showErrorMessage(`Export CSG: ${error?.message ?? error}`);
 	}
 }
+export const zzProbe = 1;

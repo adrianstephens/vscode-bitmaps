@@ -1,21 +1,23 @@
 import { handleResult, sendResult, RpcMessage, createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { ShaderProgram, cubeGeometry, bitmapToImage, getImageData, getPixel, asRGBA, RGBAPixels, imageRect } from './opengl.js';
 import { float2, float3, float3x3, float4, float4x4, normalise, lerp, orthonormalise, matmulExt } from '@isopodlabs/maths/vector';
 import { unitQuaternion } from '@isopodlabs/maths/quaternion';
+import type { psd } from '@isopodlabs/binary_bitmaps';
+
+import { ShaderProgram, cubeGeometry, bitmapToImage, getImageData, getPixel, Pixels, imageRect } from './opengl.js';
+import { asRGBA } from './colour.js';
 import { Selection } from './bitmapSelection.js';
-import type { DocumentChange, TransformTarget, TransformSession } from './transform.js';
+import { Transformer, type TransformSession } from './transform.js';
 import { SheetFan, SheetFanHost, Placement } from './sheetfan.js';
-import { CascadeItem, toggleItem, svgFace } from './cascade.js';
+import { CascadeItem, CascadeDrag, toggleItem, svgFace, reversed, icons as cascadeIcons } from './cascade.js';
 import { liftSelection, warpSelected, crop, flip, rotate, drawQuad } from './raster.js';
-import { carriedBounds, shiftCarry, planar } from './transformbox.js';
+import { carriedBounds, shiftCarry, planar, transformIcons } from './transformbox.js';
 import { Orbit, OrbitHooks, DEFAULT_FOVY } from './orbit.js';
 import { Gizmo } from './gizmo.js';
 import { Input, Place } from './navigate.js';
-import type { psd } from '@isopodlabs/binary_bitmaps';
-import type { curveVertex } from '@isopodlabs/binary_fonts';
 import type { GlyphRun } from './textedit.js';
-import { Dropped, AtlasMode, $, canvas, canvas3d, tooltip, programBG, programLayer, loadPrograms, shader, postMessage, planeMvp, flatView, stackIcon, menuIcon, viewToggle, viewItem, Mode, PanMode, PictureMode, layerChooser, mode, openMenu, history, warpPixels, Drag, reversed } from './modes.js';
-import { LayeredMode, newLayer } from './layers.js';
+import { Dropped, AtlasMode, $, canvas3d, programBG, programLayer, loadPrograms, shader, postMessage, planeMvp, flatView, stackIcon, menuIcon, viewToggle, Mode, PanMode, PictureMode, layerChooser, mode, history } from './modes.js';
+import { LayeredMode, newLayer, type PixelLayer } from './layers.js';
+import { upscale, upscaleItem } from './neural.js';
 
 //-----------------------------------------------------------------------------
 // what crosses between the extension and the page
@@ -50,22 +52,23 @@ export interface RawImage {
 	layers?: LayerData[];
 }
 
-export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d'|'layer'|'composite'|'planes'|'warp'|'blur'|'levels'|'convolve'|'effect'|'textwarp'|'gradient';
+export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d'|'layer'|'composite'|'planes'|'warp'|'blur'|'levels'|'convolve'|'flatten'|'ink'|'effect'|'textwarp'|'gradient';
 export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'getShaders', type: shaderType, requestId: number}//result: {vert: string, frag: string}};
-	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean, requestId: number}	//result: curveVertex[]
-	| {command: 'fitStroke', stroke: number[], tol: number, requestId: number}	//result: curveVertex[]
+	| {command: 'saveSvg', text: string}	// markup to be saved as a file and opened in the SVG editor
 	| {command: 'installedFonts', requestId: number}	//result: InstalledFont[] (family, style and PostScript name of each font the machine has)
+	| {command: 'model', name: 'sam-encoder' | 'sam-decoder' | 'lama' | 'esrgan' | `style-${'mosaic' | 'candy' | 'rain-princess' | 'udnie' | 'pointilism'}` | 'adain-vgg' | 'adain-decoder', requestId: number}	//result: ArrayBuffer (the network's ONNX file, which the extension fetches the first time)
+	| {command: 'pickImage', requestId: number}	//result: {name: string, data: ArrayBuffer} | undefined (a picture file the user chooses, as it is)
 	| {command: 'glyphOutlines', runs: GlyphRun[], requestId: number}	//result: {curve: curveVertex[], missing: number} (the text as contours of cubics, in the runs' units)
 	| {command: 'edited', label: string};	// the image has been changed, undoably
 
 export type MessageIn =
-	| {command: 'load2d', image: RGBAPixels, layers?: LayerData[]}	// layers, bottom first, over the canvas the image is the size of
-	| {command: 'load2dArray', image: RGBAPixels, layers: number}
-	| {command: 'loadCube', image: RGBAPixels}
-	| {command: 'load3d', image: RGBAPixels, depth: number}
+	| {command: 'load2d', image: Pixels<4>, layers?: LayerData[]}	// layers, bottom first, over the canvas the image is the size of
+	| {command: 'load2dArray', image: Pixels<4>, layers: number}
+	| {command: 'loadCube', image: Pixels<4>}
+	| {command: 'load3d', image: Pixels<4>, depth: number}
 	| {command: 'loadTexture', data: ArrayBuffer, mimeType: string}
 	| {command: 'imageOp', op: string}	// do a whole-image editing operation, or one to the layers
 	| {command: 'undo'}
@@ -82,11 +85,33 @@ export type MessageRpc =
 
 // a plain image
 class ImageMode extends PictureMode {
+	readonly transformer: Transformer;
 
 	constructor(image: ImageData, program2D: ShaderProgram) {
 		super(image, program2D);
+		this.transformer = new Transformer(this, this.canvas, $('transform-overlay'), history);
 		this.setTexture(canvas3d.createTextureFromImage(image));
 	}
+
+	override menu() {
+		const runItem = (id: string, icon: string, caption: string): CascadeItem => ({
+			id,
+			face:		() => svgFace(icon),
+			caption:	() => caption,
+			select:		() => (this.run(id), true)
+		});
+
+		return [...super.menu(), ...this.transformer.menu([
+			this.transformer.item('transform-image', cascadeIcons.transform, 'Free Transform (Enter applies, Esc cancels)', () => this.beginTransform()),
+			runItem('flipHorizontal',		transformIcons.flipH, 'Flip Horizontal'), 				
+			runItem('flipVertical',			transformIcons.flipV, 'Flip Vertical'), 					
+			runItem('rotateClockwise',		transformIcons.rotateCW, 'Rotate 90° Clockwise'), 		
+			runItem('rotateAnticlockwise',	transformIcons.rotateACW, 'Rotate 90° Anticlockwise'), 	
+			runItem('crop',					'<path d="M4.5 1.5v10h10M1.5 4.5h10v10"/>', 'Crop to Selection'),
+			upscaleItem(op => this.run(op)),
+		])];
+	}
+
 	static async create(im: ImageData) {
 		return new ImageMode(im, await shader('2d'));
 	}
@@ -107,74 +132,118 @@ class ImageMode extends PictureMode {
 		return asRGBA(getPixel(this.image, x, y));
 	}
 
-	override changed(changed: RGBAPixels, rect?: float2.extent) {
+	override changed(changed: Pixels<4>, rect?: float2.extent) {
 		if (this.texture && this.image)
 			canvas3d.updateTexture(this.texture, this.image, rect);
 		this.redraw();
 	}
-	protected override shownBy(image: RGBAPixels) {
-		return image === this.image && this.texture ? {texture: this.texture, drawn: () => this.redraw()} : undefined;
+	override shownBy(image: Pixels<4>) {
+		if (image === this.image && this.texture) {
+			const base = canvas3d.offscreenOn(this.texture, image.width, image.height);
+			return base && {
+				...base,
+				end: () => { base.end(); this.redraw(); },
+			};
+		}
 	}
 
-	// the start of a transform: the whole canvas
-	override beginTransform(target: TransformTarget, selection?: Selection): TransformSession | undefined {
+	beginTransform(): TransformSession | undefined {
 		if (!this.image || !programLayer)
 			return undefined;
-		if (!selection)
-			return this.wholeSession();
-		// what is selected is carried, over the picture with it taken from it
-		const image = this.image, whole = imageRect(image), {floating, rest} = liftSelection(image, selection);
-		const own = canvas3d.createTextureFromImage(floating);
-		canvas3d.updateTexture(this.texture!, rest);
-		return {
-			box: selection.bounds(), target: 'image', selection,
-			update: carry => {
-				const [matrix, warp] = planar(carry);
-				this.preview = () => {
-					this.drawFlat();
-					drawQuad(canvas3d, programLayer, own, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
-				};
-				this.redraw();
-			},
-			end: () => {
-				this.preview = undefined;
-				canvas3d.deleteTexture(own);
-				canvas3d.updateTexture(this.texture!, image);
-				this.redraw();
-			},
-		};
+		const before	= this.image, whole = imageRect(before);
+		const selection	= this.selection();
+		if (!selection) {
+			return {
+				box: whole, label: 'Transform Image', pinned: true,
+				update: carry => {
+					const [matrix, warp] = planar(carry);
+					this.preview = () => {
+						programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
+						drawQuad(canvas3d, programLayer, before, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+					};
+					this.redraw();
+				},
+				end: carry => {
+					this.preview = undefined;
+					this.redraw();
+					if (!carry)
+						return;
+					const onto = carriedBounds(carry, imageRect(before));
+					const size = onto?.size();
+					if (!onto || !size!.x || !size!.y)
+						return undefined;
+					const r = Mode.warpPixels(before, shiftCarry(carry, float2(0, 0), onto.min.neg()), float2.extent.fromSize(float2(0, 0), size!));
+					const after = new ImageData(r.data as Uint8ClampedArray<ArrayBuffer>, r.width, r.height);
+
+					const show = (im: ImageData) => () => {
+						const self = this.live;
+						self.image		= im;
+						self.setTexture(canvas3d.createTextureFromImage(im));
+						this.pan.width	= im.width;
+						this.pan.height	= im.height;
+						self.fit();
+						self.redraw();
+					};
+					show(after)();
+					return {undo: show(before), redo: show(after)};
+				},
+			};
+		} else {
+			// what is selected is carried, over the picture with it taken from it
+			const {floating, rest} = liftSelection(before, selection);
+			const own	= canvas3d.createTextureFromImage(floating);
+			canvas3d.updateTexture(this.texture!, rest);
+
+			return {
+				box: selection.bounds(), label: 'Free Transform', selection,
+				update: carry => {
+					const [matrix, warp] = planar(carry);
+					this.preview = () => {
+						this.drawFlat();
+						drawQuad(canvas3d, programLayer, own, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+					};
+					this.redraw();
+				},
+				end: carry => {
+					this.preview = undefined;
+					canvas3d.deleteTexture(own);
+					canvas3d.updateTexture(this.texture!, before);
+					this.redraw();
+					if (!carry)
+						return;
+					const r		= warpSelected(before, selection, carry, Mode.warpPixels);
+					const s		= Mode.warpSelection(selection, carry, imageRect(before));
+					const after = new ImageData(r.data as Uint8ClampedArray<ArrayBuffer>, r.width, r.height);
+
+					const show = (im: ImageData, sel?: Selection) => () => {
+						const self = this.live;
+						self.image		= im;
+						self.setSelection(sel);
+						self.setTexture(canvas3d.createTextureFromImage(im));
+						self.redraw();
+					};
+					show(after, s)();
+					return {undo: show(before), redo: show(after, s)};
+				},
+			};
+		}
 	}
 
-	override transform(change: DocumentChange) {
-		if (!this.image)
-			return undefined;
+	private transform(op: string, apply: (m: Pixels<4>) => Pixels<4>, resizes = false) {
 		const before = this.image;
-		let r: RGBAPixels;
-		switch (change.kind) {
-			case 'flip':	r = flip(before, change.horizontal); break;
-			case 'rotate':	r = rotate(before, change.clockwise); break;
-			case 'crop':	r = crop(before, change.rect); break;
-			case 'warp': {
-				if (change.selection) {
-					r = warpSelected(before, change.selection, change.carry, warpPixels);
-					break;
-				}
-				// the picture within its canvas, or onto a canvas which fits it
-				const onto = change.target === 'layer' ? imageRect(before) : carriedBounds(change.carry, imageRect(before));
-				const size = onto?.size();
-				if (!onto || !size!.x || !size!.y)
-					return undefined;
-				r = warpPixels(before, shiftCarry(change.carry, float2(0, 0), onto.min.neg()), float2.extent.fromSize(float2(0, 0), size!));
-				break;
-			}
-		}
+		if (!before)
+			return false;
+
+		const r: Pixels<4>  = apply(before);
 		const after = new ImageData(r.data as Uint8ClampedArray<ArrayBuffer>, r.width, r.height);
+		const sel = this.selection();
+
 		// within the canvas, the view stays as it is
 		const show = (im: ImageData) => () => {
 			const self = this.live;
 			self.image		= im;
 			self.setTexture(canvas3d.createTextureFromImage(im));
-			if (change.kind !== 'warp' || !(change.target === 'layer' || change.selection)) {
+			if (!sel || resizes) {
 				this.pan.width	= im.width;
 				this.pan.height	= im.height;
 				self.fit();
@@ -182,27 +251,49 @@ class ImageMode extends PictureMode {
 			self.redraw();
 		};
 		show(after)();
-		return {undo: show(before), redo: show(after)};
+		history.push({undo: show(before), redo: show(after)}, op);
+		return true;
 	}
+	
 
 	// the faces of the picture, if it is shaped like a cubemap
 	override async run(op: string) {
-		if (op !== 'toCubemap')
-			return super.run(op);
-		const faces = cubeFaces(this.image!);
-		if (faces)
-			await load(CubeMode.create(faces));
-		else
-			postMessage({command: 'error', message: 'The image is not laid out as a cubemap: it should be square, 6x1 or 1x6 faces, or a 4x3 or 3x4 cross.'});
-		return true;
+		const sel = this.selection();
+		switch (op) {
+			case 'flipHorizontal':		return this.transform(op, i => flip(i, true));
+			case 'flipVertical':		return this.transform(op, i => flip(i, false));
+			case 'rotateClockwise':		return this.transform(op, i => rotate(i, true));
+			case 'rotateAnticlockwise':	return this.transform(op, i => rotate(i, false));
+			case 'crop':				return !sel ? false : this.transform(op, i => crop(i, sel.bounds()));
+			case 'upscale2':
+			case 'upscale4':
+			case 'upscale8': {
+				const result = await upscale(this.image, Number(op.slice(7)) as 2 | 4 | 8);
+				return !!result && this.transform('Upscale', () => result, true);
+			}
+			case 'toCubemap': {
+				const faces = cubeFaces(this.image!);
+				if (faces)
+					await load(CubeMode.create(faces));
+				else
+					postMessage({command: 'error', message: 'The image is not laid out as a cubemap: it should be square, 6x1 or 1x6 faces, or a 4x3 or 3x4 cross.'});
+				return true;
+			}               	
+			default:
+				return super.run(op);
+		}
 	}
 
-	// Images dropped on it make it a picture with layers (it is the background): all of it one edit
+	// Images dropped on it make it a picture with layers
 	protected override async dropped(items: Dropped[]) {
+		await this.addLayers(items.map(it => newLayer(it.name, {data: it.pixels.data, width: it.pixels.width, height: it.pixels.height})), items.length > 1 ? 'Add Layers' : 'Add Layer');
+	}
+
+	// Layers put over it make it a picture with layers (it is the background): all of it one edit
+	async addLayers(made: PixelLayer[], label: string) {
 		const program2D = this.program2D, composite = await shader('composite'), effect = await shader('effect');
 		const image		= this.image, {width, height} = image;
 		const bg		= newLayer('Background', {data: new Uint8ClampedArray(image.data), width, height});
-		const made		= items.map(it => newLayer(it.name, {data: it.pixels.data, width: it.pixels.width, height: it.pixels.height}));
 		const layers	= [bg, ...made];
 		// (the same picture, seen from the same place)
 		const switchTo = (next: PanMode) => {
@@ -213,10 +304,12 @@ class ImageMode extends PictureMode {
 			Mode.enter(next);
 			mode.redraw();
 		};
-		const redo = () => switchTo(new LayeredMode(image, layers, program2D, composite, effect));
+		// (the picture with layers makes its picture of them in its own, and this one's is put back by undoing)
+		const own		= new ImageData(new Uint8ClampedArray(image.data), width, height);
+		const redo = () => switchTo(new LayeredMode(own, layers, program2D, composite, effect));
 		const undo = () => switchTo(new ImageMode(image, program2D));
 		redo();
-		history.record(made.length > 1 ? 'Add Layers' : 'Add Layer', undo, redo);
+		history.record(label, undo, redo);
 	}
 }
 
@@ -226,7 +319,7 @@ class ImageMode extends PictureMode {
 //-----------------------------------------------------------------------------
 
 // an array of slices
-type Slice = RGBAPixels;
+type Slice = Pixels<4>;
 
 
 const THUMB_SIZE = 26;
@@ -234,14 +327,14 @@ const THUMB_SIZE = 26;
 // A layer as it is on the picture (the rectangle `area`), small (THUMB_SIZE across at most), over a chequerboard: what tells a
 // layer apart. It is shrunk by warp, which averages what a pixel covers. A layer's styles are drawn over it (`more`, each with the
 // opacity it is drawn at), as they are over the layer.
-export function stripThumb(image: RGBAPixels) {
+export function stripThumb(image: Pixels<4>) {
 	const k		= THUMB_SIZE / Math.max(image.width, image.height);
 	const w		= Math.max(1, Math.round(image.width * k)), h = Math.max(1, Math.round(image.height * k));
 	const canvas = createElement('canvas', {width: w, height: h});
 	const ctx	= canvas.getContext('2d')!;
 	const out	= ctx.createImageData(w, h);
 	const small = image.width && image.height
-		? warpPixels(image, float3x3(float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1)), new float2.extent(float2(0, 0), float2(w, h)))
+		? Mode.warpPixels(image, float3x3(float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1)), new float2.extent(float2(0, 0), float2(w, h)))
 		: undefined;
 	for (let y = 0; y < h; y++) {
 		for (let x = 0; x < w; x++) {
@@ -268,7 +361,6 @@ function stripFaces<K>(thumb: (k: K) => HTMLCanvasElement) {
 }
 
 class ArrayMode extends AtlasMode implements SheetFanHost {
-
 	// the slices as the sheets of the fan
 	readonly fan = new SheetFan(this);
 	readonly tip = Mode.fanTip;
@@ -283,7 +375,7 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 	sheetName(i: number)	{ return `Slice ${i}`; }
 	reorderer(i: number)	{ return this.dragger(this.layers[i]); }
 	sheetMenu(i: number | undefined, clientX: number, clientY: number) {
-		openMenu(clientX, clientY, i === undefined ? undefined : this.sliceItems(this.layers[i]));
+		Mode.openMenu(clientX, clientY, i === undefined ? undefined : this.sliceItems(this.layers[i]));
 	}
 	// a slice of the array texture: the sheet itself, with its outline
 	drawSheet(i: number, at: Placement) {
@@ -359,7 +451,7 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 	}
 
 	// a slice moved to another place in the order, by index: it is one edit when it is dropped
-	dragger(layer: Slice): Drag {
+	dragger(layer: Slice): CascadeDrag {
 		let before: Slice[];
 		return {
 			begin:	() => { before = this.layers.slice(); },
@@ -385,7 +477,7 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 	static async create(atlas: ImageData, count: number) {
 		return new ArrayMode(atlas, count, await shader('array2d'), await shader('planes'));
 	}
-	protected override uploadSlice(i: number, image: RGBAPixels) {
+	protected override uploadSlice(i: number, image: Pixels<4>) {
 		canvas3d.updateTextureLayer(this.texture!, i, image);
 	}
 	// (a slice is seen in the 2D view, by itself)
@@ -396,7 +488,7 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 	override redraw() {
 		canvas3d.initViewport();
 		if (this.fan?.active) {
-			programBG.draw({u_viewport: [canvas.width, canvas.height]});
+			programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
 			this.fan.draw();
 			return;
 		}
@@ -405,7 +497,7 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 		this.program2DArray.draw({
 			u_texture:	0,
 			u_size:		[this.image!.width, this.sliceHeight, this.sliceHeight],
-			u_viewport:	[canvas.width, canvas.height],
+			u_viewport:	[this.canvas.width, this.canvas.height],
 			u_scale:	this.pan.scale,
 			u_offset:	[this.pan.offset.x, this.pan.offset.y],
 			u_layer:	this.currentSlice(),
@@ -430,7 +522,8 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 		if (!this.image)
 			return [];
 		return [
-			viewItem(() => [viewToggle(this, this.fan)]),
+			...super.menu(),
+			Mode.viewItem(() => [viewToggle(this, this.fan)]),
 			layerChooser('Slice',
 				() => this.layers,
 				() => this.layer!,
@@ -444,15 +537,20 @@ class ArrayMode extends AtlasMode implements SheetFanHost {
 	}
 
 	// a slice's pixels, which are part of the atlas as well as of the array texture
-	override changed(changed: RGBAPixels, rect?: float2.extent) {
+	override changed(changed: Pixels<4>, rect?: float2.extent) {
 		const i = this.layers.findIndex(l => l === changed);
 		if (this.texture && i >= 0)
 			canvas3d.updateTextureLayer(this.texture, i, changed, rect);
 		this.redraw();
 	}
-	protected override shownBy(image: RGBAPixels) {
+	override shownBy(image: Pixels<4>) {
 		const i = this.layers.findIndex(l => l === image);
-		return this.texture && i >= 0 ? {texture: this.texture, layer: i, drawn: () => this.redraw()} : undefined;
+		if (this.texture && i >= 0) {
+			const base = canvas3d.offscreenOn(this.texture, image.width, image.height, i);
+			return base && {...base,
+				end: () => { base.end(); this.redraw(); }
+			};
+		}
 	}
 
 	// (the whole picture is not turned, flipped or cropped: only a slice)
@@ -646,17 +744,17 @@ abstract class CubeViewMode extends AtlasMode {
 
 	constructor(image: ImageData, count: number, makeSlice?: (pixels: ImageData) => Slice) {
 		super(image, count, makeSlice);
-		this.orbit = new CubeOrbit(canvas, {
+		this.orbit = new CubeOrbit(this.canvas, {
 			anchor:		(x, y)	=> this.rayHit(x, y) ?? this.orbit.along(x, y, float3(0, 0, 0), 2),
 			size:		()		=> 2,
 			redraw: 	()		=> this.redraw(),
 			dragStart:	()		=> this.stop(),
-			contextMenu:(x, y)	=> openMenu(x, y),
+			contextMenu:(x, y)	=> Mode.openMenu(x, y),
 			active:		()		=> this.turnable,
 			home:		()		=> this.home(),
 		}, (x, y) => this.rayHit(x, y));
-		this.gizmo = new Gizmo(canvas, this.orbit.gizmoHooks());
-		this.unlisten = [Input.on(canvas).add(this.orbit, Place.view)];
+		this.gizmo = new Gizmo(this.canvas, this.orbit.gizmoHooks());
+		this.unlisten = [Input.on(this.canvas).add(this.orbit, Place.view)];
 	}
 
 	// the camera is the pointer's, as the cube is in 3D and not on its way anywhere
@@ -731,11 +829,11 @@ abstract class CubeViewMode extends AtlasMode {
 	// texels, with atlas point `centre` on the axis.
 	protected flatPosition(centre: {x: number, y: number}, width: number, planeZ: number) {
 		const {scale, offset} = this.pan;
-		const f = canvas.height / 2 * this.orbit.fovy;
+		const f = this.canvas.height / 2 * this.orbit.fovy;
 
 		const depth			= 2 * f / (width * scale);
-		const pixelDeltaX	= offset.x + centre.x * scale - canvas.width / 2;
-		const pixelDeltaY	= canvas.height / 2 - (offset.y + centre.y * scale);
+		const pixelDeltaX	= offset.x + centre.x * scale - this.canvas.width / 2;
+		const pixelDeltaY	= this.canvas.height / 2 - (offset.y + centre.y * scale);
 
 		return float3(pixelDeltaX * depth / f, pixelDeltaY * depth / f, -depth - this.homeRotation().z.z * planeZ);
 	}
@@ -800,10 +898,10 @@ abstract class CubeViewMode extends AtlasMode {
 			this.drawFlat();
 		} else {
 			const gl = canvas3d.gl, o = this.orbit;
-			programBG.draw({u_viewport: [canvas.width, canvas.height]});
+			programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
 			//gl.clearColor(0.06, 0.06, 0.06, 1);
 			canvas3d.clear();
-			this.drawSolid(matmulExt(o.projection(float3(0, 0, 0), canvas.width / canvas.height), o.toview()).flat());
+			this.drawSolid(matmulExt(o.projection(float3(0, 0, 0), this.canvas.width / this.canvas.height), o.toview()).flat());
 		}
 		super.redraw();
 	}
@@ -849,7 +947,7 @@ class CubeMode extends CubeViewMode {
 	// (the faces are in the atlas, `image`, so that what is drawn on one is in it too, and is what is saved)
 	constructor(faces: ImageData, private programCube: ShaderProgram, private programCube2D: ShaderProgram) {
 		super(faces, 6, image => image);
-		this.unlisten.push(Input.on(canvas).add({press: e => this.press(e)}, Place.tools));
+		this.unlisten.push(Input.on(this.canvas).add({press: e => this.press(e)}, Place.tools));
 		this.pan.width	= faces.width * 4;		// (the unfolded layout, four faces across and three down)
 		this.pan.height	= faces.width * 3;
 		this.orbit.environment = true;
@@ -858,7 +956,7 @@ class CubeMode extends CubeViewMode {
 	static async create(faces: ImageData) {
 		return new CubeMode(faces, await shader('cube', cubeGeometry), await shader('cube2d'));
 	}
-	protected override uploadSlice(i: number, image: RGBAPixels) {
+	protected override uploadSlice(i: number, image: Pixels<4>) {
 		canvas3d.updateCubeFace(this.texture!, i, image);
 	}
 	// A face is carried where it is: on its plane in 3D, or in its place in the unfolded layout
@@ -869,7 +967,7 @@ class CubeMode extends CubeViewMode {
 			return planeMvp(this.pictureMatrix(), float3x3.translate(float2(cell.x, cell.y).scale(size)).matmul(matrix));
 		}
 		// (face pixels to the cube, as the faces' points go: affine, so that the homography's divisor carries through)
-		const o = this.orbit, m = matmulExt(o.projection(float3(0, 0, 0), canvas.width / canvas.height), o.toview());
+		const o = this.orbit, m = matmulExt(o.projection(float3(0, 0, 0), this.canvas.width / this.canvas.height), o.toview());
 		const p0 = CubeMode.facePoint(i, 0, 0), pu = CubeMode.facePoint(i, 1, 0).sub(p0).scale(1 / size), pv = CubeMode.facePoint(i, 0, 1).sub(p0).scale(1 / size);
 		const onFace = float4x4(float4(pu.x, pu.y, pu.z, 0), float4(pv.x, pv.y, pv.z, 0), float4(0, 0, 0, 0), float4(p0.x, p0.y, p0.z, 1));
 		const carried = float4x4(
@@ -900,7 +998,7 @@ class CubeMode extends CubeViewMode {
 		this.programCube2D.draw({
 			u_texture:	0,
 			u_size:		this.image!.width,
-			u_viewport:	[canvas.width, canvas.height],
+			u_viewport:	[this.canvas.width, this.canvas.height],
 			u_scale:	this.pan.scale,
 			u_offset:	[this.pan.offset.x, this.pan.offset.y],
 		});
@@ -1010,7 +1108,7 @@ class CubeMode extends CubeViewMode {
 
 	// What a stroke on the chosen face does on the others: its brush goes past an edge, where it is on the face beyond
 	adjoining(p: float2, q: float2, size: number) {
-		const w = this.image.width, spill: {image: RGBAPixels, p: float2, q: float2, size: number}[] = [];
+		const w = this.image.width, spill: {image: Pixels<4>, p: float2, q: float2, size: number}[] = [];
 		for (let to = 0; to < 6; ++to) {
 			if (to === this.face)
 				continue;
@@ -1041,11 +1139,11 @@ class CubeMode extends CubeViewMode {
 	private faceToScreen(p: float2) {
 		if (!this.image)
 			return float2(0, 0);
-		const o = this.orbit, m = matmulExt(o.projection(float3(0, 0, 0), canvas.width / canvas.height), o.toview());
+		const o = this.orbit, m = matmulExt(o.projection(float3(0, 0, 0), this.canvas.width / this.canvas.height), o.toview());
 		const mvp = float4x4(m.x, m.y, m.z, m.w);
 		const q = CubeMode.facePoint(this.face, p.x / this.image.width, p.y / this.image.width);
 		const clip = mvp.mul(float4(q.x, q.y, q.z, 1));
-		return float2((clip.x / clip.w + 1) / 2 * canvas.width, (1 - clip.y / clip.w) / 2 * canvas.height);
+		return float2((clip.x / clip.w + 1) / 2 * this.canvas.width, (1 - clip.y / clip.w) / 2 * this.canvas.height);
 	}
 	private facePixelSize() {
 		if (!this.image)
@@ -1069,7 +1167,7 @@ class CubeMode extends CubeViewMode {
 	// other is the view's, and turns the cube. (A transform is over this, as its handles can be off the face.)
 	private press(event: PointerEvent) {
 		this.selectAt(event.clientX, event.clientY);
-		return this.flatten === 1 || this.faceAt(event.clientX, event.clientY) === this.face ? undefined : Input.on(canvas).press(event, Place.view);
+		return this.flatten === 1 || this.faceAt(event.clientX, event.clientY) === this.face ? undefined : Input.on(this.canvas).press(event, Place.view);
 	}
 
 	override tooltip(clientX: number, clientY: number) {
@@ -1088,6 +1186,7 @@ class CubeMode extends CubeViewMode {
 		if (!this.image)
 			return [];
 		return [
+			...super.menu(),
 			layerChooser('Face',
 				() => [0, 1, 2, 3, 4, 5],
 				() => this.face,
@@ -1105,7 +1204,7 @@ class CubeMode extends CubeViewMode {
 	}
 
 	// a face's pixels, which are part of the atlas as well as of the cube texture
-	override changed(changed: RGBAPixels, rect?: float2.extent) {
+	override changed(changed: Pixels<4>, rect?: float2.extent) {
 		const i = this.layers.findIndex(l => l === changed);
 		if (this.texture && i >= 0)
 			canvas3d.updateCubeFace(this.texture, i, changed, rect);
@@ -1182,7 +1281,7 @@ class VolumeMode extends CubeViewMode {
 		this.program3D2D.draw({
 			u_texture:	0,
 			u_size:		[this.image!.width, this.sliceHeight, this.count],
-			u_viewport:	[canvas.width, canvas.height],
+			u_viewport:	[this.canvas.width, this.canvas.height],
 			u_scale:	this.pan.scale,
 			u_offset:	[this.pan.offset.x, this.pan.offset.y],
 		});
@@ -1215,7 +1314,10 @@ class VolumeMode extends CubeViewMode {
 	}
 
 	override menu() {
-		return [this.foldToggle()];
+		return [
+			...super.menu(),
+			this.foldToggle()
+		];
 	}
 }
 
@@ -1244,37 +1346,6 @@ dropTarget.addEventListener('drop', e => {
 		e.preventDefault();
 		mode.drop(Array.from(e.dataTransfer!.files), e.clientX, e.clientY);
 	}
-});
-
-//-----------------------------------------------------------------------------
-// interaction
-//-----------------------------------------------------------------------------
-
-canvas.addEventListener('wheel', event => event.preventDefault(), {passive: false});
-
-function convertImage(image: RGBAPixels) {
-	return new ImageData(new Uint8ClampedArray(image.data.buffer, image.data.byteOffset, image.data.byteLength), image.width, image.height);
-}
-
-// A new picture, in a mode made for it, replaces the one there is (and what was done to that: it is not undone)
-async function load(made: Promise<Mode>) {
-	const next = await made;
-	Mode.enterPicture(next);
-	next.fit();
-	next.redraw();
-}
-
-canvas.addEventListener('pointermove', event => {
-	const text = mode.tooltip(event.clientX, event.clientY);
-	if (text) {
-		tooltip.show(text, event.clientX + 12, event.clientY + 12);
-		return;
-	}
-	tooltip.hide();
-});
-
-canvas.addEventListener('pointerleave', () => {
-	tooltip.hide();
 });
 
 //-----------------------------------------------------------------------------
@@ -1329,6 +1400,17 @@ export function cubeFaces(picture: ImageData): ImageData | undefined {
 //-----------------------------------------------------------------------------
 // messages
 //-----------------------------------------------------------------------------
+function convertImage(image: Pixels<4>) {
+	return new ImageData(new Uint8ClampedArray(image.data.buffer, image.data.byteOffset, image.data.byteLength), image.width, image.height);
+}
+
+// A new picture, in a mode made for it, replaces the one there is (and what was done to that: it is not undone)
+async function load(made: Promise<Mode>) {
+	const next = await made;
+	Mode.enterPicture(next);
+	next.fit();
+	next.redraw();
+}
 
 window.addEventListener('message', async event => {
 	if (handleResult(event.data))

@@ -6,6 +6,31 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
+			// the editors as web pages (web/), in Chrome with the debugger attached; the page's TypeScript is in its inline source maps
+			"name": "Web: Bitmap Editor",
+			"type": "chrome",
+			"request": "launch",
+			"url": "http://localhost:8000/web/bitmap.html",
+			"webRoot": "${workspaceFolder}",
+			"preLaunchTask": "web: start"
+		},
+		{
+			"name": "Web: OpenSCAD",
+			"type": "chrome",
+			"request": "launch",
+			"url": "http://localhost:8000/web/scad.html",
+			"webRoot": "${workspaceFolder}",
+			"preLaunchTask": "web: start"
+		},
+		{
+			"name": "Web: SVG Editor",
+			"type": "chrome",
+			"request": "launch",
+			"url": "http://localhost:8000/web/svg.html",
+			"webRoot": "${workspaceFolder}",
+			"preLaunchTask": "web: start"
+		},
+		{
 			"name": "Run Development Extension",
 			"type": "extensionHost",
 			"request": "launch",

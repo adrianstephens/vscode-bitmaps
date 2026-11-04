@@ -2,49 +2,84 @@
 // The pixels themselves are changed by the Operations here; this turns pointer and key events into those changes.
 // Transforms are not tools (transform.ts): the tools give way to one while it is under way.
 
-import { createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Pixels, RGBAPixels, RGBA, asRGBA, imageSize, imageRect, unionRect, getPixel } from './opengl.js';
-import { Tiles, TILE, Patch, applyPatch, blurWith, ShadePass, levelsPixels, levelsUniforms, kernelUniforms, Levels, Kernel, boxKernel, embossKernel, edgeKernel } from './raster.js';
 import { float2 } from '@isopodlabs/maths/vector';
-import { Selection, ellipsePoints } from './bitmapSelection.js';
+import { CurveFlag, curveFlatten, curveVertex } from '@isopodlabs/binary_fonts/curves';
+import { createElement, RPC } from '@isopodlabs/vscode_utils/webview/shared.js';
+import * as xml from '@isopodlabs/xml';
+
+import { Mode, postMessage, working, filterPrograms, CoordinateInterface } from './modes.js';
+import { RGBA, asRGBA, fromHex, toHex } from './colour.js';
+import { Canvas3D, Pixels, imageSize, imageRect, unionRect, getPixel, Offscreen, readRect, writeRect } from './opengl.js';
+import { blurWith, crop, levelsPixels, levelsUniforms, kernelUniforms, Levels, boxKernel, embossKernel, edgeKernel } from './raster.js';
+import { flattenWith, gradientsWith, traceWith, inkWith, mixed, type Traced, type TracedFill } from './vectorise.js';
+import { Selection } from './bitmapSelection.js';
+import { segment, removeObject, stylise, styleFrom, styles, type Style } from './neural.js';
 import { History, type HistoryEntry } from './history.js';
 import { Input, Place, type Drag } from './navigate.js';
-import { gridSpacing } from './pathedit.js';
+import type { PixelLayer } from './layers.js';
+import { newShapeLayer, type NewPaint } from './shapeedit.js';
+import { gridSpacing, fitRuns, svgPath } from './pathedit.js';
 import { Cascade, CascadeItem, svgFace, swatchFace, valueItem, choiceItem, toggleItem, multiplicativeStep, colourItems, valueFace, ValueOptions, sliderItem } from './cascade.js';
 
-type FilterKind = 'blur' | 'sharpen' | 'levels' | 'boxBlur' | 'emboss' | 'edges';
-type FilterUsing = {blurRadius?: number, sharpenRadius?: number, boxSize?: number};
-
-export type Tool	= 'hand' | 'marquee' | 'ellipse-marquee' | 'lasso' | 'polygon-lasso' | 'wand' | 'brush' | 'pencil' | 'eraser' | 'stamp' | 'bucket' | 'gradient' | 'eyedropper' | 'line' | 'rect' | 'ellipse';
-
-export type ShapeKind = 'line' | 'rect' | 'ellipse';
-export type ShapeFill = 'stroke' | 'fill' | 'both';
-export type SelectMode = 'replace' | 'add' | 'subtract' | 'intersect';
+type FilterKind		= 'blur' | 'sharpen' | 'levels' | 'boxBlur' | 'emboss' | 'edges';
+type Region		= {image: Pixels<4>, selection: Selection | undefined, x0: number, y0: number, w: number, h: number, id: string};
+type FilterUsing	= {blurRadius?: number, sharpenRadius?: number, boxSize?: number};
+type Tool			= 'hand' | 'marquee' | 'ellipse-marquee' | 'lasso' | 'polygon-lasso' | 'wand' | 'segment' | 'brush' | 'pencil' | 'eraser' | 'stamp' | 'bucket' | 'gradient' | 'eyedropper' | 'line' | 'rect' | 'ellipse';
+type ShapeKind		= 'line' | 'rect' | 'ellipse';
+type ShapeFill		= 'stroke' | 'fill' | 'both';
+type SelectMode		= 'replace' | 'add' | 'subtract' | 'intersect';
 
 const clamp = (v: number, lo: number, hi: number) => v < lo ? lo : v > hi ? hi : v;
 
 export interface CloneSource {
-	from?:		RGBAPixels;	// what the clone stamp copies from, chosen now (what the tools draw on, or all the picture shows) and read as each stroke begins
+	from?:		Pixels<4>;	// what the clone stamp copies from, chosen now (what the tools draw on, or all the picture shows) and read as each stroke begins
 	at:			float2;
 	offset?:	float2;
 }
 
 // what the editor needs of the viewer it is part of
-export interface PaintHost {
+export interface PaintHost extends CoordinateInterface {
 	canvas:			HTMLCanvasElement;
-	target():									RGBAPixels | undefined;	// what the tools draw on: the current layer's pixels (which cover the canvas), or the picture if there is none
+	canvas3d:		Canvas3D;
+	target():									Pixels<4> | undefined;	// what the tools draw on: the current layer's pixels (which cover the canvas), or the picture if there is none
 	pick(x: number, y: number):					RGBA | undefined;	// the colour seen at a pixel of the picture (of the current layer, if it is on it)
-	toScreen(p: float2):						float2;				// a point of the image, in canvas pixels
-	pixelSize():								number;				// how long a canvas pixel is, in the image's pixels
-	toImage(x: number, y: number):				float2;				// image coordinates, not whole pixels
-	changed(image: RGBAPixels, rect?: float2.extent): void;				// pixels of an image (all of them, without a rect) have changed
-	shade?(program: string, image: Pixels, area: float2.extent, passes: ShadePass[] | Record<string, any>, reach?: number): Pixels | undefined;	// the pixels of an area of an image run through a filter's shader (assets/<program>.frag), in passes or just the uniforms of one, that looks `reach` pixels around each one; nothing where there is no GPU
-	previewShade?(image: RGBAPixels, program: string, extra?: Pixels[]): ShadePreview | undefined;	// an image shown as a filter's shader draws it from its pixels (given as u_image, and `extra` to units 1 on), without changing them; nothing where it cannot be
+	changed(image: Pixels<4>, rect?: float2.extent): void;				// pixels of an image (all of them, without a rect) have changed
 	redraw():									void;
 	cloneSource?(at: float2, all: boolean):		CloneSource | undefined;	// what the clone stamp copies from, chosen now (what the tools draw on, or all the picture shows) and read as each stroke begins
 	// for a picture of surfaces that join (the faces of a cube), where a stroke goes on from one to the next
 	crossTo?(x: number, y: number, last: float2): float2 | undefined;	// the pointer is over another surface, which is the target now: where `last` is on it
-	adjoining?(p: float2, q: float2, size: number): {image: RGBAPixels, p: float2, q: float2, size: number}[];	// a stroke from p to q on the target, as it falls on the other surfaces it reaches
+	adjoining?(p: float2, q: float2, size: number): {image: Pixels<4>, p: float2, q: float2, size: number}[];	// a stroke from p to q on the target, as it falls on the other surfaces it reaches
+	shownBy(image: Pixels<4>): Offscreen | undefined;
+	addLayers?(layers: PixelLayer[], label: string): void | Promise<void>;
+	layerPictures?(): {name: string, image: Pixels<4>}[];		// the pictures of the layers other than the current one, which can be taken as a style	// layers put above the current one (a picture without them gets them, over itself), as one edit
+}
+
+// An image shown as a filter's shader draws it from its pixels, by drawing into the texture it is shown from (which its own pixels
+// are put back into at the end)
+function previewShade(host: PaintHost, image: Pixels<4>, program: string, extra: Pixels[] = []): ShadePreview | undefined {
+	const canvas3d = host.canvas3d;
+	const shader = filterPrograms[program];
+	const target = shader && host.shownBy(image);
+	if (!target)
+		return undefined;
+	const textures = [image, ...extra].map(p => canvas3d.createTextureFromImage(p, {format: p.channels === 1 ? 'r8' : 'rgba8', min: 'nearest', mag: 'nearest'}));
+	return {
+		show: uniforms => {
+			const gl = canvas3d.gl;
+			gl.disable(gl.BLEND);
+			target.begin();
+			textures.forEach((t, i) => canvas3d.bindTexture2D(t, i));
+			shader.draw({u_image: 0, ...uniforms});
+			textures.forEach((_, i) => canvas3d.bindTexture2D(null, i));
+			target.end();
+		},
+		end: () => {
+			target.delete(true);
+			for (const t of textures)
+				canvas3d.deleteTexture(t);
+			host.changed(image);
+		},
+	};
 }
 
 // what a tool shows of its change while it is dragged, where working out the pixels each time would be too slow
@@ -93,6 +128,12 @@ const toolInfo: Record<Tool, ToolInfo> = {
 	wand:				{
 		icon:		'<path d="M2.5 13.5l7-7"/><path d="M11 1.5v3M9.5 3h3M13.5 7v2M12.5 8h2M6 2.5v2M5 3.5h2"/>',
 		label:		'Magic Wand',
+		key:		'w',
+	},
+	segment:			{
+		icon:		'<path d="M3 3h3M10 3h3M3 13h3M10 13h3M3 3v3M13 3v3M3 10v3M13 10v3"/><path d="M6.5 7.5l3 1-1 1.5 1.5 2.5" stroke-linejoin="round"/>',
+		label:		'Object Select',
+		hint:		'click an object to select it (the first use fetches a neural network, and takes a moment)',
 		key:		'w',
 	},
 	brush:			{
@@ -155,7 +196,7 @@ const toolInfo: Record<Tool, ToolInfo> = {
 
 // the tools that share a place in the menu, which shows the one last used
 const toolGroups: Tool[][] = [
-	['marquee', 'ellipse-marquee', 'lasso', 'polygon-lasso', 'wand'],
+	['marquee', 'ellipse-marquee', 'lasso', 'polygon-lasso', 'wand', 'segment'],
 	['brush', 'pencil', 'eraser', 'stamp'],
 	['bucket', 'gradient'],
 	['line', 'rect', 'ellipse'],
@@ -182,6 +223,15 @@ const menuIcons = {
 	boxBlur:	'<rect x="2.5" y="2.5" width="11" height="11"/><path d="M2.5 6.2h11M2.5 9.8h11M6.2 2.5v11M9.8 2.5v11"/>',
 	emboss:		'<path d="M3 13l4-9 6 9z"/><path d="M7 4l-4 9" stroke-width="2.4"/>',
 	edges:		'<path d="M2.5 2.5h5v5h-5zM8.5 8.5h5v5h-5z" stroke-dasharray="2 1.2"/>',
+	style:		'<path d="M3 13c0-3 2-3 2-5s-1-3 1-5c2 2 5 0 7 2-1 3-3 2-3 5-2 3-5 4-7 3z"/><circle cx="6" cy="7" r="0.8"/><circle cx="10" cy="9" r="0.8"/>',
+	ink:		'<path d="M2.5 13.5c2-6 4-9 6-9s2 4 5 4M5 13.5c1.5-3 3-5 4.5-5" stroke-width="1.8"/>',
+	gradients:	'<path d="M2.5 2.5h11v11h-11z" fill="currentColor" fill-opacity="0.2"/><path d="M2.5 11l11-6M2.5 13.5l11-6"/>',
+	trace:		'<path d="M2.5 13.5C4 6 7 3 13.5 2.5"/><circle cx="2.5" cy="13.5" r="1.2"/><circle cx="13.5" cy="2.5" r="1.2"/><circle cx="7" cy="5.2" r="1.2"/>',
+	traceLayers: '<path d="M2 10.5l6 3 6-3M2 7.5l6 3 6-3-6-3z"/><path d="M5 6.5c1-2 3-3 6-2.5" stroke-width="1.4"/>',
+	styleAdd:	'<path d="M3 13c0-3 2-3 2-5s-1-3 1-5c2 2 5 0 7 2"/><path d="M11 9.5v5M8.5 12h5"/>',
+	styleLayer:	'<path d="M2 10.5l6 3 6-3M2 7.5l6 3 6-3-6-3z"/><circle cx="8" cy="7.5" r="1"/>',
+	flatten:	'<path d="M2.5 13.5v-4h4v4zM6.5 9.5v-4h4v4zM10.5 5.5v-4h3v4z"/>',
+	removeObject: '<circle cx="8" cy="8" r="4.5" stroke-dasharray="2 1.5"/><path d="M6.2 6.2l3.6 3.6M9.8 6.2l-3.6 3.6"/>',
 	reset:		'<path d="M3.5 8a4.5 4.5 0 1 0 1.5-3.4M3 2.5v3h3"/>',
 	swap:		'<path d="M3 6h9l-2.5-2.5M13 10H4l2.5 2.5"/>',
 	picker:		'<path d="M10.5 2.5l3 3-7 7H3.5v-3z"/><path d="M9 4l3 3"/>',
@@ -211,10 +261,32 @@ function cursorFor(tool: Tool) {
 	return `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${x} ${y}, crosshair`;
 }
 
+// A tracing as the text of an SVG the size of the picture: its shapes, each painted to its edge (a thin line of the same paint closing the
+// seams where the antialiasing of neighbours meet), under its ink lines
+function tracedSvg({width, height, shapes, strokes}: Traced) {
+	const round = (n: number) => Math.round(n * 10) / 10;
+	const d = (curve: curveVertex[]) => svgPath(curve.map(v => curveVertex(round(v.x), round(v.y), v.flags)));
+	const defs = new xml.Element('defs'), svg = new xml.Element('svg', {xmlns: 'http://www.w3.org/2000/svg', width, height, viewBox: `0 0 ${width} ${height}`}, [defs]);
+	shapes.forEach(({curve, fill}, i) => {
+		let paint: string;
+		if ('stops' in fill) {
+			defs.add(new xml.Element('linearGradient', {id: `g${i}`, gradientUnits: 'userSpaceOnUse', x1: round(fill.from.x), y1: round(fill.from.y), x2: round(fill.to.x), y2: round(fill.to.y)},
+				fill.stops.map((c, j) => new xml.Element('stop', {offset: j, 'stop-color': toHex(c)}))));
+			paint = `url(#g${i})`;
+		} else {
+			paint = toHex(fill);
+		}
+		svg.add(new xml.Element('path', {d: d(curve), fill: paint, stroke: paint, 'stroke-width': 0.8, 'stroke-linejoin': 'round', 'fill-rule': 'evenodd'}));
+	});
+	if (!defs.children.length)
+		svg.remove(defs);
+	if (strokes.length)
+		svg.add(new xml.Element('g', {fill: 'none', stroke: '#000', 'stroke-linecap': 'round', 'stroke-linejoin': 'round'},
+			strokes.map(({curve, width}) => new xml.Element('path', {d: d(curve), 'stroke-width': width}))));
+	return svg.toString() + '\n';
+}
 
 
-const hex = (c: RGBA) => '#' + [c.r, c.g, c.b, c.a].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
-const parseHex = (s: string): RGBA => ({r: parseInt(s.slice(1, 3), 16), g: parseInt(s.slice(3, 5), 16), b: parseInt(s.slice(5, 7), 16), a: 255});
 
 export class Painter {
 	private tool:		Tool	= 'hand';
@@ -229,6 +301,19 @@ export class Painter {
 	private modifyBy: Record<'growSelection' | 'shrinkSelection' | 'borderSelection' | 'smoothSelection' | 'featherSelection', number> = {
 		growSelection: 4, shrinkSelection: 4, borderSelection: 4, smoothSelection: 4, featherSelection: 8,
 	};
+	private inkContrast = 10;		// how much darker, in levels, than what is round it a pixel must be to be inked
+	private gradientTolerance = 12;	// how far, in levels, the colours of a gradient region may stray from its gradient
+	private traceKind: 'shapes' | 'lines' | 'both' = 'both';	// what Trace to SVG makes: gradient regions, ink lines as strokes, or both
+	private styleStrength = Object.fromEntries(styles.map(n => [n, 100])) as Record<Style, number>;	// how far, in percent, each style takes the picture from the original
+	private styleChoice: Style = 'mosaic';	// the style the strength is shown on
+	// styles taken from pictures (a file, or a layer): each with how big its marks are, as a percentage of the picture's size that the style
+	// picture is taken at
+	private customStyles: {id: number, name: string, image: Pixels<4>, face: string, scale: number}[] = [];
+	private nextStyle = 1;
+	private effects:	{image: Pixels<4>, region: string, crop: Pixels<4>, made: Map<string, Promise<Pixels<4> | undefined>>} | undefined;	// what neural and slow filters made of the region they were last shown on, to show at other strengths (being made, as well as made, so that none is made twice)
+	private effectToken = 0;		// which showing of one is the latest asked for
+	private applying = 0;			// the effects being made to apply (a preview is not shown meanwhile, and the pointer going from the item does not stop them)
+	private flatColours	= 8;		// the colours Flatten leaves
 	private blurRadius	= 4;		// the gaussian blur of the filter, in pixels
 	private boxSize	= 3;		// the box blur filter's side, in pixels
 	private sharpenRadius = 2;		// the blur the sharpen filter's unsharp mask is taken against, in pixels
@@ -267,7 +352,7 @@ export class Painter {
 		this.colourInput.type = 'color';
 		Object.assign(this.colourInput.style, {position: 'absolute', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none'});
 		this.colourInput.addEventListener('input', () => {
-			this.setColour(this.picking, parseHex(this.colourInput.value));
+			this.setColour(this.picking, {...fromHex(this.colourInput.value), a: 255});
 			this.menu.refresh();
 		});
 		stage.append(this.colourInput);
@@ -491,6 +576,145 @@ export class Painter {
 			select:		() => this.run(kind),
 			hover:		on => this.previewFilter(on ? kind : undefined),
 		});
+		// styles: a painting's manner given to the picture by a neural network, as much as the strength says; and Flatten, which reduces it to a
+		// few flat colours so that it makes simple vector shapes
+		const flatPresets = [3, 4, 6, 8, 12, 16, 24], stylePresets = [25, 50, 75, 100];
+		const showStyle = (name: Style) => this.previewEffect(`style:${name}`, crop => stylise(crop, name), this.styleStrength[name] / 100);
+		const scalePresets = [25, 50, 100, 200];
+		const showCustom = (c: Painter['customStyles'][number], scale = c.scale) => this.previewEffect(`custom:${c.id}:${scale}`, crop => styleFrom(crop, c.image, scale / 100));
+		const styleItem: CascadeItem = {
+			id:			'style',
+			face:		() => svgFace(menuIcons.style),
+			caption:	() => `Style: ${this.styleChoice} (click to apply; the first use fetches a neural network, and takes a moment)`,
+			select:		() => this.run(`style:${this.styleChoice}`),
+			// each style is its own strength control: scrolled over or dragged along its presets it takes the strength, clicked it applies
+			children:	() => styles.map((name): CascadeItem => ({
+				...sliderItem({
+					id:			`style:${name}`,
+					label: 		name,
+					caption: 	`${name} strength`, min: 0, max: 100,
+					get: () => this.styleStrength[name], set: v => { this.styleStrength[name] = v; this.styleChoice = name; showStyle(name); },
+					step: (v, n) => Math.min(100, Math.max(0, v + 5 * n)), markers: 5,
+				}),
+				//caption:	() => `${name[0].toUpperCase()}${name.slice(1).replace('-', ' ')} style at ${this.styleStrength[name]}% (scroll or drag to change, click to apply)`,
+				hover:		on => { if (on) { this.styleChoice = name; showStyle(name); } else this.endEffect(); },
+				select:		() => { this.styleChoice = name; return this.run(`style:${name}`); },
+			})).concat(
+				// the styles taken from pictures, each of which the wheel makes finer or bolder, and then where more can come from
+				this.customStyles.map((c): CascadeItem => ({
+					...valueItem({
+						id: `custom:${c.id}`, label: '%', caption: `${c.name}: its marks as big as at`, min: 10, max: 400,
+						get: () => c.scale, set: v => { c.scale = v; showCustom(c); },
+						step: multiplicativeStep(), presets: scalePresets,
+					}),
+					face:		() => c.face,
+					caption:	() => `${c.name}: a style from that picture, its marks as big as they are at ${c.scale}% of this one's size (scroll or drag for finer or bolder, click to apply)`,
+					hover:		on => on ? showCustom(c) : this.endEffect(),
+					select:		() => this.run(`custom:${c.id}`),
+					children:	() => scalePresets.map(n => ({
+						id:			`${n}%`,
+						face:		() => valueFace('', `${n}%`),
+						caption:	() => `${c.name} with its marks as big as at ${n}% (${n < 100 ? 'finer' : n > 100 ? 'bolder' : 'as it is'})`,
+						hover:		(on: boolean) => on ? showCustom(c, n) : this.endEffect(),
+						select:		() => { c.scale = n; return this.run(`custom:${c.id}`); },
+					})),
+				})),
+				{
+					id:			'addStyle',
+					face:		() => svgFace(menuIcons.styleAdd),
+					caption:	() => 'Custom style: take a style from a picture file (the first use fetches a neural network, and takes a moment)',
+					select:		() => this.run('addStyle'),
+				},
+				...this.host.layerPictures?.().length ? [{
+					id:			'styleLayer',
+					face:		() => svgFace(menuIcons.styleLayer),
+					caption:	() => 'Custom style from a layer',
+					children:	() => (this.host.layerPictures?.() ?? []).map(({name}, i): CascadeItem => ({
+						id:			`styleLayer:${i}`,
+						face:		() => valueFace('', name.slice(0, 6)),
+						caption:	() => `Take a style from ${name}`,
+						select:		() => this.run(`styleLayer:${i}`),
+					})),
+				}] : [],
+			),
+		};
+		const previewFlatten = (colours = this.flatColours) => this.previewEffect(`flatten:${colours}`, crop => this.flattened(crop, colours));
+
+		const flatItem: CascadeItem = {
+			...valueItem({
+				label: 'colours', caption: 'Colours to flatten to', min: 2, max: 64,
+				get: () => this.flatColours, set: v => { this.flatColours = v; previewFlatten(); },
+				step: multiplicativeStep(), presets: flatPresets,
+			}),
+			id:			'flatten',
+			face:		() => svgFace(menuIcons.flatten),
+			caption:	() => `Flatten to ${this.flatColours} colours, which makes simple vector shapes (scroll or drag to change)`,
+			select:		() => this.run('flatten'),
+			hover:		on => { if (on) previewFlatten(); else this.endEffect(); },
+			children:	() => flatPresets.map(n => ({
+				face:		() => valueFace('', String(n)),
+				caption:	() => `Flatten to ${n} colours`,
+				hover:		(on: boolean) => on ? previewFlatten(n) : this.endEffect(),
+				select:		() => { this.flatColours = n; return this.run('flatten'); },
+			})),
+		};
+		const inkPresets = [4, 8, 12, 20, 32];
+		const previewInk = (contrast = this.inkContrast) => this.previewEffect(`ink:${contrast}`, crop => this.inked(crop, contrast));
+		const inkItem: CascadeItem = {
+			...valueItem({
+				id: 'ink', label: 'ink', caption: 'Ink lines: how much darker than its surroundings a pixel must be', min: 2, max: 60,
+				get: () => this.inkContrast, set: v => { this.inkContrast = v; previewInk(); },
+				step: multiplicativeStep(), presets: inkPresets,
+			}),
+			face:		() => svgFace(menuIcons.ink),
+			caption:	() => `Ink lines where pixels are ${this.inkContrast} levels darker than round them (scroll or drag to change; lower finds more lines)`,
+			select:		() => this.run('ink'),
+			hover:		on => { if (on) previewInk(); else this.endEffect(); },
+			children:	() => inkPresets.map(n => ({
+				face:		() => valueFace('', String(n)),
+				caption:	() => `Ink lines at ${n} levels`,
+				hover:		(on: boolean) => on ? previewInk(n) : this.endEffect(),
+				select:		() => { this.inkContrast = n; return this.run('ink'); },
+			})),
+		};
+		const gradientPresets = [4, 8, 12, 20, 32];
+		const previewGradients = (tolerance = this.gradientTolerance) => this.previewEffect(`gradients:${tolerance}`, crop => this.gradients(crop, tolerance));
+		const gradientItem: CascadeItem = {
+			...valueItem({
+				id: 'gradients', label: 'tol', caption: 'Gradient regions: how far colours may stray from a gradient', min: 2, max: 60,
+				get: () => this.gradientTolerance, set: v => { this.gradientTolerance = v; previewGradients(); },
+				step: multiplicativeStep(), presets: gradientPresets,
+			}),
+			face:		() => svgFace(menuIcons.gradients),
+			caption:	() => `Gradients: smooth regions each with a linear gradient, within ${this.gradientTolerance} levels (scroll or drag to change)`,
+			select:		() => this.run('gradients'),
+			hover:		on => { if (on) previewGradients(); else this.endEffect(); },
+			children:	() => gradientPresets.map(n => ({
+				face:		() => valueFace('', String(n)),
+				caption:	() => `Gradient regions within ${n} levels`,
+				hover:		(on: boolean) => on ? previewGradients(n) : this.endEffect(),
+				select:		() => { this.gradientTolerance = n; return this.run('gradients'); },
+			})),
+		};
+		const traceKinds = [
+			{value: 'shapes' as const,	icon: menuIcons.gradients,	caption: `Shapes with linear gradients, within ${this.gradientTolerance} levels`},
+			{value: 'lines' as const,	icon: menuIcons.ink,		caption: `Ink lines as strokes, at ${this.inkContrast} levels`},
+			{value: 'both' as const,	icon: menuIcons.trace,		caption: 'Shapes with ink lines over them'},
+		];
+		// tracing, to a file or to layers, as one of its kinds, which is kept for the next
+		const traceItem = (id: string, icon: string, label: string, where: string): CascadeItem => ({
+			id,
+			face:		() => svgFace(icon),
+			caption:	() => `${label}: the picture (or selection) as ${traceKinds.find(k => k.value === this.traceKind)!.caption.toLowerCase()}, ${where}`,
+			select:		() => this.run(id),
+			children:	() => traceKinds.map(k => ({
+				id:			k.value,
+				face:		() => svgFace(k.icon),
+				caption:	() => `${label} as ${k.caption.toLowerCase()}`,
+				active:		() => this.traceKind === k.value,
+				select:		() => { this.traceKind = k.value; return this.run(id); },
+			})),
+		});
 		// all the filters, under one icon
 		const filters: CascadeItem = {
 			id:			'filters',
@@ -503,6 +727,18 @@ export class Painter {
 				boxItem,
 				convolution('emboss', menuIcons.emboss, 'Emboss'),
 				convolution('edges', menuIcons.edges, 'Detect edges'),
+				styleItem,
+				flatItem,
+				gradientItem,
+				inkItem,
+				traceItem('traceSvg', menuIcons.trace, 'Trace to SVG', 'saved as an SVG file'),
+				traceItem('traceLayers', menuIcons.traceLayers, 'Trace to layers', 'as shape layers above it'),
+				{
+					id:			'removeObject',
+					face:		() => svgFace(menuIcons.removeObject),
+					caption:	() => 'Remove Object: fills the selection from what is round it (the first use fetches a neural network, and takes a moment)',
+					select:		() => this.run('removeObject'),
+				},
 			],
 		};
 		const contiguous = toggleItem('Contiguous', svgFace(menuIcons.contiguous), () => this.contiguous, v => this.contiguous = v);
@@ -541,6 +777,7 @@ export class Painter {
 			lasso:				[selectModes],
 			'polygon-lasso':	[selectModes],
 			wand:				[tolerance, contiguous, selectModes],
+			segment:			[selectModes],
 			brush:				[size, hardness, opacity],
 			pencil:				[size, opacity],
 			eraser:				[size, hardness, opacity],
@@ -582,8 +819,8 @@ export class Painter {
 		});
 		const colour = (which: 'fg' | 'bg', caption: string): CascadeItem => ({
 			id:			which,
-			face:		() => swatchFace(hex(this[which])),
-			caption:	() => `${caption} ${hex(this[which])}`,
+			face:		() => swatchFace(toHex(this[which])),
+			caption:	() => `${caption} ${toHex(this[which])}`,
 			children:	() => [
 				...colourItems(which, () => this[which], c => this.setColour(which, {...c, a: 255}), () => true, []),
 				{
@@ -591,7 +828,7 @@ export class Painter {
 					caption:	() => 'Choose with the system colour picker',
 					select:		() => {
 						this.picking = which;
-						this.colourInput.value = hex(this[which]);
+						this.colourInput.value = toHex(this[which]);
 						this.colourInput.showPicker?.() ?? this.colourInput.click();
 						return true;
 					},
@@ -619,7 +856,7 @@ export class Painter {
 			tool('eyedropper'),
 			{
 				id:			'colours',
-				face:		() => swatchFace(hex(this.fg), hex(this.bg)),
+				face:		() => swatchFace(toHex(this.fg), toHex(this.bg)),
 				caption:	() => 'Colours',
 				children:	() => [
 					colour('fg', 'Foreground'),
@@ -640,6 +877,20 @@ export class Painter {
 		const image = this.host.target();
 		if (!this.active || !image || this.suspended || this.aside)
 			return false;
+		if (op.startsWith('custom:')) {
+			const c = this.customStyles.find(c => `custom:${c.id}` === op);
+			return !!c && (this.applyEffect('Style', `custom:${c.id}:${c.scale}`, crop => styleFrom(crop, c.image, c.scale / 100)), true);
+		}
+		if (op.startsWith('styleLayer:')) {
+			const layer = this.host.layerPictures?.()[Number(op.slice(11))];
+			return !!layer && (this.addStyle(layer.name, layer.image), true);
+		}
+		if (op === 'addStyle')
+			return this.addStyleFromFile(), true;
+				if (op.startsWith('style:')) {
+			const style = op.slice(6) as Style;
+			return this.applyEffect('Style', `style:${style}`, crop => stylise(crop, style), this.styleStrength[style] / 100), true;
+		}
 		switch (op) {
 			case 'fill':				return this.fillSelection(this.fg, 'Fill'), true;
 			case 'clear':				return this.clearSelection(), true;
@@ -650,6 +901,12 @@ export class Painter {
 			case 'boxBlur':				return this.filter('boxBlur', 'Box Blur'), true;
 			case 'emboss':				return this.filter('emboss', 'Emboss'), true;
 			case 'edges':				return this.filter('edges', 'Detect Edges'), true;
+			case 'removeObject':		return this.removeObject(), true;
+			case 'gradients':			return this.applyEffect('Gradients', `gradients:${this.gradientTolerance}`, crop => this.gradients(crop, this.gradientTolerance)), true;
+			case 'ink':					return this.applyEffect('Ink', `ink:${this.inkContrast}`, crop => this.inked(crop, this.inkContrast)), true;
+			case 'traceSvg':			return this.traceSvg(), true;
+			case 'traceLayers':			return this.traceLayers(), true;
+			case 'flatten':				return this.applyEffect('Flatten', `flatten:${this.flatColours}`, crop => this.flattened(crop, this.flatColours)), true;
 			case 'selectAll':			return this.select(Selection.all(imageSize(image)), 'Select All'), true;
 			case 'deselect':			return this.select(undefined, 'Deselect'), true;
 			case 'invertSelection':		return this.select(this.selection ? this.selection.invert(imageSize(image)) : Selection.all(imageSize(image)), 'Invert Selection'), true;
@@ -737,7 +994,7 @@ export class Painter {
 	// finish operations (of one edit, which may reach more than one image): if they changed anything, that is an edit.
 	// A patch is of the image it was made on, which may not be the one being drawn on when it is undone
 	private commitAll(ops: Iterable<Operation>, label: string) {
-		const made: {image: RGBAPixels, patch: Patch}[] = [];
+		const made: {image: Pixels<4>, patch: Patch}[] = [];
 		for (const op of ops) {
 			const patch = op.commit();
 			if (patch)
@@ -755,7 +1012,7 @@ export class Painter {
 		this.commitAll([op], label);
 	}
 
-	private operation(blend: Operation['blend'] = 'paint', image = this.host.target()!, selection = this.selection) {
+	private operation(blend: Blend = 'paint', image = this.host.target()!, selection = this.selection) {
 		const op = new Operation(image, selection);
 		op.opacity	= this.opacity;
 		op.colour	= this.fg;
@@ -793,6 +1050,102 @@ export class Painter {
 		this.commit(op, 'Clear');
 	}
 
+	// fill the selection with what the picture round it suggests (by a neural network, so after a moment)
+	private removeObject() {
+		const image = this.host.target(), selection = this.selection;
+		if (!image || !selection)
+			return;
+		removeObject(image, selection).then(found => {
+			if (!found)
+				return;
+			const op = this.operation('replace', image, selection);
+			op.opacity = 1;
+			op.replace(found.area, found.pixels);
+			this.flush(op);
+			this.commit(op, 'Remove Object');
+		});
+	}
+
+	// The part of the picture an effect (a style, Flatten) is for: the selection's bounds, or the layer
+	private region(): Region | undefined {
+		const image = this.host.target(), selection = this.selection;
+		if (!image)
+			return;
+		const bounds = selection ? selection.bounds() : imageRect(image);
+		const x0 = Math.max(0, Math.floor(bounds.min.x)), y0 = Math.max(0, Math.floor(bounds.min.y));
+		const w = Math.min(image.width, Math.ceil(bounds.max.x)) - x0, h = Math.min(image.height, Math.ceil(bounds.max.y)) - y0;
+		if (w > 0 && h > 0)
+			return {image, selection, x0, y0, w, h, id: `${x0},${y0},${w},${h}`};
+	}
+
+	// what an effect makes of the region at full strength, kept (while the same region is being looked at) for the other strengths
+	private async effectOf(r: Region, key: string, make: (crop: Pixels<4>) => Pixels<4> | undefined | Promise<Pixels<4> | undefined>) {
+		let fx = this.effects;
+		if (fx?.image !== r.image || fx.region !== r.id)
+			this.effects = fx = {image: r.image, region: r.id, made: new Map(),
+				crop: crop(r.image, new float2.extent(float2(r.x0, r.y0), float2(r.x0 + r.w, r.y0 + r.h)))};
+		let made = fx.made.get(key);
+		if (!made) {
+			const mine = fx;
+			fx.made.set(key, made = Promise.resolve(make(fx.crop)).then(full => {
+				if (!full)
+					mine.made.delete(key);	// (so that it is tried again)
+				return full;
+			}));
+		}
+		const full = await made;
+		return full && {crop: fx.crop, full};
+	}
+
+	// the effect shown on the picture, at this strength, as an unmade edit (the filter previews' own, so showing another or ending it takes it away)
+	private showEffect(r: Region, made: {crop: Pixels<4>, full: Pixels<4>}, strength: number) {
+		const op = this.blurring;
+		if (op) {
+			op.reset();
+			this.flush(op);
+		}
+		const next = op ?? this.operation('replace', r.image, r.selection);
+		next.opacity = 1;
+		next.replace(new float2.extent(float2(r.x0, r.y0), float2(r.x0 + r.w, r.y0 + r.h)), strength < 1 ? mixed(made.crop, made.full, strength) : made.full);
+		this.flush(next);
+		this.blurring = next;
+		return next;
+	}
+
+	private previewEffect(key: string, make: (crop: Pixels<4>) => Pixels<4> | undefined | Promise<Pixels<4> | undefined>, strength = 1) {
+		const token = ++this.effectToken, r = this.region();
+		if (!r)
+			return;
+		this.effectOf(r, key, make).then(made => {
+			if (made && !this.applying && token === this.effectToken && this.host.target() === r.image)
+				this.showEffect(r, made, strength);
+		});
+	}
+
+	// the preview taken away (what is asked for after it, in the same moment, is shown in its place)
+	private endEffect() {
+		++this.effectToken;
+		this.showFilter();
+	}
+
+	// the effect made an edit of the picture, which is the preview if there is one
+	private applyEffect(label: string, key: string, make: (crop: Pixels<4>) => Pixels<4> | undefined | Promise<Pixels<4> | undefined>, strength = 1) {
+		const r = this.region();
+		if (!r)
+			return;
+		++this.effectToken;		// (a preview on its way is no longer wanted)
+		this.applying++;
+		this.effectOf(r, key, make).then(made => {
+			// (not if the picture has been changed meanwhile)
+			if (!made || this.host.target() !== r.image)
+				return;
+			const op = this.showEffect(r, made, strength);
+			this.blurring = undefined;
+			this.effects = undefined;
+			this.commit(op, label);
+		}).finally(() => this.applying--);
+	}
+
 	private invert() {
 		if (!this.host.target())
 			return;
@@ -822,6 +1175,99 @@ export class Painter {
 			this.commit(op, label);
 	}
 
+	// a picture reduced to a few colours, on the GPU (nothing where there is none)
+	private flattened(image: Pixels<4>, colours: number) {
+		return working('Flattening', () => flattenWith((img, passes, reach) => Mode.shade('flatten', img, imageRect(img), passes, reach) as Pixels<4> | undefined, image, colours));
+	}
+
+	// the picture (or the selection's bounds) traced as gradient regions and ink lines (as traceKind has it), in its pixels
+	private async traced(r: Region) {
+		const part = crop(r.image, new float2.extent(float2(r.x0, r.y0), float2(r.x0 + r.w, r.y0 + r.h)));
+		const kind = this.traceKind;
+		return working('Tracing', progress => traceWith(part, (runs, closed) => fitRuns(runs, closed, 0.75),
+			kind !== 'lines' ? {run: (img, passes, reach) => Mode.shade('flatten', img, imageRect(img), passes, reach) as Pixels<4> | undefined, tolerance: this.gradientTolerance} : undefined,
+			kind !== 'shapes' ? {run: (img, passes, reach) => Mode.shade('ink', img, imageRect(img), passes, reach) as Pixels<4> | undefined, contrast: this.inkContrast} : undefined,
+			progress
+		));
+	}
+
+	// a picture taken as a style, its icon a small copy of it
+	private addStyle(name: string, image: Pixels<4>) {
+		const scale = 40 / Math.max(image.width, image.height);
+		const w = Math.max(1, Math.round(image.width * scale)), h = Math.max(1, Math.round(image.height * scale));
+		const full = createElement('canvas', {width: image.width, height: image.height}), small = createElement('canvas', {width: w, height: h});
+		full.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(image.data as Uint8ClampedArray), image.width, image.height), 0, 0);
+		small.getContext('2d')!.drawImage(full, 0, 0, w, h);
+		const face = `<img src="${small.toDataURL()}" style="width:100%;height:100%;object-fit:cover;border-radius:2px">`;
+		this.customStyles.push({id: this.nextStyle++, name, image, face, scale: 100});
+	}
+
+	// a picture file the user chooses, taken as a style
+	private async addStyleFromFile() {
+		const file = await RPC<{name: string, data: ArrayBuffer} | undefined>({command: 'pickImage'});
+		if (!file)
+			return;
+		try {
+			const bitmap = await createImageBitmap(new Blob([file.data]));
+			const ctx = createElement('canvas', {width: bitmap.width, height: bitmap.height}).getContext('2d')!;
+			ctx.drawImage(bitmap, 0, 0);
+			const data = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+			this.addStyle(file.name, Pixels(data.data, data.width, data.height, 4));
+		} catch {
+			postMessage({command: 'error', message: `${file.name} could not be read as a picture.`});
+		}
+	}
+
+	// the tracing as an SVG, which the extension opens
+	private async traceSvg() {
+		const r = this.region(), traced = r && await this.traced(r);
+		if (traced)
+			postMessage({command: 'saveSvg', text: tracedSvg(traced)});
+	}
+
+	// the tracing as shape layers above what it was made from: one for each region (with a thin line of its own paint, which closes the seams
+	// where the antialiasing of neighbours meet), and one of the ink lines of each width over them
+	private async traceLayers() {
+		const host = this.host, r = this.region();
+		const traced = r && host.addLayers && await this.traced(r);
+		if (!r || !traced)
+			return;
+		const stack = {width: r.image.width, height: r.image.height};
+		const at = (p: {x: number, y: number}) => ({x: p.x + r.x0, y: p.y + r.y0});
+		const moved = (curve: curveVertex[]) => curve.map(v => curveVertex(v.x + r.x0, v.y + r.y0, v.flags));
+		const paint = (f: TracedFill): NewPaint => 'stops' in f ? {from: at(f.from), to: at(f.to), stops: f.stops} : f;
+
+		const layers = await working('Making layers', async progress => {
+			const made: PixelLayer[] = [];
+			for (const [i, s] of traced.shapes.entries()) {
+				made.push(newShapeLayer(`Shape ${i + 1}`, moved(s.curve), stack, paint(s.fill), {width: 0.8, paint: paint(s.fill)}));
+				if (i % 50 === 49)
+					await progress(i / traced.shapes.length);
+			}
+			const widths = new Map<number, curveVertex[]>();
+			for (const s of traced.strokes) {
+				const curve = widths.get(s.width) ?? [];
+				curve.push(...moved(s.curve));
+				widths.set(s.width, curve);
+			}
+			for (const [width, curve] of [...widths].sort((a, b) => a[0] - b[0]))
+				made.push(newShapeLayer(`Ink ${width}px`, curve, stack, undefined, {width, paint: {r: 0, g: 0, b: 0}}));
+			return made;
+		});
+		if (layers.length)
+			await host.addLayers!(layers, 'Trace to Layers');
+	}
+
+	// a picture as ink lines on white, on the GPU (nothing where there is none)
+	private inked(image: Pixels<4>, contrast: number) {
+		return inkWith((img, passes, reach) => Mode.shade('ink', img, imageRect(img), passes, reach) as Pixels<4> | undefined, image, contrast);
+	}
+
+	// a picture reduced to smooth regions with a linear gradient each, the GPU smoothing it first (nothing where there is none)
+	private gradients(image: Pixels<4>, tolerance: number) {
+		return working('Finding gradients', () => gradientsWith((img, passes, reach) => Mode.shade('flatten', img, imageRect(img), passes, reach) as Pixels<4> | undefined, image, tolerance));
+	}
+
 	// a mask (one value a pixel, 0..255, zero beyond its edges) blurred in place, on the GPU, as bytes (which a selection's coverage
 	// is, and which can be drawn into where floats cannot); left as it is where there is no GPU
 	private maskBlur = (f: Float32Array, width: number, height: number, sigma: number) => {
@@ -832,7 +1278,7 @@ export class Painter {
 
 	// an area of an image blurred, or sharpened by an unsharp mask of this radius, on the GPU; nothing where there is none
 	private blurred(image: Pixels, area: float2.extent, radius: number, sharpen = 0, edge: 'zero' | 'clamp' = 'clamp') {
-		return blurWith((passes, reach) => this.host.shade?.('blur', image, area, passes, reach), image, radius, edge, sharpen);
+		return blurWith((passes, reach) => Mode.shade('blur', image, area, passes, reach), image, radius, edge, sharpen);
 	}
 
 	// the filter as the settings (or those given instead) have it, on an area of an image
@@ -850,10 +1296,10 @@ export class Painter {
 			case 'emboss':
 			case 'edges': {
 				const kernel = kind === 'boxBlur' ? boxKernel(using.boxSize ?? this.boxSize) : kind === 'emboss' ? embossKernel : edgeKernel;
-				return this.host.shade?.('convolve', image, area, kernelUniforms(kernel), kernel.size >> 1);
+				return Mode.shade('convolve', image, area, kernelUniforms(kernel), kernel.size >> 1);
 			}
 			case 'levels':
-				return this.host.shade?.('levels', image, area, levelsUniforms(this.levels)) ?? levelsPixels(image, area, this.levels);
+				return Mode.shade('levels', image, area, levelsUniforms(this.levels)) ?? levelsPixels(image, area, this.levels);
 		}
 	}
 
@@ -865,7 +1311,7 @@ export class Painter {
 			return;
 		op.blend = 'replace';
 		op.opacity = 1;
-		const result = this.filtered(kind, image, area, using) as RGBAPixels | undefined;	// (a picture's pixels in, so a picture's out)
+		const result = this.filtered(kind, image, area, using) as Pixels<4> | undefined;	// (a picture's pixels in, so a picture's out)
 		if (!result)
 			return;		// (no GPU to do it)
 		op.replace(area, result);
@@ -911,6 +1357,7 @@ export class Painter {
 
 	// the menu has come up at a point of the window, which is where the system's colour picker is to come up
 	menuOpened(x: number, y: number) {
+		this.effects = undefined;	// (the picture may have been changed since the effects were made)
 		const r = this.overlay.parentElement!.getBoundingClientRect();
 		this.colourInput.style.left = `${x - r.left}px`;
 		this.colourInput.style.top	= `${y - r.top}px`;
@@ -936,8 +1383,8 @@ export class Painter {
 			case 'eraser': {
 				// (a stroke may go on to other surfaces of the picture, each with an operation of its own: the selection is of the first)
 				const blend = this.tool === 'eraser' ? 'erase' : 'paint';
-				const ops = new Map<RGBAPixels, Operation>();
-				const opOn = (on: RGBAPixels) => {
+				const ops = new Map<Pixels<4>, Operation>();
+				const opOn = (on: Pixels<4>) => {
 					let o = ops.get(on);
 					if (!o)
 						ops.set(on, o = this.operation(blend, on, on === image ? this.selection : undefined));
@@ -985,7 +1432,7 @@ export class Painter {
 					break;
 				// (a copy of what is drawn on, so a stroke copies what was there before it and not itself)
 				if (from === image)
-					from = RGBAPixels(image.data.slice(), image.width, image.height);
+					from = Pixels(image.data.slice(), image.width, image.height);
 
 				// by whole pixels, so what is copied is not resampled
 				const offset	= stamp.offset ??= float2(Math.round(stamp.at.x - start.x), Math.round(stamp.at.y - start.y));
@@ -1015,7 +1462,7 @@ export class Painter {
 				const tool = this.tool;
 				// (a gradient covers all it can, so the GPU shows it as it is dragged, and its pixels are worked out once, when it is let go)
 				const selected = op.selection, m = selected?.mask, mask = m && Pixels(new Uint8ClampedArray(m.buffer as ArrayBuffer, m.byteOffset, m.length), selected.width, selected.height, 1);
-				const preview = tool === 'gradient' ? this.host.previewShade?.(op.image, 'gradient', mask ? [mask] : []) : undefined;
+				const preview = tool === 'gradient' ? previewShade(this.host, op.image, 'gradient', mask ? [mask] : []) : undefined;
 				let end = start;
 				let shift = false, alt = false, frame: number | undefined;
 				// where it goes from and to
@@ -1134,7 +1581,7 @@ export class Painter {
 				}, () => {
 					this.draft = undefined;
 					if (box)
-						this.join(round ? Selection.ellipse(box, imageSize(image)) : Selection.rect(box), mode);
+						this.join(round ? Selection.fromPolygons([ellipsePoints(box)], imageSize(image)) : Selection.rect(box), mode);
 					else if (mode === 'replace')
 						this.select(undefined);	// a click on its own deselects
 					else
@@ -1182,6 +1629,15 @@ export class Painter {
 
 			case 'wand': {
 				this.join(Selection.wand(image, Math.floor(start.x), Math.floor(start.y), this.tolerance, this.contiguous), this.modeFor(event));
+				break;
+			}
+
+			case 'segment': {
+				const mode = this.modeFor(event);
+				segment(image, Math.floor(start.x), Math.floor(start.y)).then(found => {
+					if (found)
+						this.join(found, mode);
+				});
 				break;
 			}
 		}
@@ -1428,6 +1884,90 @@ export class Painter {
 // operations: one undoable change to an image
 //-----------------------------------------------------------------------------
 
+export const TILE = 64;
+
+// The image is changed in tiles, and the first time a tile is touched its original pixels are kept. That is what undo needs,
+// and it also lets a stroke be correct where it overlaps itself: every pixel is worked out from its original value and
+// the greatest coverage the stroke has given it, so a translucent stroke is no darker where it crosses itself. And a preview
+// (a line being dragged out) is `reset` and drawn again.
+
+class Tile extends float2.extent {
+	before:	Uint8ClampedArray;	// the original pixels, packed
+	cover:	Float32Array;		// the greatest coverage so far, per pixel
+	constructor(image: Pixels<4>, r: float2.extent) {
+		super(r.min, r.max.min(float2(image.width, image.height)));
+		// packed at the width of the tile as it falls on the image, which is less than TILE at the right and bottom edges
+		this.before = readRect(image, this);
+		const {x: w, y: h} = this.size();
+		this.cover = new Float32Array(w * h);
+	 }
+}
+
+export class Tiles {
+	protected tiles = new Map<number, Tile>();
+	protected dirty: float2.extent | undefined;
+
+	constructor(readonly image: Pixels<4>) {}
+
+	protected tile(x: number, y: number) {
+		const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
+		const key = ty * 65536 + tx;
+		let t = this.tiles.get(key);
+		if (!t) {
+			t = new Tile(this.image, new float2.extent(float2(tx, ty).scale(TILE), float2(tx + 1, ty + 1).scale(TILE)));
+			this.tiles.set(key, t);
+		}
+		return t;
+	}
+
+	// the area changed since the last call
+	take() {
+		const r = this.dirty;
+		this.dirty = undefined;
+		return r;
+	}
+	// back to the original, to draw again
+	reset() {
+		for (const t of this.tiles.values()) {
+			writeRect(this.image, t, t.before);
+			t.cover.fill(0);
+			// a copy: a pixel put afterwards grows the dirty area in place, and it must not be the tile that does
+			this.dirty = (this.dirty ?? t).union(t);
+		}
+	}
+
+	// what changed, to undo or redo; nothing if nothing did
+	commit(): Patch | undefined {
+		const tiles: PatchTile[] = [];
+		for (const t of this.tiles.values()) {
+			const after = readRect(this.image, t);
+			if (after.some((v, i) => v !== t.before[i]))
+				tiles.push(new PatchTile(t, after));
+		}
+		return tiles.length ? {tiles} : undefined;
+	}
+}
+
+export class PatchTile extends float2.extent {
+	before:	Uint8ClampedArray;	// the original pixels, packed
+	constructor(tile: Tile, public after:Uint8ClampedArray) {
+		super(tile.min, tile.max);
+		this.before = tile.before;
+	}
+}
+export interface Patch {
+	tiles: PatchTile[];
+}
+
+export function applyPatch(image: Pixels<4>, patch: Patch, which: 'before' | 'after') {
+	let dirty: float2.extent | undefined;
+	for (const t of patch.tiles) {
+		writeRect(image, t, t[which]);
+		dirty = unionRect(dirty, t);
+	}
+	return dirty;
+}
+
 // how a pixel takes its colour: composed over what was there, taking that away, or replacing it
 type Blend = 'paint' | 'erase' | 'replace';
 
@@ -1436,7 +1976,7 @@ class Operation extends Tiles {
 	colour		= RGBA(0, 0, 0, 255);
 	blend:		Blend = 'paint';
 
-	constructor(image: RGBAPixels, readonly selection?: Selection | null) { super(image); }
+	constructor(image: Pixels<4>, readonly selection?: Selection | null) { super(image); }
 
 	// where anything can be drawn: the selection, inside the image
 	bounds(): float2.extent {
@@ -1451,7 +1991,7 @@ class Operation extends Tiles {
 
 	// What put does for each pixel of `area` with the colours of `src` (the area's size, from its corner), the selection's coverage
 	// the weight of each, as 'replace' at full opacity: all at once, as it is for a filter of a whole picture
-	replace(area: float2.extent, src: RGBAPixels) {
+	replace(area: float2.extent, src: Pixels<4>) {
 		const {width, height, data: d} = this.image, s = src.data, sw = src.width, sel = this.selection;
 		const a = area.intersect(new float2.extent(float2(0, 0), float2(width, height)));
 		if (a.empty())
@@ -1612,6 +2152,20 @@ function pencilSegment(op: Operation, x0: number, y0: number, x1: number, y1: nu
 
 // how much of the pixel starting at p lies in [a, b)
 const overlap = (p: number, a: number, b: number) => clamp(Math.min(p + 1, b) - Math.max(p, a), 0, 1);
+
+export function ellipsePoints(area: float2.extent) {
+	const c = area.centre(), ry = area.max.y - c.y, x0 = area.min.x, x1 = area.max.x;
+
+	const ellipse: curveVertex[] = [
+		{x: x0, y: c.y, flags: CurveFlag.ON_BEGIN},
+		{x: x0, y: c.y - ry * 2, flags: CurveFlag.OFF_ARC},   // on the tangent line at the start, 2*ry away
+		{x: x1, y: c.y - ry * 2, flags: CurveFlag.OFF_ARC},   // on the tangent line at the end,area.max.y away
+		{x: x1, y: c.y, flags: CurveFlag.ON_CURVE},
+		{x: x1, y: c.y + ry * 2, flags: CurveFlag.OFF_ARC},
+		{x: x0, y: c.y + ry * 2, flags: CurveFlag.OFF_ARC},
+	];
+	return curveFlatten(ellipse, 0.1)[0];
+}
 
 // coverage of the pixel at (px, py) by an ellipse, from an approximation to the distance to its edge
 function ellipseCover(px: number, py: number, cx: number, cy: number, rx: number, ry: number) {

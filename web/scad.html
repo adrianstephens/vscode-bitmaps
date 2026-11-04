@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>OpenSCAD</title>
+	<script type="importmap">{"imports": {
+		"@isopodlabs/vscode_utils/webview/": "../node_modules/@isopodlabs/vscode_utils/dist/webview/",
+		"@isopodlabs/maths/vector": "../node_modules/@isopodlabs/maths/esm/vector.js",
+		"@isopodlabs/maths/quaternion": "../node_modules/@isopodlabs/maths/esm/quaternion.js",
+		"@isopodlabs/maths/geometry": "../node_modules/@isopodlabs/maths/esm/geometry.js",
+		"@isopodlabs/maths/linear": "../node_modules/@isopodlabs/maths/esm/linear.js",
+		"@isopodlabs/binary": "../node_modules/@isopodlabs/binary/esm/index.js",
+		"@isopodlabs/binary_ml/browser": "../node_modules/@isopodlabs/binary_ml/esm/browser.js",
+		"@isopodlabs/xml": "../node_modules/@isopodlabs/xml/esm/xml.js",
+		"@isopodlabs/binary_bitmaps": "../node_modules/@isopodlabs/binary_bitmaps/esm/browser.js",
+		"@isopodlabs/binary_fonts": "../node_modules/@isopodlabs/binary_fonts/esm/browser.js",
+		"@isopodlabs/binary_fonts/curves": "../node_modules/@isopodlabs/binary_fonts/esm/curves.js"
+	}}</script>
+	<link rel="stylesheet" href="../node_modules/@isopodlabs/vscode_utils/assets/shared.css">
+	<link rel="stylesheet" href="../assets/bitmap.css">
+	<link rel="stylesheet" href="../assets/cascade.css">
+	<link rel="stylesheet" href="../assets/scad.css">
+	<style>
+		:root { --vscode-editor-background: #1e1e1e; --vscode-foreground: #cccccc; --vscode-editor-font-family: ui-monospace, Menlo, Consolas, monospace; }
+		html, body { height: 100%; margin: 0; background: var(--vscode-editor-background); color: var(--vscode-foreground); }
+		#scad-editor { flex: none; width: 42%; min-width: 220px; max-width: 80%; resize: horizontal; overflow: hidden; display: flex; flex-direction: column; border-right: 1px solid #3c3c3c; }
+		#scad-source { flex: 1; min-height: 0; box-sizing: border-box; width: 100%; margin: 0; padding: 10px 12px; border: 0; outline: 0; resize: none; tab-size: 4;
+			background: #1e1e1e; color: #d4d4d4; font: 13px/1.5 var(--vscode-editor-font-family); white-space: pre; overflow: auto; }
+		#scad-bar { flex: none; display: flex; gap: 8px; align-items: center; padding: 4px 10px; font: 12px sans-serif; border-bottom: 1px solid #3c3c3c; }
+		#scad-bar button, #scad-bar select { font: inherit; }
+		#scad-bar .spacer { flex: 1; }
+		#scad-modules, #scad-examples { max-width: 12em; }
+		#scad-cm { flex: 1; min-height: 0; overflow: hidden; }
+		#scad-cm .cm-editor { height: 100%; font-size: 13px; }
+		#scad-cm .cm-scroller { overflow: auto; font-family: var(--vscode-editor-font-family); }
+		#scad-params { flex: none; max-height: 34%; overflow: auto; padding: 4px 10px 6px; border-bottom: 1px solid #3c3c3c; font: 12px sans-serif; }
+		#scad-params summary { cursor: pointer; padding: 2px 0; opacity: .8; }
+		#scad-params .row { display: grid; grid-template-columns: 8em 1fr 5.5em; gap: 8px; align-items: center; padding: 1px 0; }
+		#scad-params .row label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family); }
+		#scad-params input[type=number] { width: 100%; box-sizing: border-box; font: inherit; }
+		#scad-params input[type=range] { width: 100%; margin: 0; }
+	</style>
+</head>
+<body class="tensors">
+	<div id="scad-editor">
+		<div id="scad-bar">
+			<span>OpenSCAD</span>
+			<select id="scad-examples" title="Open an example"></select>
+			<select id="scad-modules" class="hidden" title="Run a module of the file"></select>
+			<span class="spacer"></span>
+			<button id="scad-share" title="Copy a link that holds this text">Share</button>
+			<button id="scad-open" title="Open a .scad file (or drop one on the page)">Open…</button>
+			<button id="scad-save" title="Save the text (Ctrl/Cmd+S)">Save</button>
+		</div>
+		<details id="scad-params" class="hidden" open><summary>Parameters</summary><div id="scad-param-rows"></div></details>
+		<textarea id="scad-source" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+	</div><div id="main">
+		<canvas id="viewport"></canvas>
+		<div id="scad-tooltip" class="hidden"></div>
+		<div id="scad-info"></div>
+		<pre id="scad-error" class="hidden"></pre>
+	</div>
+	<!-- the page talks to this instead of to the extension: it must exist before the page's modules run -->
+	<script type="module" src="./scad-host.js"></script>
+</body>
+</html>

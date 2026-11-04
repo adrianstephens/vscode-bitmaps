@@ -2,15 +2,16 @@
 // canvas's pixels, its view the picture's. What it does is the layer's (see LayeredMode.openShape): each change is shown on the
 // picture as it is made, and each edit made again as the layer's pixels. In three parts: the serialisation of what a shape layer keeps
 // (its fills, stroke and vector mask), the editing of it, and the rendering of it as a picture.
-import { PathEditor, ViewOptions, svgPath, type DragHandler, type ToolChoice } from './pathedit.js';
+import { PathEditor, ViewOptions, svgPath, simplifyPoints as simplify, fitStroke, type DragHandler, type ToolChoice, DEFAULT_OPTIONS } from './pathedit.js';
+import { Pixels } from './opengl.js';
 import { float2, float2x3 } from '@isopodlabs/maths/vector';
 import { bezier3 } from '@isopodlabs/maths/geometry';
 import { createElement, RPC } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { curveVertex, curveExtentQuick, ON_BEGIN, ON_CURVE, ON_END, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
+import { curveVertex, curveExtentQuick, ON_BEGIN, ON_CURVE, ON_END, OFF_BEZ3 } from '@isopodlabs/binary_fonts/curves';
 import { type Stop, type Paint, type PaintOptions, GradientEditor } from './gradientedit.js';
 import { CascadeItem, svgFace, swatchFace, valueItem, choiceItem, toggleItem, colourItems } from './cascade.js';
 import { RGB, toHex, toCss, clamp01, lerp, mixColour } from './colour.js';
-import { canvas, openMenu } from './modes.js';
+import { Mode } from './modes.js';
 import { Input, Place } from './navigate.js';
 import type { LayeredMode, Layer, LayerMask, PixelLayer, ShapeState, BlocksEdit } from './layers.js';
 import type { psd } from '@isopodlabs/binary_bitmaps';
@@ -455,6 +456,37 @@ export function shapeBlocks(blocks: LayerBlocks | undefined, curve: curveVertex[
 	} as LayerBlocks;
 }
 
+/** A paint for a new shape layer: a colour, or a linear gradient through its stops (evenly spaced) from one point to another, in canvas pixels */
+export type NewPaint = RGB | {from: {x: number, y: number}, to: {x: number, y: number}, stops: RGB[]};
+
+/** A new shape layer of this outline (in canvas pixels) with a fill, or a stroke (round at its ends and joins), or both. A gradient is laid out
+ *  on the outline's box as a file keeps it. The layer's pixels are only of the box it paints. */
+export function newShapeLayer(name: string, curve: curveVertex[], stack: {width: number, height: number}, fill?: NewPaint, stroke?: {width: number, paint: NewPaint}): PixelLayer {
+	const {width, height} = stack;
+	let blocks = shapeBlocks(undefined, curve, {r: 0, g: 0, b: 0}, width, height);
+	const points = pathsToCurve(findVectorMask(blocks)!, width, height), box = curveBox(points, stack);
+	const paint = (p: NewPaint): Fill => 'stops' in p
+		? {...gradientDefaults, stops: p.stops.map((color, i) => ({offset: i / Math.max(1, p.stops.length - 1), color, opacity: 1})),
+			...gradientFromHandles(gradientDefaults, [float2(p.from.x, p.from.y), float2(p.to.x, p.to.y)], box)}
+		: {type: 'solid', colour: p};
+
+	const f = fill && paint(fill);
+	const s = stroke && {...newShapeStroke(), width: stroke.width, cap: 'round', join: 'round', paint: paint(stroke.paint)} as Stroke;
+	if (f)
+		blocks = withFill(blocks, f);
+	if (s)
+		blocks = f ? withShapeStroke(blocks, s) : withNewShapeStroke(blocks, s, true, false);
+
+	// its pixels: what it paints, over as much of the canvas as that reaches
+	const pad	= s ? Math.ceil(strokeReach(s)) : 1;
+	const left	= Math.min(width - 1, Math.max(0, Math.floor(box.min.x) - pad)), top = Math.min(height - 1, Math.max(0, Math.floor(box.min.y) - pad));
+	const w		= Math.max(1, Math.min(width, Math.ceil(box.max.x) + pad) - left), h = Math.max(1, Math.min(height, Math.ceil(box.max.y) + pad) - top);
+	const ctx	= createElement('canvas', {width: w, height: h}).getContext('2d', {willReadFrequently: true})!;
+	ctx.translate(-left, -top);
+	paintShape(ctx, points, f, s, stack);
+	return {kind: 'shape', name, left, top, opacity: 1, visible: true, blend: 'norm', blocks, image: {data: ctx.getImageData(0, 0, w, h).data, width: w, height: h}};
+}
+
 /** The fill a layer's blocks have of their own (a colour or a gradient), if any. */
 export function ownFill(blocks: LayerBlocks | undefined): Fill | undefined {
 	const colour = solidColour(blocks);
@@ -680,10 +712,11 @@ export class ShapeEditor extends PathEditor {
 	private off?:			() => void;			// it has the picture while it has a session: how it gives it back
 	private readonly statusText = createElement('div', {style: {position: 'absolute', left: '8px', bottom: '6px', opacity: '0.7', pointerEvents: 'none', fontSize: '11px'}});
 
-	constructor(parent: HTMLElement) {
+	constructor(private canvas: HTMLCanvasElement) {
+		const parent = canvas.parentElement!;
 		const host = createElement('div', {className: 'pathedit-host', style: {position: 'absolute', inset: '0', display: 'none'}});
 		parent.append(host);
-		super(host, new ViewOptions(), false);
+		super(host, new ViewOptions(DEFAULT_OPTIONS), false);
 		host.append(this.statusText);
 		// (its drawing is part of the picture: the pointer there is in the picture's stack, as is the editor while it is open)
 		Input.on(canvas).include(this.svg);
@@ -693,7 +726,7 @@ export class ShapeEditor extends PathEditor {
 	// the way while something over it (a transform) has the picture.
 	private hold(on: boolean) {
 		if (on && !this.off) {
-			this.off = Input.on(canvas).add({
+			this.off = Input.on(this.canvas).add({
 				...this.input,
 				holds:		true,
 				key:		e => !e.metaKey && !e.ctrlKey && (this.key(e) || (e.key === 'Escape' && this.leaveGradient())),
@@ -733,7 +766,7 @@ export class ShapeEditor extends PathEditor {
 	override draw() {
 		if (this.picture && this.session) {
 			// (the canvas's pixels are in the window's: client = pixel * s + t)
-			const pan = this.picture.pan, r = this.svg.getBoundingClientRect(), c = canvas.getBoundingClientRect(), k = c.width / canvas.width;
+			const pan = this.picture.pan, r = this.svg.getBoundingClientRect(), c = this.canvas.getBoundingClientRect(), k = c.width / this.canvas.width;
 			this.view = {s: pan.scale * k, t: float2(c.left + pan.offset.x * k - r.left, c.top + pan.offset.y * k - r.top)};
 			this.gradientMode?.updateContent();		// (the gradient from its handles, as they are dragged)
 			const now = this.signature();
@@ -745,7 +778,7 @@ export class ShapeEditor extends PathEditor {
 		super.draw();
 	}
 	protected override moveView(by: float2) {
-		this.picture?.pan.moveBy(by.scale(canvas.width / canvas.getBoundingClientRect().width));
+		this.picture?.pan.moveBy(by.scale(this.canvas.width / this.canvas.getBoundingClientRect().width));
 		this.picture?.redraw();
 	}
 	override zoom(factor: number, c = float2(this.host.clientWidth / 2, this.host.clientHeight / 2)) {
@@ -825,7 +858,7 @@ export class ShapeEditor extends PathEditor {
 		if (this.only())
 			super.showMenu(x, y);
 		else
-			openMenu(x, y);
+			Mode.openMenu(x, y);
 	}
 
 	// what the shape is painted with, as paintItem has it, with a gradient's stops and ends dragged on the drawing (a click on its icon,
@@ -855,8 +888,7 @@ export class ShapeEditor extends PathEditor {
 	bounds()				{ return new float2.extent(float2(0, 0), float2(this.session?.width ?? 1, this.session?.height ?? 1)); }
 	protected defaultSize()	{ return Math.max(this.session?.width ?? 0, this.session?.height ?? 0) / 4; }
 
-	// the points with fewer of them, which the extension works out
-	protected override simplifyPoints(points: curveVertex[], tol: number) { return RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}); }
+	protected override simplifyPoints(points: curveVertex[], tol: number) { return simplify(points, tol, true); }
 
 	// A stroke drawn freehand (the pen: a press anywhere starts one, unless Shift is held, which moves the view), as an open contour that
 	// follows it to within two pixels
@@ -868,7 +900,7 @@ export class ShapeEditor extends PathEditor {
 		const session = this.session;
 		if (!session || world.length < 2)
 			return;
-		const points = await RPC<curveVertex[]>({command: 'fitStroke', stroke: world.flatMap(p => [p.x, p.y]), tol: 2 / this.view.s});
+		const points = await fitStroke(world.flatMap(p => [p.x, p.y]), 2 / this.view.s);
 		if (points.length > 1 && this.session === session) {
 			session.points.push(...points);
 			this.commit('Draw path');
@@ -1175,7 +1207,7 @@ function drawVectorMask(paths: PathRecord[], width: number, height: number, inve
 	const rgba = ctx.getImageData(0, 0, w, h).data, data = new Uint8ClampedArray(w * h);
 	for (let i = 0; i < data.length; i++)
 		data[i] = rgba[i * 4 + 3];
-	return {left, top, image: {data, width: w, height: h}, default: all ? 255 : 0, inverted, disabled: false};
+	return {left, top, image: Pixels(data, w, h, 1), default: all ? 255 : 0, inverted, disabled: false};
 }
 
 // a shape's fill and stroke painted as they are in its pixels, over a canvas of this size

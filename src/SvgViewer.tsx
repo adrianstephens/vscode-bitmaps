@@ -7,13 +7,45 @@ import * as path from 'path';
 import type { MessageIn, MessageOut } from '../webview/svg';
 
 import { setActiveViewer } from './extension';
-import { webviewPage } from './BitmapViewer';
-import { StatusLine, shapePoints, simplifyPoints, fitStroke } from './FontViewer';
-import { embedded, parseDataUri, dataUri, sameBytes, type EmbeddedImage } from './embedded';
+import { webviewPage, parseSize } from './BitmapViewer';
+import { StatusLine } from './FontViewer';
+import { parseSVGshape, makeCurve, bezier3Curve } from '@isopodlabs/binary_fonts';
+import { embedded, parseDataUri, dataUri, type EmbeddedImage } from './embedded';
 import * as xml from '@isopodlabs/xml';
+
+// Drawings made by the extension rather than read from a file, waiting for their editor to take them: the editor opens on an
+// untitled document, so that Save As is what chooses the file
+let untitledCount = 0;
+const pending = new Map<string, string>();
+const editors = new Map<string, SvgViewer>();
+
+export async function openSvg(name: string, text: string) {
+	const uri = vscode.Uri.from({scheme: 'untitled', path: '/' + name}), key = uri.toString();
+	// already open from an earlier run: it shows the new one
+	const open = editors.get(key);
+	if (open)
+		await open.document.load(text);
+	else
+		pending.set(key, text);
+	await vscode.commands.executeCommand('vscode.openWith', uri, 'svg.viewer');
+	// (it is unsaved from the start, so closing it asks)
+	const document = editors.get(key)?.document;
+	document?.edited.fire({document, label: 'New', undo() {}, redo() {}});
+}
+
+export async function newSvg() {
+	const text = await vscode.window.showInputBox({prompt: 'Size of the new drawing', value: '512x512', validateInput: s => parseSize(s) ? undefined : 'Width and height, like 512x512'});
+	const size = text && parseSize(text);
+	if (size) {
+		const [width, height] = size;
+		await openSvg(`Untitled-${++untitledCount}.svg`, `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">\n</svg>\n`);
+	}
+}
 
 export class SvgDocument implements vscode.CustomDocument {
 	text		= '';
+	// not read from a file: there is no file until it is saved
+	get untitled() { return this.uri.scheme === 'untitled'; }
 	error?:		string;
 	private saved?:	string;			// what the file held when last read or written
 	// whether there are edits that are not in the file: a file that changes on disk meanwhile is not read over them
@@ -39,7 +71,7 @@ export class SvgDocument implements vscode.CustomDocument {
 	}
 
 	async reloadIfChanged() {
-		if (this.dirty)
+		if (this.dirty || this.untitled)
 			return;
 		const data = new TextDecoder('utf-8').decode(await vscode.workspace.fs.readFile(this.uri)).replace(/^﻿/, '');
 		if (data === this.saved)
@@ -49,6 +81,9 @@ export class SvgDocument implements vscode.CustomDocument {
 	}
 
 	async revert() {
+		// (an unsaved drawing has no file to go back to)
+		if (this.untitled)
+			return;
 		await this.load();
 		this.changed.fire();
 	}
@@ -113,11 +148,15 @@ class SvgViewer extends webview.Panel<MessageOut, MessageIn> {
 		], 'tensors', ['node_modules/@isopodlabs/vscode_utils/assets/tree.css', 'assets/pathedit.css', 'assets/font.css', 'assets/svg.css', 'assets/scad.css']);
 
 		const file = document.uri.fsPath;
-		const watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
-		const reload = () => document.reloadIfChanged().catch(error => this.postMessage({command: 'error', message: `${path.basename(file)}: ${error?.message ?? error}`}));
-		watch.onDidChange(reload);
-		watch.onDidCreate(reload);
-		this.subscriptions.push(watch, document.onDidChange(() => { this.send(); this.syncImages(); }));
+		this.subscriptions.push(document.onDidChange(() => { this.send(); this.syncImages(); }));
+		// (nothing to watch for what is not in a file yet)
+		if (!document.untitled) {
+			const watch = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(file), path.basename(file)));
+			const reload = () => document.reloadIfChanged().catch(error => this.postMessage({command: 'error', message: `${path.basename(file)}: ${error?.message ?? error}`}));
+			watch.onDidChange(reload);
+			watch.onDidCreate(reload);
+			this.subscriptions.push(watch);
+		}
 	}
 
 	dispose() {
@@ -184,11 +223,7 @@ class SvgViewer extends webview.Panel<MessageOut, MessageIn> {
 				await this.editImage(message.id, message.href);
 				break;
 			case 'shapePoints':
-				return shapePoints(message.name, message.attributes);
-			case 'simplifyPoints':
-				return simplifyPoints(message.points, message.tol, message.cubic);
-			case 'fitStroke':
-				return fitStroke(message.stroke, message.tol);
+				return bezier3Curve(makeCurve(parseSVGshape(message, true) ?? {run() {}}), 1e-6);
 			case 'error':
 				vscode.window.showErrorMessage(`SVG editor: ${message.message}`);
 				break;
@@ -214,7 +249,11 @@ export class SvgViewerProvider implements vscode.CustomEditorProvider<SvgDocumen
 		const document = new SvgDocument(uri);
 		// edits that were not saved are in the backup VS Code kept of them
 		const backup = context.backupId ? vscode.Uri.parse(context.backupId) : undefined;
-		await document.load(backup ? new TextDecoder('utf-8').decode(await vscode.workspace.fs.readFile(backup)) : undefined).catch(error => { document.error = String(error?.message ?? error); });
+		const key = uri.toString();
+		// (an unsaved drawing that is not being restored was just made by openSvg)
+		const made = pending.get(key);
+		pending.delete(key);
+		await document.load(backup ? new TextDecoder('utf-8').decode(await vscode.workspace.fs.readFile(backup)) : document.untitled ? made ?? '' : undefined).catch(error => { document.error = String(error?.message ?? error); });
 		document.edited.event(e => this.changeEmitter.fire(e));
 		return document;
 	}
@@ -241,8 +280,12 @@ export class SvgViewerProvider implements vscode.CustomEditorProvider<SvgDocumen
 
 	async resolveCustomEditor(document: SvgDocument, webviewPanel: vscode.WebviewPanel) {
 		const editor = new SvgViewer(webviewPanel, this.assets, document, this.statusLine);
+		editors.set(document.uri.toString(), editor);
 		setActiveViewer(editor);
-		webviewPanel.onDidDispose(() => editor.dispose());
+		webviewPanel.onDidDispose(() => {
+			editors.delete(document.uri.toString());
+			editor.dispose();
+		});
 		webviewPanel.onDidChangeViewState(event => {
 			if (event.webviewPanel.active)
 				setActiveViewer(editor);

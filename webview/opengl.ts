@@ -1,28 +1,25 @@
-import { float2, float3, normalise, float4x4 } from '@isopodlabs/maths/vector';
+import { float2 } from '@isopodlabs/maths/vector';
 
 export type PixelStorage = Uint8ClampedArray<ArrayBuffer> | Float32Array<ArrayBuffer>;
 
-export interface RGBA {r: number, g: number, b: number, a: number}
-export function RGBA(r: number, g: number, b: number, a: number): RGBA { return {r, g, b, a}; }
-export function asRGBA(p?: PixelStorage): RGBA|undefined { return p && {r: p[0], g: p[1], b: p[2], a: p[3]}; }
-
 // N is the number of values a pixel holds, checked statically: Pixels<4> is a picture (rgba, the default
 // when channels is absent, so an ImageData or a bare {data, width, height} fits), Pixels<1> is a mask or a field
-export interface Pixels<N extends number = 1 | 4> {
+export type Pixels<N extends number = 1 | 4> = {
 	data:	PixelStorage;
 	width:	number;
 	height: number;
-	channels?: N extends 4 ? 4 | undefined : N;
-}
-export type PixelsN<N extends number> = Pixels<N>;
-export type RGBAPixels = Pixels<4>;
-export function Pixels<N extends 1 | 4>(data: PixelStorage, width: number, height: number, channels: N): Pixels<N> {
-	return {data, width, height, channels} as Pixels<N>;
-}
+} & (N extends 4 ? {channels?: 4} : {channels: N});
 
-export function RGBAPixels(data: PixelStorage, width: number, height: number): RGBAPixels {
-	return {data, width, height};
+export type PixelsN<N extends number> = Pixels<N>;
+
+export function Pixels<N extends 4 = 4>(data: PixelStorage, width: number, height: number, channels?: N): Pixels<N>;
+export function Pixels<N extends 1 | 4>(data: PixelStorage, width: number, height: number, channels: N): Pixels<N>;
+export function Pixels(data: PixelStorage, width: number, height: number, channels?: 1 | 4) {
+	return {data, width, height, channels} as Pixels<any>;
 }
+//export function Pixels<N extends 1 | 4>(data: PixelStorage, width: number, height: number, channels?: N): Pixels<N> {
+//	return {data, width, height, channels} as Pixels<N>;
+//}
 
 // the size of an image (or anything with a width and a height), and the rectangle it covers from the origin
 export const imageSize = (p: {width: number, height: number}) => float2(p.width, p.height);
@@ -34,53 +31,31 @@ export function getPixel(image: Pixels, x: number, y: number): PixelStorage | un
 		return;
 	const channels	= image.channels ?? 4;
 	const offset	= (y * image.width + x) * channels;
-	return image.data.subarray(offset, channels);
+	return image.data.subarray(offset, offset + channels);
 }
 
-export function setPixel(image: RGBAPixels, x: number, y: number, colour: {r: number, g: number, b: number}) {
-	const index = (y * image.width + x) * 4;
-	image.data[index + 0] = colour.r;
-	image.data[index + 1] = colour.g;
-	image.data[index + 2] = colour.b;
-	image.data[index + 3] = 255;
+export function setPixel(image: Pixels<4>, x: number, y: number, colour: number[]) {
+	const channels	= image.channels ?? 4;
+	image.data.set(colour, (y * image.width + x) * channels);
 }
-
-export function getPixelBilinear(image: RGBAPixels, sx: number, sy: number) {
-	const value = RGBA(0, 0, 0, 0);
-	const fx = sx - 0.5, fy = sy - 0.5;
-	const x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
-	for (let k = 0; k < 4; k++) {
-		const weight = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
-		if (!weight)
-			continue;
-		const pixel = asRGBA(getPixel(image,  x0 + (k & 1), y0 + (k >> 1)));
-		if (pixel) {
-			const a = pixel.a * weight;
-			value.r += pixel.r * a;
-			value.g += pixel.g * a;
-			value.b += pixel.b * a;
-			value.a += a;
-		}
-	}
-	return value;
-}
-
 
 // the pixels of a rectangle, packed
-export function readRect(image: RGBAPixels, r: float2.extent) {
+export function readRect(image: Pixels, r: float2.extent) {
 	const {x, y} = r.min, {x: w, y: h} = r.size();
-	const out = new Uint8ClampedArray(w * h * 4);
+	const channels	= image.channels ?? 4;
+	const out = new Uint8ClampedArray(w * h * channels);
 	for (let j = 0; j < h; j++) {
-		const s = ((y + j) * image.width + x) * 4;
-		out.set(image.data.subarray(s, s + w * 4), j * w * 4);
+		const s = ((y + j) * image.width + x) * channels;
+		out.set(image.data.subarray(s, s + w * channels), j * w * channels);
 	}
 	return out;
 }
 
-export function writeRect(image: RGBAPixels, r: float2.extent, src: Uint8ClampedArray) {
+export function writeRect(image: Pixels, r: float2.extent, src: Uint8ClampedArray) {
 	const {x, y} = r.min, {x: w, y: h} = r.size();
+	const channels	= image.channels ?? 4;
 	for (let j = 0; j < h; j++)
-		image.data.set(src.subarray(j * w * 4, (j + 1) * w * 4), ((y + j) * image.width + x) * 4);
+		image.data.set(src.subarray(j * w * channels, (j + 1) * w * channels), ((y + j) * image.width + x) * channels);
 }
 
 
@@ -363,17 +338,12 @@ export function bitmapToImage(bitmap: ImageBitmap) {
 // Canvas3D
 //-----------------------------------------------------------------------------
 
-function getScreenRayDirection(rect: DOMRect, x: number, y: number, fovy: number): float3 {
-	const ndcX	= ((x - rect.left) / rect.width) * 2 - 1;
-	const ndcY	= 1 - ((y - rect.top) / rect.height) * 2;
-
-	const aspect = rect.width / rect.height;
-	return normalise(float3(ndcX * aspect / fovy, ndcY / fovy, -1));
-}
-
-export function pointerToCanvas(rect: DOMRect, x: number, y: number): float2 {
+export function rectRelative(rect: DOMRect, x: number, y: number): float2 {
 	const pixelRatio  = window.devicePixelRatio || 1;
 	return float2((x - rect.left) * pixelRatio, (y - rect.top) * pixelRatio);
+}
+export function rectNormal(rect: DOMRect, x: number, y: number): float2 {
+	return float2((x - rect.left) / rect.width, (y - rect.top) / rect.height);
 }
 
 export interface Canvas3DOptions {
@@ -469,10 +439,7 @@ export class Canvas3D {
 		this.canvas.height = Math.max(1, Math.floor(rect.height * pixelRatio));
 	}
 	toCanvas(x: number, y: number) {
-		return pointerToCanvas(this.canvas.getBoundingClientRect(), x, y);
-	}
-	rayDirection(x: number, y: number, fov: number) {
-		return getScreenRayDirection(this.canvas.getBoundingClientRect(), x, y, fov);
+		return rectRelative(this.canvas.getBoundingClientRect(), x, y);
 	}
 	bindTexture(target: number, texture: WebGLTexture | null, unit = 0) {
 		this.gl.activeTexture(this.gl.TEXTURE0 + unit);
@@ -541,7 +508,7 @@ export class Canvas3D {
 		gl.bindTexture(gl.TEXTURE_2D, null);
 	}
 	// one face of a cube texture, or a part of it
-	updateCubeFace(texture: WebGLTexture, face: number, image: RGBAPixels, rect?: float2.extent) {
+	updateCubeFace(texture: WebGLTexture, face: number, image: Pixels<4>, rect?: float2.extent) {
 		const gl = this.gl;
 		const {x, y} = rect?.min ?? float2(0, 0), {x: w, y: h} = rect?.size() ?? float2(image.width, image.height);
 		gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
@@ -551,7 +518,7 @@ export class Canvas3D {
 		gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
 	}
 	// one slice of an array texture, or a part of it
-	updateTextureLayer(texture: WebGLTexture, layer: number, image: RGBAPixels, rect?: float2.extent) {
+	updateTextureLayer(texture: WebGLTexture, layer: number, image: Pixels<4>, rect?: float2.extent) {
 		const gl = this.gl;
 		const {x, y} = rect?.min ?? float2(0, 0), {x: w, y: h} = rect?.size() ?? float2(image.width, image.height);
 		gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);

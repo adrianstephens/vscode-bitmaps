@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Font Viewer</title>
+	<script type="importmap">{"imports": {
+		"@isopodlabs/vscode_utils/webview/": "../node_modules/@isopodlabs/vscode_utils/dist/webview/",
+		"@isopodlabs/maths/vector": "../node_modules/@isopodlabs/maths/esm/vector.js",
+		"@isopodlabs/maths/quaternion": "../node_modules/@isopodlabs/maths/esm/quaternion.js",
+		"@isopodlabs/maths/geometry": "../node_modules/@isopodlabs/maths/esm/geometry.js",
+		"@isopodlabs/maths/linear": "../node_modules/@isopodlabs/maths/esm/linear.js",
+		"@isopodlabs/binary": "../node_modules/@isopodlabs/binary/esm/index.js",
+		"@isopodlabs/binary_ml/browser": "../node_modules/@isopodlabs/binary_ml/esm/browser.js",
+		"@isopodlabs/xml": "../node_modules/@isopodlabs/xml/esm/xml.js",
+		"@isopodlabs/binary_bitmaps": "../node_modules/@isopodlabs/binary_bitmaps/esm/browser.js",
+		"@isopodlabs/binary_fonts": "../node_modules/@isopodlabs/binary_fonts/esm/browser.js",
+		"@isopodlabs/binary_fonts/curves": "../node_modules/@isopodlabs/binary_fonts/esm/curves.js"
+	}}</script>
+	<link rel="stylesheet" href="../node_modules/@isopodlabs/vscode_utils/assets/shared.css">
+	<link rel="stylesheet" href="../node_modules/@isopodlabs/vscode_utils/assets/tree.css">
+	<link rel="stylesheet" href="../assets/pathedit.css">
+	<link rel="stylesheet" href="../assets/font.css">
+	<link rel="stylesheet" href="../assets/svg.css">
+	<link rel="stylesheet" href="../assets/scad.css">
+	<link rel="stylesheet" href="../assets/bitmap.css">
+	<link rel="stylesheet" href="../assets/cascade.css">
+</head>
+<body class="tensors" style="--cascade-size:32px;--cascade-scale:1;--cascade-magnify:1.6">
+	<div id="font-toolbar">
+		<select id="font-face" class="hidden"></select>
+		<label>Size <input id="font-size" type="number" min="6" max="1000" value="56"> px</label>
+		<label><input id="font-unicode" type="checkbox"> Mapped only</label>
+	</div>
+	<div id="font-sample-box" title="Type to change the sample; scroll to change the size">
+		<input id="font-sample" type="text" value="The quick brown fox jumps over the lazy dog 0123456789" spellcheck="false" autocomplete="off">
+		<div id="font-sample-out"></div>
+	</div>
+	<div id="font-body">
+		<div id="font-side">
+			<div id="font-detail"></div>
+			<div id="font-layers" class="hidden">
+				<div id="font-layer-tree" class="layer-tree"></div>
+				<div id="font-layer-props" class="layer-props"></div>
+			</div>
+			<div id="font-meta"></div>
+			<div id="font-tables"></div>
+		</div><div id="font-splitter" class="splitter"></div><div id="font-grid"></div><div id="font-inspector" class="hidden">
+			<div id="insp-bar"><span id="insp-title"></span></div>
+			<div id="insp-view"></div>
+		</div>
+	</div>
+	<pre id="scad-error" class="hidden"></pre>
+	<div id="web-status" style="position:fixed;left:0;right:0;bottom:0;padding:2px 8px;font:12px sans-serif;opacity:.8;pointer-events:none"></div>
+	<!-- the page talks to this instead of to the extension: it must exist before the page's modules run -->
+	<script type="module" src="./font-host.js"></script>
+</body>
+</html>

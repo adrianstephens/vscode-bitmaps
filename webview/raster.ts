@@ -3,19 +3,22 @@
 // imports none of them, so it can be used before bitmap.ts has run.
 
 import { float2, float3, float4, float3x3, float4x4 } from '@isopodlabs/maths/vector';
-import type { Canvas3D, ShaderProgram, Pixels } from './opengl.js';
+import type { Canvas3D, ShaderProgram } from './opengl.js';
 import type { Selection } from './bitmapSelection.js';
-import { Offscreen, readRect, writeRect, imageRect, unionRect, RGBAPixels, createVertexArray } from './opengl.ts';
+import { Offscreen, readRect, Pixels, getPixel, createVertexArray } from './opengl.ts';
 import { clamp01 } from './colour.ts';
 import { type Warp, type Carry, carriedBounds } from './transformbox.ts';
 
-export const TILE = 64;
+export const imageSize	= (p: {width: number, height: number}) => float2(p.width, p.height);
+export const imageRect	= (p: {width: number, height: number}) => float2.extent.fromSize(float2(0, 0), imageSize(p));
+export const unionRect	= (a: float2.extent | undefined, b: float2.extent | undefined) => !a ? b : !b ? a : a.union(b);
 
-export function roundOut(ext: float2.extent) {
-	return new float2.extent(float2(Math.floor(ext.min.x), Math.floor(ext.min.y)), float2(Math.ceil(ext.max.x), Math.ceil(ext.max.y)));
-}
+export const roundOut	= (a: float2.extent, e = 0) => new float2.extent(
+	float2(Math.floor(a.min.x + e), Math.floor(a.min.y + e)),
+	float2(Math.ceil(a.max.x - e), Math.ceil(a.max.y - e))
+);
 
-export function alphaExtent(image: RGBAPixels) {
+export function alphaExtent(image: Pixels<4>) {
 	const {data: data, width, height} = image;
 	if (!width || !height)
 		return;
@@ -55,13 +58,13 @@ export function alphaExtent(image: RGBAPixels) {
 
 
 export class Shape extends float2.extent {
-	constructor(area: float2.extent, readonly mask?: Uint8ClampedArray) {
+	constructor(area: float2.extent, readonly mask?: Uint8ClampedArray<ArrayBuffer>) {
 		super(area.min, area.max);
 	}
 }
 
 // The alpha of an image within its extent, as a shape placed at (left, top)
-export function alphaShape(image: RGBAPixels, left: number, top: number): Shape | undefined {
+export function alphaShape(image: Pixels<4>, left: number, top: number): Shape | undefined {
 	const ext = alphaExtent(image);
 	if (!ext)
 		return;
@@ -74,92 +77,6 @@ export function alphaShape(image: RGBAPixels, left: number, top: number): Shape 
 			alpha[d + x] = image.data[s];
 	}
 	return new Shape(float2.extent.fromSize(float2(left + x0, top + y0), float2(w, h)), alpha);
-}
-
-// The image is changed in tiles, and the first time a tile is touched its original pixels are kept. That is what undo needs,
-// and it also lets a stroke be correct where it overlaps itself: every pixel is worked out from its original value and
-// the greatest coverage the stroke has given it, so a translucent stroke is no darker where it crosses itself. And a preview
-// (a line being dragged out) is `reset` and drawn again.
-
-class Tile extends float2.extent {
-	before:	Uint8ClampedArray;	// the original pixels, packed
-	cover:	Float32Array;		// the greatest coverage so far, per pixel
-	constructor(image: RGBAPixels, r: float2.extent) {
-		super(r.min, r.max.min(float2(image.width, image.height)));
-		// packed at the width of the tile as it falls on the image, which is less than TILE at the right and bottom edges
-		this.before = readRect(image, this);
-		const {x: w, y: h} = this.size();
-		this.cover = new Float32Array(w * h);
-	 }
-}
-
-export class Tiles {
-	protected tiles = new Map<number, Tile>();
-	protected dirty: float2.extent | undefined;
-
-	constructor(readonly image: RGBAPixels) {}
-
-	protected tile(x: number, y: number) {
-		const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
-		const key = ty * 65536 + tx;
-		let t = this.tiles.get(key);
-		if (!t) {
-			t = new Tile(this.image, new float2.extent(float2(tx, ty).scale(TILE), float2(tx + 1, ty + 1).scale(TILE)));
-			this.tiles.set(key, t);
-		}
-		return t;
-	}
-
-	// the area changed since the last call
-	take() {
-		const r = this.dirty;
-		this.dirty = undefined;
-		return r;
-	}
-	// back to the original, to draw again
-	reset() {
-		for (const t of this.tiles.values()) {
-			writeRect(this.image, t, t.before);
-			t.cover.fill(0);
-			// a copy: a pixel put afterwards grows the dirty area in place, and it must not be the tile that does
-			this.dirty = (this.dirty ?? t).union(t);
-		}
-	}
-
-	// what changed, to undo or redo; nothing if nothing did
-	commit(): Patch | undefined {
-		const tiles: PatchTile[] = [];
-		for (const t of this.tiles.values()) {
-			const after = readRect(this.image, t);
-			if (after.some((v, i) => v !== t.before[i]))
-				tiles.push(new PatchTile(t, after));
-		}
-		return tiles.length ? {tiles} : undefined;
-	}
-}
-
-export class PatchTile extends float2.extent {
-	before:	Uint8ClampedArray;	// the original pixels, packed
-	constructor(tile: Tile, public after:Uint8ClampedArray) {
-		super(tile.min, tile.max);
-		this.before = tile.before;
-	}
-}
-export interface Patch {
-	tiles: PatchTile[];
-}
-
-export function applyPatch(image: RGBAPixels, patch: Patch, which: 'before' | 'after') {
-	let dirty: float2.extent | undefined;
-	for (const t of patch.tiles) {
-		writeRect(image, t, t[which]);
-		dirty = unionRect(dirty, t);
-	}
-	return dirty;
-}
-export function crop(image: RGBAPixels, r: float2.extent): RGBAPixels {
-	const {x: width, y: height} = r.size();
-	return {data: readRect(image, r), width, height};
 }
 
 //-----------------------------------------------------------------------------
@@ -233,6 +150,10 @@ export function drawQuad(canvas3d: Canvas3D, program: ShaderProgram, texture: We
 		program.use({u_warp: 0, u_span: [0, 0, 1, 1]});
 }
 
+export function crop<P extends Pixels>(image: P, r: float2.extent): P {
+	const {x: width, y: height} = r.size();
+	return {...image, data: readRect(image, r), width, height};
+}
 
 // (a pixel is as many bytes as the image's channels: 4 for the colours of a picture, 1 for a mask)
 export function flip<P extends Pixels>(image: P, horizontal: boolean): P {
@@ -269,7 +190,7 @@ export function rotate<P extends Pixels>(image: P, clockwise: boolean): P {
 export function warpCPU<P extends Pixels>(image: P, m: float3x3, area: float2.extent, outside = 0): P {
 	const {data: data, width, height} = image, channels = image.channels ?? 4;
 	const {x: rx, y: ry} = area.min, {x: rw, y: rh} = area.size();
-	const out = new Uint8ClampedArray(rw * rh * channels);
+	const out = newData(data, rw * rh * channels);
 	const inv = m.inverse();
 
 	// how many samples a side a pixel: by how far apart its neighbours' samples are in the image, the most of that anywhere
@@ -354,28 +275,82 @@ export function warpCPU<P extends Pixels>(image: P, m: float3x3, area: float2.ex
 
 const MAX_TILE = 4096;
 
+// a new array for pixels of the same kind as these (bytes, or floats)
+const newData = (like: Pixels['data'], n: number) => (like instanceof Float32Array ? new Float32Array(n) : new Uint8ClampedArray(n)) as Pixels['data'];
+
 export function warp<P extends Pixels>(canvas3d: Canvas3D, program: ShaderProgram, image: P, m: float3x3, area: float2.extent, outside = 0): P {
-	const gl = canvas3d.gl, channels = image.channels ?? 4;
+	const {width, height, data} = image;
+	const channels = image.channels ?? 4;
+	const {x: rw, y: rh} = area.size();
+	const floats = data instanceof Float32Array;
+	const out = newData(data, rw * rh * channels);
+
+	const w = m.z.z;
+	if (w && Math.abs(m.x.z) === 0 && Math.abs(m.y.z) === 0) {
+		const xx = m.x.x / w, xy = m.x.y / w, yx = m.y.x / w, yy = m.y.y / w, tx = m.z.x / w, ty = m.z.y / w;
+		const unit = (v: number) => v === -1 || v === 1;
+		// (a flip or quarter turn by whole pixels, which is a copy: each output axis from one input axis, so that centres land on centres)
+		const exact = ([xx, yy].every(unit) && !xy && !yx) || ([xy, yx].every(unit) && !xx && !yy);
+		if (exact && Number.isInteger(tx) && Number.isInteger(ty)) {
+			if (xx === 1 && yy === 1 && !tx && !ty && width === rw && height === rh && !area.min.x && !area.min.y)
+				return image;
+
+			// Each pixel lands where its centre does: along an axis it moves by v + t, or by -v - 1 + t where that is reversed (v the pixel's
+			// column or row), and the area's own corner is taken off. Of each output axis one input axis is the source: along that the
+			// output steps by 1 or -1 a pixel, and along the other it holds still.
+			const to_ = (v: number, sign: number) => sign > 0 ? v : -v - 1;
+			const words = channels === 4 && !floats && data.byteOffset % 4 === 0;
+			const from = words ? new Uint32Array(data.buffer, data.byteOffset, width * height) : undefined, wout = words ? new Uint32Array(out.buffer, out.byteOffset, rw * rh) : undefined;
+			const stepX = xx || 0, stepY = xy || 0;		// (the output's column and row, a pixel to the right)
+			for (let y = 0; y < height; y++) {
+				const startX = (xx ? to_(0, xx) : to_(y, yx)) + tx - area.min.x, startY = (xy ? to_(0, xy) : to_(y, yy)) + ty - area.min.y;
+				if (xx === 1) {
+					// the row stays a row, in the same direction: copied whole, as much of it as the area holds
+					if (startY < 0 || startY >= rh)
+						continue;
+					const x0 = Math.max(0, -startX), x1 = Math.min(width, rw - startX);
+					if (x1 > x0)
+						out.set(data.subarray((y * width + x0) * channels, (y * width + x1) * channels), (startY * rw + startX + x0) * channels);
+					continue;
+				}
+				for (let x = 0; x < width; x++) {
+					const dx = startX + stepX * x, dy = startY + stepY * x;
+					if (dx < 0 || dy < 0 || dx >= rw || dy >= rh)
+						continue;	// (beyond the area)
+					if (from && wout) {
+						wout[dy * rw + dx] = from[y * width + x];
+					} else {
+						const o = (dy * rw + dx) * channels, i = (y * width + x) * channels;
+						for (let c = 0; c < channels; c++)
+							out[o + c] = data[i + c];
+					}
+				}
+			}
+
+			return {...image, data: out, width: rw, height: rh};
+		}
+
+	}
+	const gl = canvas3d.gl;
 	const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
-	const {x: rw, y: rh} = area.size();
 
-	if (!program || !(image.data instanceof Uint8ClampedArray || image.data instanceof Uint8Array)
+	// (floats are kept as floats all the way, which needs a target they can be drawn into)
+	if (!program || !(data instanceof Uint8ClampedArray || data instanceof Uint8Array || floats && gl.getExtension('EXT_color_buffer_float'))
 		|| (channels !== 4 && channels !== 1)
-		|| !image.width || !image.height || image.width > maxSize || image.height > maxSize
+		|| !width || !height || width > maxSize || height > maxSize
 		|| rw <= 0 || rh <= 0)
 		return warpCPU(image, m, area, outside);
 
 	const {x: rx, y: ry} = area.min;
 	const source	= channels === 4
-		? canvas3d.createTextureFromImage(image, {min: 'nearest', mag: 'nearest'})
-		: canvas3d.createTexture(image.width, image.height, image.data, {format: 'r8', min: 'nearest', mag: 'nearest'});
+		? canvas3d.createTextureFromImage(image, {format: floats ? 'rgba32f' : 'rgba8', min: 'nearest', mag: 'nearest'})
+		: canvas3d.createTexture(width, height, data, {format: floats ? 'r32f' : 'r8', min: 'nearest', mag: 'nearest'});
 	const tile		= Math.min(MAX_TILE, maxSize, ...(gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array));
-	const target	= canvas3d.createOffscreen(Math.min(rw, tile), Math.min(rh, tile));
+	const target	= canvas3d.createOffscreen(Math.min(rw, tile), Math.min(rh, tile), floats ? 'rgba32f' : 'rgba8');
 	const inv		= m.inverse();
 
-	const out		= new Uint8ClampedArray(rw * rh * channels);
-	const read		= new Uint8ClampedArray(Math.min(rw, tile) * Math.min(rh, tile) * 4);
+	const read		= newData(data, Math.min(rw, tile) * Math.min(rh, tile) * 4) as Uint8ClampedArray<ArrayBuffer>;	// (or floats: the one array is read into as either)
 	const blend		= gl.isEnabled(gl.BLEND);
 	gl.disable(gl.BLEND);
 	target.begin();
@@ -391,14 +366,14 @@ export function warp<P extends Pixels>(canvas3d: Canvas3D, program: ShaderProgra
 				u_image:	0,
 				u_inverse:	[t.x.x, t.x.y, t.x.z, t.y.x, t.y.y, t.y.z, t.z.x, t.z.y, t.z.z],
 				u_mask:		channels === 1 ? 1 : 0,
-				u_outside:	outside / 255,
+				u_outside:	floats ? outside : outside / 255,
 			});
 			const tileRead = read.subarray(0, tw * th * 4);
-			gl.readPixels(0, 0, tw, th, gl.RGBA, gl.UNSIGNED_BYTE, tileRead);
+			gl.readPixels(0, 0, tw, th, gl.RGBA, floats ? gl.FLOAT : gl.UNSIGNED_BYTE, tileRead as Uint8ClampedArray);
 			for (let j = 0; j < th; j++) {
 				const o = ((ty + j) * rw + tx) * channels;
 				if (channels === 4) {
-					out.set(tileRead.subarray(j * tw * 4, (j + 1) * tw * 4), o);
+					(out as Uint8ClampedArray).set(tileRead.subarray(j * tw * 4, (j + 1) * tw * 4), o);
 				} else {
 					for (let i = 0; i < tw; i++)
 						out[o + i] = tileRead[(j * tw + i) * 4];
@@ -512,10 +487,10 @@ export function meshWarp<P extends Pixels>(canvas3d: Canvas3D, program: ShaderPr
 
 // The part of a picture a selection covers, lifted out (what is partly selected partly, and the rest not at all), and the picture
 // with that part taken from it
-export function liftSelection(image: RGBAPixels, s: Selection) {
+export function liftSelection(image: Pixels<4>, s: Selection) {
 	const {width, height, data: src} = image;
-	const floating	= RGBAPixels(new Uint8ClampedArray(width * height * 4), width, height);
-	const rest		= RGBAPixels(src.slice(), width, height);
+	const floating	= Pixels<4>(new Uint8ClampedArray(width * height * 4), width, height);
+	const rest		= Pixels<4>(src.slice(), width, height);
 	const f = floating.data as Uint8ClampedArray, d = rest.data as Uint8ClampedArray;
 	for (let y = Math.max(0, s.min.y); y < Math.min(height, s.max.y); y++) {
 		for (let x = Math.max(0, s.min.x); x < Math.min(width, s.max.x); x++) {
@@ -533,7 +508,7 @@ export function liftSelection(image: RGBAPixels, s: Selection) {
 
 // A picture with what a selection covers carried (from its pixels' coordinates): the rest of it is left as it was, but where the
 // selected part was, and the carried part laid over it where that lands. `warp` carries pixels (on the GPU, if it is able).
-export function warpSelected(image: RGBAPixels, s: Selection, carry: Carry, warp: (image: RGBAPixels, c: Carry, area: float2.extent) => RGBAPixels) {
+export function warpSelected(image: Pixels<4>, s: Selection, carry: Carry, warp: (image: Pixels<4>, c: Carry, area: float2.extent) => Pixels<4>) {
 	const {floating, rest} = liftSelection(image, s);
 	const area = carriedBounds(carry, s.bounds())?.intersect(imageRect(image));
 	if (area && !area.empty()) {
@@ -823,7 +798,7 @@ function shadeOnce(canvas3d: Canvas3D, program: ShaderProgram, image: Pixels, ar
 			program.draw({u_image: 0, u_original: 1, u_origin: [draws.min.x - readAt.x, draws.min.y - readAt.y], u_originalAt: [draws.min.x, draws.min.y], ...pass.uniforms});
 			if (last) {
 				// (always read as rgba, which is what a target can be read as; a single channel is the red)
-				let data: RGBAPixels['data'];
+				let data: Pixels<4>['data'];
 				if (floats) {
 					data = new Float32Array(w * h * 4);
 					gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, data);

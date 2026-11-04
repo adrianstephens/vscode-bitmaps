@@ -131,6 +131,22 @@ vec3 localLight(vec3 n, vec3 view, float mat, float diffuseWeight) {
 	return diffuse * (vec3(1.0) - fres) + high;
 }
 
+
+// The floor's colour between its lines and on them, and how the two lights in the camera's frame (as the models' own
+// shading has them) light it
+//const vec3 FLOOR_BASE = vec3(0.26, 0.28, 0.31);
+//const vec3 FLOOR_LINE = vec3(0.62, 0.65, 0.70);
+const vec3 FLOOR_BASE = vec3(0.0, 0.0, 0.0);
+const vec3 FLOOR_LINE = vec3(1.0, 1.0, 1.0);
+vec3 floorColour(float lines) {
+	return mix(FLOOR_BASE, FLOOR_LINE, lines);
+}
+float floorLight() {
+	vec3 key	= normalize(u_basis * vec3(-0.4, 0.6, 0.7));
+	vec3 fill	= normalize(u_basis * vec3(0.7, -0.2, 0.5));
+	return 0.45 + 0.55 * max(key.z, 0.0) + 0.2 * max(fill.z, 0.0);
+}
+
 // The floor's own colour: the grid, the two lights, the darkening where the model is near it, and the haze that
 // dissolves it into the background with distance. Every ray that meets the floor gets this, not only the first one.
 // The floor only hides the background: whatever of the model is on the far side of it is seen through it, tinted,

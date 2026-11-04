@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Mesh Viewer</title>
+	<script type="importmap">{"imports": {
+		"@isopodlabs/vscode_utils/webview/": "../node_modules/@isopodlabs/vscode_utils/dist/webview/",
+		"@isopodlabs/maths/vector": "../node_modules/@isopodlabs/maths/esm/vector.js",
+		"@isopodlabs/maths/quaternion": "../node_modules/@isopodlabs/maths/esm/quaternion.js",
+		"@isopodlabs/maths/geometry": "../node_modules/@isopodlabs/maths/esm/geometry.js",
+		"@isopodlabs/maths/linear": "../node_modules/@isopodlabs/maths/esm/linear.js",
+		"@isopodlabs/binary": "../node_modules/@isopodlabs/binary/esm/index.js",
+		"@isopodlabs/binary_ml/browser": "../node_modules/@isopodlabs/binary_ml/esm/browser.js",
+		"@isopodlabs/xml": "../node_modules/@isopodlabs/xml/esm/xml.js",
+		"@isopodlabs/binary_bitmaps": "../node_modules/@isopodlabs/binary_bitmaps/esm/browser.js",
+		"@isopodlabs/binary_fonts": "../node_modules/@isopodlabs/binary_fonts/esm/browser.js",
+		"@isopodlabs/binary_fonts/curves": "../node_modules/@isopodlabs/binary_fonts/esm/curves.js"
+	}}</script>
+	<link rel="stylesheet" href="../node_modules/@isopodlabs/vscode_utils/assets/shared.css">
+	<link rel="stylesheet" href="../assets/bitmap.css">
+	<link rel="stylesheet" href="../assets/cascade.css">
+	<link rel="stylesheet" href="../assets/scad.css">
+	<style>
+		:root { --vscode-editor-background: #1e1e1e; --vscode-foreground: #cccccc; --vscode-editor-font-family: ui-monospace, Menlo, Consolas, monospace; }
+		html, body { height: 100%; margin: 0; background: var(--vscode-editor-background); color: var(--vscode-foreground); }
+		body.tensors { flex-direction: column; }
+		#mesh-bar { flex: none; display: flex; gap: 8px; align-items: center; padding: 4px 10px; font: 12px sans-serif; border-bottom: 1px solid #3c3c3c; }
+		#mesh-bar button, #mesh-bar select { font: inherit; }
+		#mesh-bar .spacer { flex: 1; }
+	</style>
+</head>
+<body class="tensors">
+	<div id="mesh-bar">
+		<span id="mesh-name">Mesh viewer</span>
+		<span class="spacer"></span>
+		<button id="mesh-open" title="Open a mesh (and the files it names: an OBJ's .mtl, textures) or drop them on the page">Open…</button>
+		<select id="mesh-format" title="The format Save writes"></select>
+		<button id="mesh-save" title="Save the mesh (Ctrl/Cmd+S), as simplified">Save</button>
+	</div>
+	<div id="main">
+		<canvas id="viewport"></canvas>
+		<div id="scad-tooltip" class="hidden"></div>
+		<div id="scad-info"></div>
+		<pre id="scad-error" class="hidden"></pre>
+	</div>
+	<!-- the page talks to this instead of to the extension: it must exist before the page's modules run -->
+	<script type="module" src="./mesh-host.js"></script>
+</body>
+</html>

@@ -19,6 +19,7 @@
 		"node_modules/@isopodlabs/binary_bitmaps/dist/*.js",
 		"node_modules/@isopodlabs/binary_fonts/dist/*.js",
 		"node_modules/@isopodlabs/binary_ml/dist/*.js",
+		"node_modules/@isopodlabs/binary_ml/esm/*.js",
 		"node_modules/@isopodlabs/binary_meshes/dist/*.js",
 		"node_modules/@isopodlabs/binary_archives/dist/*.js",
 		"node_modules/@isopodlabs/xml/dist/*.js",
@@ -81,6 +82,9 @@
 					},
 					{
 						"filenamePattern": "*.tiff"
+					},
+					{
+						"filenamePattern": "*.webp"
 					}
 				]
 			},
@@ -175,6 +179,16 @@
 			}
 		],
 		"commands": [
+			{
+				"command": "bitmap.new",
+				"title": "Bitmap...",
+				"category": "Bitmap"
+			},
+			{
+				"command": "svg.new",
+				"title": "SVG Drawing...",
+				"category": "SVG"
+			},
 			{
 				"command": "bitmap.fit",
 				"title": "Fit to Window",
@@ -282,6 +296,16 @@
 			}
 		],
 		"menus": {
+			"file/newFile": [
+				{
+					"command": "bitmap.new",
+					"group": "file"
+				},
+				{
+					"command": "svg.new",
+					"group": "file"
+				}
+			],
 			"editor/title": [
 				{
 					"command": "scad.openPreview",
@@ -419,10 +443,13 @@
 		}
 	},
 	"scripts": {
-		"build": "tsc -b",
-		"watch": "tsc -b -watch",
-		"build-link": "tsc -b ./tsconfig.link.json",
-		"watch-link": "tsc -b -watch ./tsconfig.link.json",
+		"build": "tsc -b . ./web",
+		"web": "node web/serve.js",
+		"build-web": "node web/build.js",
+		"watch-web": "node web/build.js --watch",
+		"watch": "tsc -b -watch . ./web",
+		"build-link": "tsc -b ./tsconfig.link.json ./web/tsconfig.link.json",
+		"watch-link": "tsc -b -watch ./tsconfig.link.json ./web/tsconfig.link.json",
 		"link": "npm link @isopodlabs/binary @isopodlabs/binary_archives @isopodlabs/binary_bitmaps @isopodlabs/binary_fonts @isopodlabs/binary_meshes @isopodlabs/binary_ml @isopodlabs/dwg @isopodlabs/maths @isopodlabs/tison @isopodlabs/utilities @isopodlabs/vscode_utils",
 		"update": "npm install @isopodlabs/binary@latest @isopodlabs/binary_bitmaps@latest @isopodlabs/binary_ml@latest @isopodlabs/binary_fonts@latest @isopodlabs/binary_meshes@latest @isopodlabs/maths@latest @isopodlabs/utilities @isopodlabs/vscode_utils@latest"
 	},

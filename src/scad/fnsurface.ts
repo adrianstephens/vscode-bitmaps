@@ -372,13 +372,119 @@ function build<F>(root: Node | Node[], ret: string): F {
 // the function itself
 //-----------------------------------------------------------------------------
 
+// How steep a height field is, place by place: a bound on the rate of change of F = z - h, for a ray or a cube to divide the
+// field by where one bound for the whole field would be that of its steepest corner -- a cusp a hundred times steeper than the
+// rest makes every step of a ray, and every cube the mesher cannot rule out, a hundred times too small.
+// h is sampled over the rectangle; each cell takes the larger of the gradient there and the chord slopes to its neighbours (a
+// cliff between two samples is no gradient of either, but the change across the gap is), with room for what that stepped over,
+// and then the largest of its neighbours', so that the value read anywhere in a cell -- bilinear between cells as the texture
+// is read, which is never less than the least of the four around it -- covers all the cell's surroundings. The coarser levels
+// are the largest of a block of the finer, for a window as wide as they are: a ray far from the surface may step further than
+// a cell. Only a guess, as any sampling is: a spike narrower than a cell that no chord crosses is missed.
+const SLOPE_CELLS = 512;
+const SLOPE_MARGIN = 1.25;
+// What the field is divided by is no more than this, whatever the map says. A ray is a hit when the field is under a small
+// distance, so a field short of the distance by a factor G puts the hit G times that distance too far out: with the 1770 of a
+// cusp, a ray 50 units above the surface is a hit, and the cells of the map show as blocks. The cost is a step that may be
+// longer than the bound allows where the surface is steeper than this -- a ray grazing a wall can pass through a thin feature
+// -- which only the mesher, reading the map itself (see FieldFn.reach), has no way of putting up with.
+const SLOPE_CAP = 30;
+// Which levels the shader reads: three, from the second finest. More are fewer steps for a ray in the open, each a lookup;
+// the finest has the cells the mesher needs but is a texture of its own megabytes, which costs more to read than the steps
+// it saves, and the cap on the scale leaves the shader no use for its detail.
+// what the field is divided by close to the surface, a hit's worth of the distance (a hit is at 1 / this of the vertical gap over
+// a flat surface; the test of a ray leaving the surface needs it under 2)
+const NEAR_SCALE = 1.5;
+const SHADER_FROM = 1;
+const SHADER_LEVELS = 3;
+const SLOPE_STEP = 4;				// how many cells of a level make one of the next
+export class SlopeMap {
+	readonly levels: {n: number, cell: number, tex: Texture}[] = [];
+	max = 1;
+	constructor(readonly x0: number, readonly x1: number, readonly y0: number, readonly y1: number,
+		lipschitz: (x: number, y: number) => number, height: (x: number, y: number) => number) {
+		const n = SLOPE_CELLS, dx = (x1 - x0) / n, dy = (y1 - y0) / n;
+		const h = new Float64Array(n * n), g = new Float64Array(n * n).fill(1);
+		for (let j = 0; j < n; j++)
+			for (let i = 0; i < n; i++) {
+				const x = x0 + (i + 0.5) * dx, y = y0 + (j + 0.5) * dy;
+				h[j * n + i] = height(x, y);
+				const v = lipschitz(x, y);
+				if (Number.isFinite(v))
+					g[j * n + i] = Math.max(1, v);
+			}
+		// the chord to each neighbour east, north and the two diagonals north: between them every pair
+		for (let j = 0; j < n; j++)
+			for (let i = 0; i < n; i++)
+				for (const [di, dj] of [[1, 0], [0, 1], [1, 1], [-1, 1]]) {
+					const i2 = i + di, j2 = j + dj;
+					if (i2 < 0 || i2 >= n || j2 >= n)
+						continue;
+					const rise = Math.abs(h[j2 * n + i2] - h[j * n + i]), run = Math.hypot(di * dx, dj * dy);
+					const chord = Math.sqrt(1 + (rise / run) ** 2);
+					if (Number.isFinite(chord)) {
+						g[j * n + i] = Math.max(g[j * n + i], chord);
+						g[j2 * n + i2] = Math.max(g[j2 * n + i2], chord);
+					}
+				}
+		let cells = dilate(g.map(v => v * SLOPE_MARGIN), n);
+		for (let size = n; ; size = Math.floor(size / SLOPE_STEP)) {
+			const rgba = new Float32Array(size * size * 4);
+			for (let k = 0; k < size * size; k++) {
+				rgba[k * 4] = cells[k];
+				this.max = Math.max(this.max, cells[k]);
+			}
+			this.levels.push({n: size, cell: Math.min(x1 - x0, y1 - y0) / size, tex: new Texture(size, size, rgba, false)});
+			if (size < SLOPE_STEP * 2)
+				break;
+			const m = Math.floor(size / SLOPE_STEP), coarse = new Float64Array(m * m);
+			for (let j = 0; j < size; j++)
+				for (let i = 0; i < size; i++) {
+					const k = Math.min(Math.floor(j / SLOPE_STEP), m - 1) * m + Math.min(Math.floor(i / SLOPE_STEP), m - 1);
+					coarse[k] = Math.max(coarse[k], cells[j * size + i]);
+				}
+			cells = dilate(coarse, m);
+		}
+	}
+
+	// the bound over a window at least r wide about (x, y): the finest level whose cells are, or the whole field's
+	at(x: number, y: number, r: number): number {
+		for (const {n, cell, tex} of this.levels)
+			if (cell >= r) {
+				const i = Math.min(n - 1, Math.max(0, Math.floor((x - this.x0) / (this.x1 - this.x0) * n)));
+				const j = Math.min(n - 1, Math.max(0, Math.floor((y - this.y0) / (this.y1 - this.y0) * n)));
+				return tex.rgba[(j * n + i) * 4];
+			}
+		return this.max;
+	}
+}
+
+// each cell the largest of itself and its eight neighbours
+function dilate(a: Float64Array, n: number): Float64Array {
+	const out = new Float64Array(a.length);
+	for (let j = 0; j < n; j++)
+		for (let i = 0; i < n; i++) {
+			let m = 0;
+			for (let dj = -1; dj <= 1; dj++)
+				for (let di = -1; di <= 1; di++) {
+					const i2 = i + di, j2 = j + dj;
+					if (i2 >= 0 && i2 < n && j2 >= 0 && j2 < n)
+						m = Math.max(m, a[j2 * n + i2]);
+				}
+			out[j * n + i] = m;
+		}
+	return out;
+}
+
 // A field F(x, y, z), solid where F < 0, and the distance estimate made from it
 export class FieldFn {
 	private js?:	(x: number, y: number, z: number) => number;
 	private raw?:	(x: number, y: number, z: number) => number;
 	private slope?:	(x: number, y: number, z: number) => number;
+	private all?:	(x: number, y: number, z: number) => number[];
+	private fd?:	(x: number, y: number, z: number) => number[];
 
-	constructor(private field: Node, private dist: Node, public nodes: number, private gradient?: Node) {}
+	constructor(private field: Node, private dist: Node, public nodes: number, private gradient?: Node, readonly map?: SlopeMap) {}
 
 	// The steepest the field gets inside a box, by looking at a lattice of n points a side: the length of its gradient,
 	// which is what the field's rate of change is. A lattice can step over a narrow steep place, so the answer is only
@@ -399,6 +505,58 @@ export class FieldFn {
 						worst = Math.max(worst, g);
 				}
 		return worst;
+	}
+
+	// How far the field's estimate can change over a ball of radius r about a point, as a multiple of r: 1 for a distance, less
+	// where the scale it is divided by is a bound from far off that is steeper than the field is here, more where it is not. The
+	// scale the estimate is divided by may be a bound on the gradient taken from far off (or one a user stated and got wrong),
+	// and then the estimate changes by more near a steep place than r, which a mesher that drops a cube whose centre is farther
+	// than that from zero cannot know. So the gradient is looked at, on a lattice of the ball's bounding cube, and the steepest
+	// of it (with room for what the lattice stepped over) is what the field is allowed to change by. Only a guess: a spike narrower
+	// than the lattice that the chords do not cross can still be missed.
+	reach(x: number, y: number, z: number, r: number): number {
+		if (!this.gradient)
+			return 1;
+		// with a map of the slope, the bound over the ball is read from it, where otherwise it is looked for
+		if (this.map) {
+			this.fd ??= build<(x: number, y: number, z: number) => number[]>([this.field, this.dist], 'return [r0, r1];');
+			const [f, d] = this.fd(x, y, z), scale = f / d;
+			return scale > 0 && Number.isFinite(scale) ? this.map.at(x, y, r) / scale : 1;
+		}
+		// the field, its gradient's length and the estimate, together: they share almost all of their work
+		this.all ??= build<(x: number, y: number, z: number) => number[]>([this.field, this.gradient, this.dist], 'return [r0, r1, r2];');
+		const [f, g0, d] = this.all(x, y, z);
+		const scale = f / d;
+		if (!(scale > 0) || !Number.isFinite(scale) || !Number.isFinite(g0))
+			return 1;
+		// the gradient at the centre is a least for the steepest, so a cube the surface passes this close to is kept
+		// whatever the rest of the lattice says
+		const low = Math.max(g0, 1) * REACH_MARGIN / scale;
+		if (Math.abs(d) <= r * low)
+			return Math.max(low, 1);
+		// the gradient at each point, and the slope of the chord from the centre to it: a cliff that falls between the
+		// points is missed by the first and shows in the second as the field's change across the gap
+		let steepest = g0;
+		for (let i = -1; i <= 1; i++)
+			for (let j = -1; j <= 1; j++)
+				for (let k = -1; k <= 1; k++)
+					if (i || j || k) {
+						const [fp, gp] = this.all(x + i * r, y + j * r, z + k * r);
+						if (Number.isFinite(gp))
+							steepest = Math.max(steepest, gp);
+						const chord = Math.abs(fp - f) / (r * Math.hypot(i, j, k));
+						if (Number.isFinite(chord))
+							steepest = Math.max(steepest, chord);
+					}
+		return Math.max(steepest, 1) * REACH_MARGIN / scale;
+	}
+
+	// the length of the field's gradient at a point: how fast it changes just there
+	lipschitz(x: number, y: number, z: number): number {
+		if (!this.gradient)
+			return NaN;
+		this.slope ??= this.build(this.gradient, false);
+		return this.slope(x, y, z);
 	}
 
 	// the estimated distance to the surface, which is negative inside: the field's value over its gradient's length
@@ -831,6 +989,8 @@ export interface FieldOptions {
 	// how big the shape is (half its largest side). With a bound, this says how close to the surface the field is
 	// the gradient's own estimate rather than the bound's: see compileField.
 	size?:		number;
+	// how steep the field is place by place, which replaces the one bound (a height field only)
+	map?:		SlopeMap;
 }
 
 // How cautious the estimate is: a first-order distance is exact only to first order, and a raymarcher that steps all
@@ -846,6 +1006,8 @@ const FLAT = 1e-2;
 const NEAR = 0.01, FAR = 0.05;
 // how much of the gradient's estimate is believed close to the surface
 const NEAR_SAFETY = 0.85;
+// the room reach() leaves for what its lattice missed
+const REACH_MARGIN = 1.25;
 
 // A height field `z = f(x, y)` has the field F = z - f; an implicit surface has F = f(x, y, z) itself. Both are solid
 // where F < 0, and F / |grad F| is the distance estimate (which for a height field is (z - f) / sqrt(1 + |grad f|^2)).
@@ -865,8 +1027,35 @@ export function compileField(definition: FunctionDefinition, resolver: Resolver,
 		const g = [dag.x, dag.y, dag.z].map(v => dag.d(field, v as Var));
 		return dag.op('sqrt', g.reduce((s, n) => dag.op('add', s, dag.op('mul', n, n)), dag.zero));
 	};
-	if (options.bound === undefined) {
-		const len = gradient = gradientLength();
+	// (the length of the gradient is also how fast the field changes just here, which the mesher asks of a cube; see reach())
+	gradient = gradientLength();
+	if (options.map) {
+		// The bound is read from the map at the finest level whose cells are as wide as the step it gives: a ray cannot go
+		// further than the field over the bound, so it is that far round the point that the bound has to hold. Only the
+		// finest few levels are read, the coarsest of them standing for the rest, and no gradient is asked of the shader:
+		// the differentiated function is several times the size of the function, and a step of the map's bound is what a
+		// ray takes in a few more steps (the cap, below, is what keeps the hit where the surface is).
+		const m = options.map, abs = dag.op('abs', field);
+		const levels = m.levels.slice(SHADER_FROM, SHADER_FROM + SHADER_LEVELS);
+		const u = dag.op('div', dag.op('sub', dag.x, dag.num(m.x0)), dag.num(m.x1 - m.x0));
+		const v = dag.op('div', dag.op('sub', dag.y, dag.num(m.y0)), dag.num(m.y1 - m.y0));
+		scale = dag.num(Math.min(m.max, SLOPE_CAP));
+		for (const {cell, tex} of [...levels].reverse()) {
+			const g = dag.op('min', dag.texture(tex, 'tex', 0, u, v), dag.num(SLOPE_CAP));
+			scale = dag.op('sel', dag.op('le', dag.op('div', abs, g), dag.num(cell)), g, scale);
+		}
+		// Within a little of the surface the scale is a small constant instead. A ray is a hit when the field is under a small
+		// distance, and a normal is taken from taps of the field a little way apart: with the bound there, which differs
+		// from cell to cell, the hits are as many different heights and the normals tilt where the taps' scales differ, which
+		// shows as the map's cells. A constant puts them all the same distance out and leaves the normal alone. Steps that
+		// close to the surface are short (the width of the zone over the constant), so a surface steeper than the constant is
+		// overshot by little, and the bound takes over beyond the zone, where it is what keeps a ray from the cliff next door.
+		const near = dag.num(NEAR_SCALE);
+		const size = Math.max(m.x1 - m.x0, m.y1 - m.y0) / 2;
+		const w = dag.op('min', dag.op('max', dag.op('div', dag.op('sub', dag.op('div', abs, near), dag.num(NEAR * size)), dag.num((FAR - NEAR) * size)), dag.zero), dag.one);
+		scale = dag.op('add', near, dag.op('mul', dag.op('sub', scale, near), w));
+	} else if (options.bound === undefined) {
+		const len = gradient;
 		scale = dag.op('mul', dag.op('max', len, dag.num(height ? 1 : FLAT)), dag.num(1 / SAFETY));
 	} else {
 		const far = dag.num(height ? Math.sqrt(1 + options.bound * options.bound) : options.bound);
@@ -875,13 +1064,13 @@ export function compileField(definition: FunctionDefinition, resolver: Resolver,
 		else {
 			// the gradient's estimate near the surface, no less than a quarter of the bound's so a flat spot cannot give a
 			// long step, blended into the bound's by how far (by the bound's own measure) the surface is
-			const near = dag.op('max', dag.op('div', gradientLength(), dag.num(NEAR_SAFETY)), dag.op('mul', far, dag.num(0.25)));
+			const near = dag.op('max', dag.op('div', gradient, dag.num(NEAR_SAFETY)), dag.op('mul', far, dag.num(0.25)));
 			const away = dag.op('div', dag.op('abs', field), far);
 			const w = dag.op('min', dag.op('max', dag.op('div', dag.op('sub', away, dag.num(NEAR * options.size)), dag.num((FAR - NEAR) * options.size)), dag.zero), dag.one);
 			scale = dag.op('add', near, dag.op('mul', dag.op('sub', far, near), w));
 		}
 	}
-	return new FieldFn(field, dag.op('div', field, scale), dag.size, gradient);
+	return new FieldFn(field, dag.op('div', field, scale), dag.size, gradient, options.map);
 }
 
 // A colour that is a function of the point: function(x, y, z) [r, g, b], in the frame the color() was written in, or

@@ -14,6 +14,20 @@ out vec4		fragColor;
 
 //@floor
 
+
+// The floor's colour between its lines and on them, and how the two lights in the camera's frame (as the models' own
+// shading has them) light it
+const vec3 FLOOR_BASE = vec3(0.26, 0.28, 0.31);
+const vec3 FLOOR_LINE = vec3(0.62, 0.65, 0.70);
+vec3 floorColour(float lines) {
+	return mix(FLOOR_BASE, FLOOR_LINE, lines);
+}
+float floorLight() {
+	vec3 key	= normalize(u_basis * vec3(-0.4, 0.6, 0.7));
+	vec3 fill	= normalize(u_basis * vec3(0.7, -0.2, 0.5));
+	return 0.45 + 0.55 * max(key.z, 0.0) + 0.2 * max(fill.z, 0.0);
+}
+
 void main() {
 	vec3 rd = normalize(u_basis * vec3(v_ndc.x * u_aspect / u_fovy, v_ndc.y / u_fovy, -1.0));
 	if (u_floor < 0.5) {

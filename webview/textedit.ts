@@ -5,14 +5,14 @@
 import { createElement, RPC } from '@isopodlabs/vscode_utils/webview/shared.js';
 import { CascadeItem, svgFace, valueItem, choiceItem, toggleItem, colourItems, multiplicativeStep, swatchFace, opItem } from './cascade.js';
 import { toHex, toCss, RGB, clamp01 } from './colour.js';
-import { canvas, canvas3d, programTextWarp, postMessage } from './modes.js';
+import { canvas3d, programTextWarp, postMessage } from './modes.js';
 import { Input, Place } from './navigate.js';
 import { meshWarp, roundOut } from './raster.js';
 import { sampledExtent, Warp, carryPoint, type Carry } from './transformbox.js';
 import { shapeBlocks, openShape } from './shapeedit.js';
 import { float2 } from '@isopodlabs/maths/vector';
 import type { psd } from '@isopodlabs/binary_bitmaps';
-import { curveVertex, makeCurveVertex, ON_BEGIN, ON_CURVE, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
+import { curveVertex, makeCurveVertex, ON_BEGIN, ON_CURVE, OFF_BEZ3 } from '@isopodlabs/binary_fonts/curves';
 import { Descriptor, Lookup, Enum, Default, Long, Double, Text, Engine, E, SpecOf, put, readSpec, withSpec, writeField, EngineDict, EngineValue, EngineAccess, Real, Int, Flag, Reals, Str, Raw, Dict, Elems, Optional, readDict, writeDict, putDict, isDict } from './psdblocks.ts';
 import type { LayeredMode, PixelLayer, ShapeState, PlacedPixels } from './layers.js';
 
@@ -715,7 +715,8 @@ export class TextEditor {
 	private hidden		= false;		// something over it has the picture (a transform): it is out of the way
 	private off?:		() => void;		// it has the picture while it has text: how it gives it back
 
-	constructor(parent: HTMLElement) {
+	constructor(private canvas: HTMLCanvasElement) {
+		const parent = canvas.parentElement!;
 		this.host	= createElement('div', {className: 'textedit-host', style: {position: 'absolute', inset: '0', display: 'none', pointerEvents: 'none', overflow: 'hidden'}});
 		this.frame	= createElement('div', {className: 'textedit-frame', style: {position: 'absolute', outline: '1px dashed rgba(128,128,128,0.9)', pointerEvents: 'none'}});
 		this.input	= createElement('textarea', {
@@ -748,10 +749,12 @@ export class TextEditor {
 				if (layer.blocks)
 					picture.replace(layer, 'Rasterize Text', {kind: 'image', blocks: withoutText(layer.blocks)});
 			}),
-			opItem('<path d="M2.5 13.5L8 2.5l5.5 11M4.5 9.5h7"/>', 'Convert text to shape: make its letters a vector shape, which can no longer be edited as text', async () => {
-				const blocks = layer.blocks, after = await textAsShape(layer, picture.stack);
-				if (after && layer.blocks === blocks && picture.stack.layers.includes(layer))		// (not if it was changed while the fonts were being read)
-					picture.replace(layer, 'Convert Text to Shape', after);
+			opItem('<path d="M2.5 13.5L8 2.5l5.5 11M4.5 9.5h7"/>', 'Convert text to shape: make its letters a vector shape, which can no longer be edited as text', () => {
+				const blocks = layer.blocks;
+				textAsShape(layer, picture.stack).then(after => {
+					if (after && layer.blocks === blocks && picture.stack.layers.includes(layer))		// (not if it was changed while the fonts were being read)
+						picture.replace(layer, 'Convert Text to Shape', after);
+				});
 			})
 		];
 	}
@@ -818,7 +821,7 @@ export class TextEditor {
 	// (a transform) has it. (Its box and handle take their own pointer and keys.)
 	private hold(on: boolean) {
 		if (on && !this.off) {
-			this.off = Input.on(canvas).add({holds: true, covered: by => {
+			this.off = Input.on(this.canvas).add({holds: true, covered: by => {
 				this.hidden = by !== undefined;
 				this.host.style.display = this.hidden ? 'none' : '';
 				if (this.hidden)
@@ -900,7 +903,7 @@ export class TextEditor {
 			return;
 		e.preventDefault();
 		e.stopPropagation();
-		const k = canvas.getBoundingClientRect().width / canvas.width, scale = picture.pan.scale * k;
+		const k = this.canvas.getBoundingClientRect().width / this.canvas.width, scale = picture.pan.scale * k;
 		const from = {x: e.clientX, y: e.clientY, tx: spec.transform[4], ty: spec.transform[5]};
 		this.handle.setPointerCapture(e.pointerId);
 		const move = (m: PointerEvent) => {
@@ -925,7 +928,7 @@ export class TextEditor {
 		if (!spec || !picture)
 			return;
 		// (the canvas's pixels are in the window's: client = pixel * s + t)
-		const pan = picture.pan, r = this.host.getBoundingClientRect(), c = canvas.getBoundingClientRect(), k = c.width / canvas.width;
+		const pan = picture.pan, r = this.host.getBoundingClientRect(), c = this.canvas.getBoundingClientRect(), k = c.width / this.canvas.width;
 		const s = pan.scale * k, tx = c.left + pan.offset.x * k - r.left, ty = c.top + pan.offset.y * k - r.top;
 
 		const layout = layoutText(spec), box = textBox(spec, layout.area);

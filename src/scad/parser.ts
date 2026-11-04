@@ -1,6 +1,6 @@
 import { makeRule, Rules, MaybeList, terminal, Forward, TextPos, WithPrec, makeParser} from '@isopodlabs/tison';
 import { Binary, Unary, Conditional, Literal, Call, Identifier } from '@isopodlabs/tison/ast'
-import type { ScadFiles } from '../filereader';
+import type { SyncFiles } from '../filereader';
 
 //const ID		= terminal('id', /[a-zA-Z0-9_$][a-zA-Z0-9_]*/);
 const ID		= terminal('id', /(?!\d+$)\$?[a-zA-Z0-9_]+/);
@@ -152,7 +152,7 @@ class Ctx {
 	get currfile()	{ return this.file_stack.at(-1)!; }
 	get rootfile()	{ return this.file_stack[0]; }
 
-	constructor(public mainFilePath: string, public files?: ScadFiles) {
+	constructor(public mainFilePath: string, public files?: SyncFiles) {
 		this.file_stack = [new SourceFile(mainFilePath)];
 	}
 
@@ -492,7 +492,7 @@ const lalr = makeParser({
  *  the root scope and pops it again), and an `include` is expanded where it is read, with no I/O to await. */
 export const parser = {
 	tables: lalr.tables,
-	parse(code: string, filename = 'main.scad', files?: ScadFiles): SourceFile {
+	parse(code: string, filename = 'main.scad', files?: SyncFiles): SourceFile {
 		const ctx = new Ctx(filename, files);
 		ctx.scope_stack.push(ctx.rootfile.scope);
 		lalr.parse(code, ctx);
@@ -502,7 +502,7 @@ export const parser = {
 
 // Phase 2. `read` gives a file's text, or undefined if it isn't there -- so the grammar module never
 // imports `fs`, and a caller can pass a Map (tests) or readFileSync (node).
-export function parse(code: string, filename = 'main.scad', files?: ScadFiles): SourceFile {
+export function parse(code: string, filename = 'main.scad', files?: SyncFiles): SourceFile {
 	const ctx = new Ctx(filename, files);
 	const parseOne = (text: string, file: SourceFile) => {
 		ctx.file_stack.push(file);

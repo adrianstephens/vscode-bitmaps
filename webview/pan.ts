@@ -1,9 +1,9 @@
 // The 2D view of a picture: a zoom and an offset (in canvas pixels) of the picture's top left corner. The left button drags
 // the picture, keeping the point of it that was under the cursor there, and the wheel zooms about the cursor. The right
-// button is left to the page (the tools bring up their menu).
+// button drags it too (a right click that has not moved is for the menu).
 import { float2, float2x3 } from '@isopodlabs/maths/vector';
 import { Navigate } from './navigate.js';
-import { pointerToCanvas } from './opengl.js';
+import { rectRelative } from './opengl.js';
 
 const MAX_SCALE	= 256;
 const FIT_SCALE	= 16;	// the most a picture is enlarged to fit
@@ -70,7 +70,7 @@ export class Pan extends Navigate<float2> {
 
 	// a point of the window, in canvas pixels, which the offset is in
 	private toCanvas(clientX: number, clientY: number) {
-		return pointerToCanvas(this.canvas.getBoundingClientRect(), clientX, clientY);
+		return rectRelative(this.canvas.getBoundingClientRect(), clientX, clientY);
 	}
 
 	// the point of the picture (not whole pixels) under a point of the window
@@ -84,8 +84,6 @@ export class Pan extends Navigate<float2> {
 	}
 
 	protected grab(anchor: float2, event: PointerEvent) {
-		if (event.button !== 0)
-			return undefined;
 		return (e: PointerEvent) => {
 			const p = this.toCanvas(e.clientX, e.clientY);
 			this.offset = this.clampOffset(p.sub(anchor.scale(this.scale)));

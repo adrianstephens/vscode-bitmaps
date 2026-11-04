@@ -28,9 +28,10 @@ interface FileEntry {
 	values:		Map<string, {value?: any, error?: string}>;
 }
 
-export interface ScadFiles {
+export interface SyncFiles {
 	resolve(written: string, fromDir: string): string | undefined;
 	read<T>(full: string, key?: string, reader?: Reader<T>): T | undefined;
+	with<T>(run: () => T | Promise<T>): Promise<T>;
 }
 
 export interface AsyncFiles {
@@ -48,7 +49,7 @@ export const asyncFileReader: AsyncFiles = {
 
 const KEEP_RUNS = 32;
 
-export class FileReader implements ScadFiles {
+export class FileReader implements SyncFiles {
 	private entries			= new Map<string, FileEntry | null>();	// null: looked for and not there (or not a file)
 //	private missingStats	= new Set<string>();
 	private missingValues	= new Map<string, Map<string, Reader>>();

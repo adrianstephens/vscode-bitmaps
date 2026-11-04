@@ -2,23 +2,25 @@
 // rotate, crop) move them. The pixel work is plain, and tested outside a webview. Making the picture of them is on the GPU,
 // in gpulayers.ts.
 
-import { float2, float3, float3x3, approx_equal } from '@isopodlabs/maths/vector';
+import { float2, float3, float3x3 } from '@isopodlabs/maths/vector';
 import { createElement } from '@isopodlabs/vscode_utils/webview/shared.js';
 import type { psd } from '@isopodlabs/binary_bitmaps';
-import { drawQuad, maskUniforms, type QuadMask, featherReach, blurMask, liftSelection, warpSelected, alphaExtent, crop, flip, rotate, placed } from './raster.js';
-import { Warp, type Carry, carryPoint, carriedBounds, shiftCarry, planar } from './transformbox.js';
+import { asRGBA } from './colour.js';
+import { drawQuad, maskUniforms, type QuadMask, featherReach, blurMask, liftSelection, warpSelected, alphaExtent, crop, placed } from './raster.js';
+import { Warp, type Carry, carryPoint, carriedBounds, shiftCarry, planar, transformIcons } from './transformbox.js';
 import { type Adjustment, adjustmentKey, adjustmentFace, adjustmentItem, newAdjustmentItem, adjustment } from './layeradj.js';
 import { blendItem, styleItem, EffectRenderer, styleLayers, effectLayers, forgetEffects, type EffectSpec, fillLayer } from './layerfx.js';
 import { ShapeEditor, openShape, shapeSmall, fillSwatch, type ShapeSession, transformBlocks, isShape, hasFill, vectorMask, maskBlock, withMaskFlags, newVectorMask, openVectorMask, fillLayerItem } from './shapeedit.js';
 import { isText, TextEditor, textIcon, newTextLayer, carryText } from './textedit.js';
 
-import { Pixels, PixelStorage, asRGBA, RGBAPixels, imageRect, imageSize, getPixel, resizePixels, Canvas3D, ShaderProgram, Offscreen } from './opengl.js';
+import { Pixels, PixelStorage, imageRect, imageSize, getPixel, resizePixels, Canvas3D, ShaderProgram, Offscreen } from './opengl.js';
 import { Selection } from './bitmapSelection.js';
-import type { DocumentChange, TransformTarget, TransformSession } from './transform.js';
+import { Transformer, type TransformSession } from './transform.js';
 import { SheetFan, type SheetFanHost, type Placement } from './sheetfan.js';
-import { type CascadeItem, opItem, valueItem, sliderItem, toggleItem, svgFace, swatchFace } from './cascade.js';
-import { Dropped, canvas, canvas3d, programBG, programLayer, blank, shader, planeMvp, flatView, menuIcon, viewToggle, viewItem, PictureMode, layerChooser, mode, openMenu, history, warpPixels, Drag, reversed } from './modes.js';
+import { type CascadeItem, type CascadeDrag, opItem, valueItem, sliderItem, toggleItem, svgFace, swatchFace, icons as cascadeIcons, reversed } from './cascade.js';
+import { Dropped, canvas3d, programBG, programLayer, blank, shader, planeMvp, flatView, menuIcon, viewToggle, PictureMode, layerChooser, mode, history } from './modes.js';
 import type { LayerData } from './bitmap.js';
+import { upscale, upscaleItem } from './neural.js';
 
 // what an editor over the picture makes of a layer: its blocks, and its pixels if it makes them (a shape's or text's, not a vector mask's)
 export type ShapeState = Pick<Layer, 'blocks'> & Partial<Pick<PixelLayer, 'image' | 'left' | 'top'>>;
@@ -34,125 +36,11 @@ export interface PlacedPixels<N extends number = 1|4> {
 	top:		number;
 	image:		Pixels<N>;
 }
-export function PlacedPixels<N extends 1 | 4>(left: number, top: number, width: number, height: number, data: PixelStorage, channels: N): PlacedPixels<N> {
-	return {left, top, image: Pixels(data, width, height, channels)};
-}
 
-// A layer's mask: it hides the layer where it is dark. Its pixels are one byte each, over a rectangle which need not be the
-// layer's, outside which it is `default`.
-export interface LayerMask extends PlacedPixels<1> {
-	default:	number;		// 0..255
-	disabled:	boolean;
-	inverted:	boolean;
-	density?:	number;		// 0..255: how much it hides of what it hides (all of it, if not given)
-	feather?:	number;		// how soft its edges are: the sigma of a gaussian, in pixels (which the compositor blurs it by, on the GPU)
-}
 
 function greyRGBA(p?: PixelStorage) { return p && {r: p[0], g: p[0], b: p[0], a: 255}; }
-function placedRect(p: PlacedPixels<number>) {
+function placedRect(p: PlacedPixels) {
 	return float2.extent.fromSize(float2(p.left, p.top), imageSize(p.image));
-}
-
-// what a mask holds at a pixel of the canvas, 0..255
-function storedAt(mask: LayerMask, x: number, y: number) {
-	const mx = x - mask.left, my = y - mask.top, {width, height, data} = mask.image;
-	return mx >= 0 && my >= 0 && mx < width && my < height ? data[my * width + mx] : mask.default;
-}
-
-// how much of the layer a mask leaves at a pixel of the canvas, 0..255: inverted if it says so, and what it hides made less by its
-// density (its feather, which the GPU makes, aside)
-function maskAt(mask: LayerMask, x: number, y: number) {
-	const v = mask.inverted ? 255 - storedAt(mask, x, y) : storedAt(mask, x, y);
-	return 255 - (255 - v) * (mask.density ?? 255) / 255;
-}
-
-// a mask, over the box of these pixels (each 0..255 as `at` gives it), which is `outside` beyond that
-function makeMask(box: float2.extent, outside: number, at: (x: number, y: number) => number): LayerMask {
-	const {x: left, y: top} = box.min, {x: width, y: height} = box.size(), data = new Uint8ClampedArray(width * height);
-	for (let y = 0; y < height; y++)
-		for (let x = 0; x < width; x++)
-			data[y * width + x] = at(x + left, y + top);
-	return {left, top, image: {data, width, height}, default: outside, disabled: false, inverted: false};
-}
-
-/** A mask that shows what is selected. */
-function selectionMask(selection: Selection): LayerMask {
-	return makeMask(selection, 0, (x, y) => selection.at(x, y));
-}
-
-/** A mask that shows where a layer's pixels are; and the layer's pixels with nothing transparent, as Photoshop makes them. */
-function transparencyMask(layer: PixelLayer): {mask: LayerMask, image: RGBAPixels} {
-	const {image} = layer, data = new Uint8ClampedArray(image.data);
-	const mask = makeMask(placedRect(layer), 0, (x, y) => image.data[((y - layer.top) * image.width + x - layer.left) * 4 + 3]);
-	for (let i = 3; i < data.length; i += 4)
-		data[i] = 255;
-	return {mask, image: RGBAPixels(data, image.width, image.height)};
-}
-
-/** What masks leave of a canvas of this size, as one mask over all of it: a mask made a selection, or a vector mask drawn into a
- *  pixel mask. Undefined if they leave nothing. */
-function masksOver(masks: LayerMask[], width: number, height: number) {
-	const outside = masks.reduce((v, m) => v * (m.inverted ? 255 - m.default : m.default) / 255, 255);
-	return makeMask(new float2.extent(float2(0, 0), float2(width, height)), Math.round(outside), (x, y) => Math.round(masks.reduce((v, m) => v * maskAt(m, x, y) / 255, 255)));
-}
-
-/** A selection of what a mask leaves; undefined if it leaves nothing. */
-function maskSelection(mask: LayerMask, width: number, height: number) {
-	const {image} = masksOver([mask], width, height);
-	return new Selection(new float2.extent(float2(0, 0), float2(width, height)), new Uint8Array(image.data.buffer)).trimmed();
-}
-
-// What the tools draw on while a layer's mask is painted: the mask's pixels as an opaque grey picture, kept for as long as they are
-// (an undo of a stroke puts back pixels of the picture it was made on, which go back into the same mask's)
-const maskPictures = new WeakMap<Pixels<1>, RGBAPixels>(), picturedMasks = new WeakMap<RGBAPixels, Pixels<1>>();
-
-/** The picture a mask is painted on. The mask is made to cover the canvas first, as a layer's pixels are when they are drawn on:
- *  this changes the mask itself, though not what it does. */
-function maskPicture(mask: LayerMask, width: number, height: number): RGBAPixels {
-	if (mask.left || mask.top || mask.image.width !== width || mask.image.height !== height) {
-		mask.image	= makeMask(new float2.extent(float2(0, 0), float2(width, height)), mask.default, (x, y) => storedAt(mask, x, y)).image;
-		mask.left	= mask.top = 0;
-	}
-	let picture = maskPictures.get(mask.image);
-	if (!picture) {
-		const values = mask.image.data, data = new Uint8ClampedArray(values.length * 4);
-		for (let i = 0; i < values.length; i++)
-			data.set([values[i], values[i], values[i], 255], i * 4);
-		picture = RGBAPixels(data, width, height);
-		maskPictures.set(mask.image, picture);
-		picturedMasks.set(picture, mask.image);
-	}
-	return picture;
-}
-
-/** What is painted on a mask's picture (in `rect`, or all of it) put into the mask's pixels, which are given back (undefined if it is
- *  not a mask's picture): each is the lightness painted, or less where it was erased. The picture is made the grey it now holds. */
-function paintedMask(picture: RGBAPixels, rect?: float2.extent): Pixels<1> | undefined {
-	const mask = picturedMasks.get(picture);
-	if (!mask)
-		return;
-	const {width} = picture, d = picture.data;
-	const x0 = rect ? Math.max(0, rect.min.x) : 0, y0 = rect ? Math.max(0, rect.min.y) : 0;
-	const x1 = rect ? Math.min(width, rect.max.x) : width, y1 = rect ? Math.min(picture.height, rect.max.y) : picture.height;
-	for (let y = y0; y < y1; y++) {
-		for (let x = x0; x < x1; x++) {
-			const i = y * width + x, o = i * 4;
-			const v = Math.round((0.3 * d[o] + 0.59 * d[o + 1] + 0.11 * d[o + 2]) * d[o + 3] / 255);
-			mask.data[i] = v;
-			d[o] = d[o + 1] = d[o + 2] = v;
-			d[o + 3] = 255;
-		}
-	}
-	return mask;
-}
-
-/** A layer's pixels as its mask leaves them: what it hides is made transparent. */
-function appliedMask(layer: PixelLayer, mask: LayerMask): RGBAPixels {
-	const {image} = layer, data = new Uint8ClampedArray(image.data);
-	for (let y = 0; y < image.height; y++)
-		for (let x = 0; x < image.width; x++)
-			data[(y * image.width + x) * 4 + 3] = Math.round(data[(y * image.width + x) * 4 + 3] * maskAt(mask, x + layer.left, y + layer.top) / 255);
-	return RGBAPixels(data, image.width, image.height);
 }
 
 function getPlacedPixel(p: PlacedPixels | undefined, x: number, y: number) {
@@ -163,6 +51,16 @@ function getPlacedPixel(p: PlacedPixels | undefined, x: number, y: number) {
 function expand(layer: PlacedPixels, width: number, height: number) {
 	layer.image	= resizePixels(layer.image, layer.left, layer.top, width, height);
 	layer.left	= layer.top = 0;
+}
+
+// A layer's mask: it hides the layer where it is dark. Its pixels are one byte each, over a rectangle which need not be the
+// layer's, outside which it is `default`.
+export interface LayerMask extends PlacedPixels<1> {
+	default:	number;		// 0..255
+	disabled:	boolean;
+	inverted:	boolean;
+	density?:	number;		// 0..255: how much it hides of what it hides (all of it, if not given)
+	feather?:	number;		// how soft its edges are: the sigma of a gaussian, in pixels (which the compositor blurs it by, on the GPU)
 }
 
 interface LayerBase {
@@ -228,7 +126,112 @@ class LayerStack {
 	}
 }
 
+//-----------------------------------------------------------------------------
+// mask helpers
+//-----------------------------------------------------------------------------
 
+// what a mask holds at a pixel of the canvas, 0..255
+function storedAt(mask: LayerMask, x: number, y: number) {
+	const mx = x - mask.left, my = y - mask.top, {width, height, data} = mask.image;
+	return mx >= 0 && my >= 0 && mx < width && my < height ? data[my * width + mx] : mask.default;
+}
+
+// how much of the layer a mask leaves at a pixel of the canvas, 0..255: inverted if it says so, and what it hides made less by its
+// density (its feather, which the GPU makes, aside)
+function maskAt(mask: LayerMask, x: number, y: number) {
+	const v = mask.inverted ? 255 - storedAt(mask, x, y) : storedAt(mask, x, y);
+	return 255 - (255 - v) * (mask.density ?? 255) / 255;
+}
+
+// a mask, over the box of these pixels (each 0..255 as `at` gives it), which is `outside` beyond that
+function makeMask(box: float2.extent, outside: number, at: (x: number, y: number) => number): LayerMask {
+	const {x: left, y: top} = box.min, {x: width, y: height} = box.size(), data = new Uint8ClampedArray(width * height);
+	for (let y = 0; y < height; y++)
+		for (let x = 0; x < width; x++)
+			data[y * width + x] = at(x + left, y + top);
+	return {left, top, image: Pixels(data, width, height, 1), default: outside, disabled: false, inverted: false};
+}
+
+/** A mask that shows what is selected. */
+function selectionMask(selection: Selection): LayerMask {
+	return makeMask(selection, 0, (x, y) => selection.at(x, y));
+}
+
+/** A mask that shows where a layer's pixels are; and the layer's pixels with nothing transparent, as Photoshop makes them. */
+function transparencyMask(layer: PixelLayer): {mask: LayerMask, image: Pixels<4>} {
+	const {image} = layer, data = new Uint8ClampedArray(image.data);
+	const mask = makeMask(placedRect(layer), 0, (x, y) => image.data[((y - layer.top) * image.width + x - layer.left) * 4 + 3]);
+	for (let i = 3; i < data.length; i += 4)
+		data[i] = 255;
+	return {mask, image: Pixels<4>(data, image.width, image.height)};
+}
+
+/** What masks leave of a canvas of this size, as one mask over all of it: a mask made a selection, or a vector mask drawn into a
+ *  pixel mask. Undefined if they leave nothing. */
+function masksOver(masks: LayerMask[], width: number, height: number) {
+	const outside = masks.reduce((v, m) => v * (m.inverted ? 255 - m.default : m.default) / 255, 255);
+	return makeMask(new float2.extent(float2(0, 0), float2(width, height)), Math.round(outside), (x, y) => Math.round(masks.reduce((v, m) => v * maskAt(m, x, y) / 255, 255)));
+}
+
+/** A selection of what a mask leaves; undefined if it leaves nothing. */
+function maskSelection(mask: LayerMask, width: number, height: number) {
+	const {image} = masksOver([mask], width, height);
+	return new Selection(new float2.extent(float2(0, 0), float2(width, height)), new Uint8ClampedArray(image.data.buffer)).trimmed();
+}
+
+// What the tools draw on while a layer's mask is painted: the mask's pixels as an opaque grey picture, kept for as long as they are
+// (an undo of a stroke puts back pixels of the picture it was made on, which go back into the same mask's)
+const maskPictures = new WeakMap<Pixels<1>, Pixels<4>>(), picturedMasks = new WeakMap<Pixels<4>, Pixels<1>>();
+
+
+/** What is painted on a mask's picture (in `rect`, or all of it) put into the mask's pixels, which are given back (undefined if it is
+ *  not a mask's picture): each is the lightness painted, or less where it was erased. The picture is made the grey it now holds. */
+function paintedMask(picture: Pixels<4>, rect?: float2.extent): Pixels<1> | undefined {
+	const mask = picturedMasks.get(picture);
+	if (!mask)
+		return;
+	const {width} = picture, d = picture.data;
+	const x0 = rect ? Math.max(0, rect.min.x) : 0, y0 = rect ? Math.max(0, rect.min.y) : 0;
+	const x1 = rect ? Math.min(width, rect.max.x) : width, y1 = rect ? Math.min(picture.height, rect.max.y) : picture.height;
+	for (let y = y0; y < y1; y++) {
+		for (let x = x0; x < x1; x++) {
+			const i = y * width + x, o = i * 4;
+			const v = Math.round((0.3 * d[o] + 0.59 * d[o + 1] + 0.11 * d[o + 2]) * d[o + 3] / 255);
+			mask.data[i] = v;
+			d[o] = d[o + 1] = d[o + 2] = v;
+			d[o + 3] = 255;
+		}
+	}
+	return mask;
+}
+
+/** The picture a mask is painted on. The mask is made to cover the canvas first, as a layer's pixels are when they are drawn on:
+ *  this changes the mask itself, though not what it does. */
+function maskPicture(mask: LayerMask, width: number, height: number): Pixels<4> {
+	if (mask.left || mask.top || mask.image.width !== width || mask.image.height !== height) {
+		mask.image	= makeMask(new float2.extent(float2(0, 0), float2(width, height)), mask.default, (x, y) => storedAt(mask, x, y)).image;
+		mask.left	= mask.top = 0;
+	}
+	let picture = maskPictures.get(mask.image);
+	if (!picture) {
+		const values = mask.image.data, data = new Uint8ClampedArray(values.length * 4);
+		for (let i = 0; i < values.length; i++)
+			data.set([values[i], values[i], values[i], 255], i * 4);
+		picture = Pixels<4>(data, width, height);
+		maskPictures.set(mask.image, picture);
+		picturedMasks.set(picture, mask.image);
+	}
+	return picture;
+}
+
+/** A layer's pixels as its mask leaves them: what it hides is made transparent. */
+function appliedMask(layer: PixelLayer, mask: LayerMask): Pixels<4> {
+	const {image} = layer, data = new Uint8ClampedArray(image.data);
+	for (let y = 0; y < image.height; y++)
+		for (let x = 0; x < image.width; x++)
+			data[(y * image.width + x) * 4 + 3] = Math.round(data[(y * image.width + x) * 4 + 3] * maskAt(mask, x + layer.left, y + layer.top) / 255);
+	return Pixels<4>(data, image.width, image.height);
+}
 
 //-----------------------------------------------------------------------------
 // blend modes
@@ -278,8 +281,31 @@ let shapeEditor: ShapeEditor | undefined;
 let textEditor: TextEditor | undefined;
 
 // a layer of these pixels, at the top left, shown as it is
-export function newLayer(name: string, image: RGBAPixels): PixelLayer {
+export function newLayer(name: string, image: Pixels<4>): PixelLayer {
 	return {kind: 'image', name, left: 0, top: 0, opacity: 1, visible: true, blend: 'norm', image};
+}
+
+// a layer style's (or any descriptor's) measurements in pixels, multiplied: its shadows' distances, its glows' sizes, its stroke's width
+function scalePixelUnits<T>(v: T, factor: number): T {
+	if (Array.isArray(v))
+		return v.map(x => scalePixelUnits(x, factor)) as T;
+	if (v && typeof v === 'object' && !ArrayBuffer.isView(v)) {
+		const o = v as {type?: string, unit?: string, value?: number};
+		if (o.type === 'UntF' && o.unit === '#Pxl' && typeof o.value === 'number')
+			return {...v, value: o.value * factor};
+		return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scalePixelUnits(x, factor)])) as T;
+	}
+	return v;
+}
+
+// a layer with what it measures in pixels (its style's distances and sizes, the softness of its mask) multiplied
+function scaledMeasures(layer: Layer, factor: number): Layer {
+	const out = {...layer} as Layer;
+	if (layer.blocks?.lfx2)
+		out.blocks = {...layer.blocks, lfx2: scalePixelUnits(layer.blocks.lfx2, factor)};
+	if (layer.mask?.feather)
+		out.mask = {...layer.mask, feather: layer.mask.feather * factor};
+	return out;
 }
 
 // a picture of layers, which is on the GPU as they are composed
@@ -320,7 +346,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	}
 	reorderer(i: number)	{ return this.dragger(this.stack.layers[i]); }
 	sheetMenu(i: number | undefined, clientX: number, clientY: number) {
-		openMenu(clientX, clientY, i === undefined ? undefined : this.layerItems(this.stack.layers[i]));
+		LayeredMode.openMenu(clientX, clientY, i === undefined ? undefined : this.layerItems(this.stack.layers[i]));
 	}
 	// the masks a layer is drawn through on its own (as the fan and a transform draw it), their textures made now
 	private masksOf(layer: Layer): {mask?: QuadMask, vmask?: QuadMask} {
@@ -407,20 +433,20 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		// the layers as the page has them, from a file's
 		const layers = layerdata.map((data): Layer => {
 			const kind = layerKind(data.blocks);
-			const common = {
-			name:		data.name,
-			opacity:	data.opacity,
-			visible:	data.visible,
-			blend:		data.blend as BLEND_MODE,
-			clipped:	data.clipped,
-			blocks:		data.blocks,
-			mask:		data.mask && {
-				left: data.mask.left, top: data.mask.top, default: data.mask.default, disabled: data.mask.disabled, inverted: data.mask.inverted,
-				density: data.mask.density, feather: data.mask.feather,
-				image: {data: new Uint8ClampedArray(data.mask.data), width: data.mask.width, height: data.mask.height},
-			},
-			vectorMaskDensity:	data.vectorMaskDensity,
-			vectorMaskFeather:	data.vectorMaskFeather,
+			const common: LayerBase = {
+				name:		data.name,
+				opacity:	data.opacity,
+				visible:	data.visible,
+				blend:		data.blend as BLEND_MODE,
+				clipped:	data.clipped,
+				blocks:		data.blocks,
+				mask:		data.mask && {
+					left: data.mask.left, top: data.mask.top, image: Pixels(new Uint8ClampedArray(data.mask.data), data.mask.width, data.mask.height, 1),
+					default: data.mask.default, disabled: data.mask.disabled, inverted: data.mask.inverted,
+					density: data.mask.density, feather: data.mask.feather,
+				},
+				vectorMaskDensity:	data.vectorMaskDensity,
+				vectorMaskFeather:	data.vectorMaskFeather,
 			};
 			return kind === 'adjustment'
 				? {...common, kind}
@@ -584,7 +610,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const {width, height} = this.stack, pixels = pixelLayer(layer);
 
 		// the mask, and with it perhaps the layer's pixels or blocks, changed as one edit
-		type State = Pick<Layer, 'mask' | 'blocks' | 'vectorMaskDensity' | 'vectorMaskFeather'> & {image: RGBAPixels | undefined};
+		type State = Pick<Layer, 'mask' | 'blocks' | 'vectorMaskDensity' | 'vectorMaskFeather'> & {image: Pixels<4> | undefined};
 		const state = (): State => ({mask: layer.mask, image: pixels?.image, blocks: layer.blocks, vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather});
 		const put = (s: State) => () => {
 			layer.mask		= s.mask;
@@ -608,7 +634,10 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			change('Add Layer Mask', {mask: mask()});
 			this.editMask(layer, 'mask');
 		}});
-		const all = (shown: boolean): LayerMask => ({left: 0, top: 0, image: {data: new Uint8ClampedArray(0), width: 0, height: 0}, default: shown ? 255 : 0, disabled: false, inverted: false});
+		const all = (shown: boolean): LayerMask => ({
+			left: 0, top: 0, image: Pixels(new Uint8ClampedArray(0), 0, 0, 1),
+			default: shown ? 255 : 0, disabled: false, inverted: false
+		});
 		// (chosen, as a layer is, the mask is what the tools draw on)
 		const maskItem: CascadeItem = {
 			id:			'mask',
@@ -742,24 +771,6 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	// The current layer's masks shown over the picture: as a red veil over what they hide, or alone, in grey
 	private viewMask?: 'over' | 'alone';
 
-	// the View item's: the 3D view, and the current layer's masks (if it has any) shown over the picture
-	private viewItem(): CascadeItem {
-		return viewItem(() => {
-			const live = this.live, layer = live.layer;
-			const view = (how: 'over' | 'alone', on: boolean) => {
-				live.viewMask = on ? how : undefined;
-				live.redraw();
-			};
-			return [
-				viewToggle(live, live.fan),
-				...(layer && (layer.mask || maskBlock(layer.blocks)) ? [
-					{...toggleItem('Show the masks over the picture', svgFace(menuIcon.mask), () => live.viewMask === 'over', on => view('over', on)), id: 'mask-over'},
-					{...toggleItem('Show the masks alone', svgFace(menuIcon.invert), () => live.viewMask === 'alone', on => view('alone', on)), id: 'mask-alone'},
-				] : []),
-			];
-		});
-	}
-
 	// the masks drawn over the picture, by the layer shader, from their textures
 	private drawMaskView() {
 		const layer = this.viewMask && !this.fanned ? this.layer : undefined, masks = layer && this.masksOf(layer);
@@ -787,11 +798,11 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 
 	// The current layer's shape, when it has one the shape editor can edit: the editor is over the picture in place of the tools,
 	// and what it does is the layer's (see openShape in shapeedit.ts)
-	private shape?: ShapeSession;
-	private text?: TextEditor;	// likewise the editor of the current layer's text, if it has some
-	private focusText = false;		// the text just made is to be typed into
+	private shape?:		ShapeSession;
+	private text?:		TextEditor;		// likewise the editor of the current layer's text, if it has some
+	private focusText	= false;		// the text just made is to be typed into
 	private previewFrame = 0;			// the frame the session is next shown on the picture in, while it is being changed
-	private fanned = false;
+	private fanned		= false;
 
 	// the shape editor over the picture if the current layer is a shape (and the layers are not fanned out), opened again from
 	// the layer's blocks if they have been changed by something else (an undo); else the tools
@@ -799,29 +810,21 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		// (while a mask is painted, the tools are over the picture whatever the layer is; while a vector mask is edited, its path is
 		// the shape editor's)
 		const vector = !this.fanned && this.editing === 'vector' ? this.layer : undefined;
-		const layer = this.fanned || this.editing ? undefined : pixelLayer(this.layer), s = this.shape, edited = vector ?? layer;
+		const layer = this.fanned || this.editing ? undefined : pixelLayer(this.layer);
+		const s = this.shape;
+		const edited = vector ?? layer;
 		if (!(s && s.layer === edited && s.blocks === edited?.blocks && !!s.mask === !!vector)) {
 			cancelAnimationFrame(this.previewFrame);
 			this.shape = vector ? openVectorMask(vector, this.stack) : layer && openShape(layer, this.stack);
-			shapeEditor ??= new ShapeEditor(canvas.parentElement!);
+			shapeEditor ??= new ShapeEditor(this.canvas);
 			shapeEditor.open(this.shape && this, this.shape);
 		}
 		if (!this.text?.has(layer)) {
 			cancelAnimationFrame(this.previewFrame);
-			textEditor ??= new TextEditor(canvas.parentElement!);
+			textEditor ??= new TextEditor(this.canvas);
 			this.text	= textEditor.open(this, layer, this.focusText);
 			this.focusText = false;
 		}
-	}
-
-	// a shape layer has a transform of its own (its editor's), and a text layer's cannot distort it
-	transformable() {
-		return this.shape ? 'none' : this.text ? 'affine' : 'any';
-	}
-
-	// the transforms a text layer has of its own (that are not the picture's)
-	transformMenu() {
-		return this.text?.warpItems() ?? [];
 	}
 
 	// what a layer is made, as one edit
@@ -836,8 +839,6 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		set(after);
 		history.record(label, () => set(before), () => set(after));
 	}
-
-
 
 	// the shape (or text) as it is being changed, shown in place of the layer (which is left as it was) on the next frame
 	previewEdit() {
@@ -902,7 +903,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	override redraw() {
 		if (this.fan?.active) {
 			canvas3d.initViewport();
-			programBG.draw({u_viewport: [canvas.width, canvas.height]});
+			programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
 			this.fan.draw();
 			return;
 		}
@@ -946,7 +947,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	override cloneSource(at: float2, all: boolean) {
 		if (all) {
 			const {width, height} = this.stack, data = this.compositor.read(new float2.extent(float2(0, 0), float2(width, height)));
-			return data && {from: RGBAPixels(data as Uint8ClampedArray<ArrayBuffer>, width, height), at};
+			return data && {from: Pixels<4>(data as Uint8ClampedArray<ArrayBuffer>, width, height), at};
 		}
 		const mask = this.maskPainted();
 		if (mask)
@@ -987,19 +988,68 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const urls = new Map<Layer, string>();	// (the menu is made again each time it comes up, so these are as the pictures are then)
 
 		const layer = this.layer;
-		const fx = !layer
+		const fx	= !layer
 				?	undefined
 				:	adjustmentItem(this.blocksOf(layer, 'Adjustment')) ?? styleItem(this.blocksOf(layer, 'Layer Style'));
 
-		// (while a mask is what is drawn on, or its path is edited, how dense and soft it is)
-		const edited = layer && (this.editing === 'mask' && layer.mask || this.editing === 'vector' && maskBlock(layer.blocks)) ? this.editing : undefined;
+
+		const view = LayeredMode.viewItem(() => {
+			const live = this.live, layer = live.layer;
+			const view = (how: 'over' | 'alone', on: boolean) => {
+				live.viewMask = on ? how : undefined;
+				live.redraw();
+			};
+			return [
+				viewToggle(live, live.fan),
+				...(layer && (layer.mask || maskBlock(layer.blocks)) ? [
+					{...toggleItem('Show the masks over the picture', svgFace(menuIcon.mask), () => live.viewMask === 'over', on => view('over', on)), id: 'mask-over'},
+					{...toggleItem('Show the masks alone', svgFace(menuIcon.invert), () => live.viewMask === 'alone', on => view('alone', on)), id: 'mask-alone'},
+				] : []),
+			];
+		});
+
+
+		const runItem = (id: string, icon: string, caption: string): CascadeItem => ({
+			id,
+			face:		() => svgFace(icon),
+			caption:	() => caption,
+			select:		() => (this.run(id), true)
+		});
+		const by = (factor: 2 | 4 | 8): CascadeItem => runItem(
+			`upscale${factor}`,
+			`<path d="M2.5 13.5v-4h4v4z M2.5 13.5l9-9M7.5 2.5h6v6"/>`,
+			`Upscale ${factor}x (the first use fetches a neural network, and takes a moment)`
+		);
+
+		const transformable = this.shape ? 'none' : this.text ? 'affine' : 'any';
 
 		return [
-			this.viewItem(),
+			...super.menu(),
+			view,
 			...(shapeEditor?.items() ?? []),
 			...(this.text?.items() ?? []),
 			...(fx ? [fx] : []),
-			...(layer && edited ? this.maskSoftness(layer, edited) : []),
+			...(layer && this.editing && (this.editing === 'mask' ? layer.mask : maskBlock(layer.blocks)) ? this.maskSoftness(layer, this.editing) : []),
+
+			...this.transformer.menu([
+				...transformable === 'none' ? [] : [
+					this.transformer.item('transform-layer', cascadeIcons.transform, 'Free Transform (Enter applies, Esc cancels)', () => this.beginTransform(pixelLayer(this.layer)), transformable === 'affine'),
+					this.transformer.item('transform-image', cascadeIcons.image, 'Transform Image: all of it, onto a canvas that fits', () => this.beginTransform()),
+				],
+				runItem('flipHorizontal',		transformIcons.flipH, 'Flip Horizontal'), 				
+				runItem('flipVertical',			transformIcons.flipV, 'Flip Vertical'), 					
+				runItem('rotateClockwise',		transformIcons.rotateCW, 'Rotate 90° Clockwise'), 		
+				runItem('rotateAnticlockwise',	transformIcons.rotateACW, 'Rotate 90° Anticlockwise'), 	
+				runItem('crop',					'<path d="M4.5 1.5v10h10M1.5 4.5h10v10"/>', 'Crop to Selection'),
+				...this.text?.warpItems() ?? [],
+				{
+					id:			'upscale',
+					face:		() => svgFace(`<path d="M2.5 13.5v-4h4v4z M2.5 13.5l9-9M7.5 2.5h6v6"/>`),
+					caption:	() => 'Upscale with a neural network: sharper than resampling, but it makes up detail',
+					children:	() => [by(2), by(4), by(8)],
+				},
+			]),
+
 			layerChooser('Layer',
 				() => stack.layers ?? [],
 				() => this.layer!,
@@ -1026,7 +1076,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	}
 
 	// a layer's pixels, which may lie anywhere on the canvas
-	override changed(changed: RGBAPixels, rect?: float2.extent) {
+	override changed(changed: Pixels<4>, rect?: float2.extent) {
 		// (a mask's picture is over the whole canvas)
 		const mask = paintedMask(changed, rect);
 		if (mask) {
@@ -1045,212 +1095,189 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const shift = layer && float2(layer.left, layer.top);
 		this.recompose(shift && rect ? new float2.extent(rect.min.add(shift), rect.max.add(shift)) : undefined);
 	}
-	protected override shownBy(image: RGBAPixels) {
+	override shownBy(image: Pixels<4>) {
 		const layer = this.stack?.layers.find((l): l is PixelLayer => l.kind !== 'adjustment' && l.image === image);
 		const texture = layer && !layer.effect ? this.compositor.layerTexture(layer) : undefined;
-		return texture && {texture, drawn: () => {
-			forgetEffects(layer!);
-			this.recompose();
-		}};
+		if (texture) {
+			const base = canvas3d.offscreenOn(texture, image.width, image.height);
+			return base && {...base,
+				end: () => {
+					base.end(); 
+					forgetEffects(layer!);
+					this.recompose();
+				}
+			};
+		}
 	}
 
 	// the start of a transform: what of the canvas it is of
-	override beginTransform(target: TransformTarget, selection?: Selection): TransformSession | undefined {
+	beginTransform(layer?: PixelLayer): TransformSession | undefined {
 		if (!this.image || !programLayer)
 			return undefined;
-		const layer = target === 'layer' ? pixelLayer(this.layer) : undefined;
-		if (!layer)
-			return this.wholeSession();
-		// (what the tools draw on covers the canvas, so a selection is of the canvas as well)
-		if (selection && layer.left === 0 && layer.top === 0 && layer.image.width === this.image.width && layer.image.height === this.image.height)
-			return this.selectedSession(layer, selection);
-		const r = alphaExtent(layer.image);
-		if (!r)
-			return undefined;
-		this.recompose(undefined, layer);	// (the layer is left out, to be drawn on its own as it is carried)
-		const shift = float2(layer.left, layer.top);
-		return {
-			box: new float2.extent(r.min.add(shift), r.max.add(shift)), target: 'layer',
-			update: carry => {
-				const [matrix, warp] = planar(carry);
-				this.preview = () => {
-					// (the textures are got before any is bound: making one binds it)
-					const texture = this.compositor.layerTexture(layer), masks = this.masksOf(layer);
-					this.drawFlat();
-					const mvp	= planeMvp(this.pictureMatrix(), matrix);
-					if (texture)
-						drawQuad(canvas3d, programLayer, texture, placedRect(layer), masks, layer.visible ? layer.opacity : 0.3, mvp, undefined, warp);
-				};
-				this.redraw();
-			},
-			end: () => {
-				this.preview = undefined;
-				this.recompose();
-			},
-		};
+
+		const whole		= imageRect(this.image);
+		const selection = this.selection();
+		
+		if (!layer) {
+			// the whole picture is to be transformed: carried over the background
+			return {
+				box: whole, label: 'Transform Image', pinned: true,
+				update: carry => {
+					const [matrix, warp] = planar(carry);
+					this.preview = () => {
+						programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
+						if (this.texture)
+							drawQuad(canvas3d, programLayer, this.texture, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+					};
+					this.redraw();
+				},
+				end: carry => {
+					this.preview = undefined;
+					this.redraw();
+					return carry && this.warp(layer, carry);
+				},
+			};
+
+		} else if (selection && layer.left === 0 && layer.top === 0 && layer.image.width === this.image.width && layer.image.height === this.image.height) {
+			// a layer's selected part is carried, over the rest of it
+			const {floating, rest} = liftSelection(layer.image, selection), whole = imageRect(layer.image);
+			const own = canvas3d.createTextureFromImage(floating), left = canvas3d.createTextureFromImage(rest);
+			this.recompose(undefined, layer);	// (the layer is left out, to be drawn on its own)
+			return {
+				box: selection.bounds(), label: 'Free Transform', selection,
+				update: carry => {
+					const [matrix, warp] = planar(carry);
+					this.preview = () => {
+						// (the textures are got before any is bound: making one binds it)
+						const masks = this.masksOf(layer), opacity = layer.visible ? layer.opacity : 0.3;
+						this.drawFlat();
+						drawQuad(canvas3d, programLayer, left, whole, masks, opacity, planeMvp(this.pictureMatrix(), float3x3.identity()));
+						drawQuad(canvas3d, programLayer, own, whole, masks, opacity, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+					};
+					this.redraw();
+				},
+				end: carry => {
+					this.preview = undefined;
+					canvas3d.deleteTexture(own);
+					canvas3d.deleteTexture(left);
+					this.recompose();
+					return carry && this.warp(layer, carry, selection);
+				},
+			};
+
+		} else {
+			const r = alphaExtent(layer.image);
+			if (!r)
+				return undefined;
+
+			this.recompose(undefined, layer);	// (the layer is left out, to be drawn on its own as it is carried)
+			const shift = float2(layer.left, layer.top);
+			return {
+				box: new float2.extent(r.min.add(shift), r.max.add(shift)), label: 'Free Transform',
+				update: carry => {
+					const [matrix, warp] = planar(carry);
+					this.preview = () => {
+						// (the textures are got before any is bound: making one binds it)
+						const texture = this.compositor.layerTexture(layer), masks = this.masksOf(layer);
+						this.drawFlat();
+						if (texture)
+							drawQuad(canvas3d, programLayer, texture, placedRect(layer), masks, layer.visible ? layer.opacity : 0.3, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+					};
+					this.redraw();
+				},
+				end: carry => {
+					this.preview = undefined;
+					this.recompose();
+					return carry && this.warp(layer, carry, selection);
+				},
+			};
+		}
 	}
 
-	// a layer's selected part is carried, over the rest of it
-	private selectedSession(layer: PixelLayer, selection: Selection): TransformSession {
-		const {floating, rest} = liftSelection(layer.image, selection), whole = imageRect(layer.image);
-		const own = canvas3d.createTextureFromImage(floating), left = canvas3d.createTextureFromImage(rest);
-		this.recompose(undefined, layer);	// (the layer is left out, to be drawn on its own)
-		return {
-			box: selection.bounds(), target: 'layer', selection,
-			update: carry => {
-				const [matrix, warp] = planar(carry);
-				this.preview = () => {
-					// (the textures are got before any is bound: making one binds it)
-					const masks = this.masksOf(layer), opacity = layer.visible ? layer.opacity : 0.3;
-					this.drawFlat();
-					drawQuad(canvas3d, programLayer, left, whole, masks, opacity, planeMvp(this.pictureMatrix(), float3x3.identity()));
-					drawQuad(canvas3d, programLayer, own, whole, masks, opacity, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
-				};
-				this.redraw();
-			},
-			end: () => {
-				this.preview = undefined;
-				canvas3d.deleteTexture(own);
-				canvas3d.deleteTexture(left);
-				this.recompose();
-			},
-		};
-	}
-
-	override transform(change: DocumentChange) {
+	// What carrying `carry` (from the picture's coordinates) over the picture does: of a layer (the pixels of the selection in it, if there is
+	// one), or, of none, all the picture (or the part of it a selection covers: a crop), on a canvas that fits what is carried. The pixels of
+	// a layer onto an area are resampled unless `pixels` makes them some other way. The edit, as undo and redo.
+	warp(layer: PixelLayer|undefined, carry: Carry, selection?: Selection, pixels?: <P extends Pixels>(image: P, area: float2.extent) => P | undefined) {
 		if (!this.image || !this.stack)
 			return undefined;
-		const layers = this.stack;
-		const before = layers.snapshot(layers.index(this.layer));	// (whatever is done, the same layer is current)
+
+		const layers	= this.stack;
+		const before	= layers.snapshot(layers.index(this.layer));	// (whatever is done, the same layer is current)
+		const rect		= imageRect(before);
+
+		const floating = !!layer && !!selection;					// (what a selection covers is lifted, and carried alone)
 		let after: Snapshot | undefined;
+		let selafter: Selection | undefined;
 
-		// a layer's mask as the layer is moved: its rectangle goes where it is carried, its pixels turn with it
-		// (`place` says where the top left of a rectangle goes)
-		function moveLayer(layer: Layer, place: (area: float2.extent) => float2, apply: <P extends Pixels>(m: P) => P) {
-			const m = layer.mask, maskAt = m && place(placedRect(m));
-			const mask = m && maskAt && {...m, left: maskAt.x, top: maskAt.y, image: apply(m.image)};
-			if (layer.kind === 'adjustment')
-				return {...layer, mask};
-			const at = place(placedRect(layer));
-			return {...layer, left: at.x, top: at.y, image: apply(layer.image), mask};
-		}
+		if (floating) {
+			const index = before.current;
+			after		= {...before, layers: before.layers.map((l, k) => k === index && l.kind !== 'adjustment' ? {...l, image: warpSelected(l.image, selection, carry, LayeredMode.warpPixels)} : l)};
+			selafter	= LayeredMode.warpSelection(selection, carry, imageRect(before));
 
-		function moveLayers(before: Snapshot, place: (area: float2.extent) => float2, apply: <P extends Pixels>(m: P) => P, layer?: Layer) {
-			if (layer) {
-				const moved = moveLayer(layer, place, apply);
-				return moved && {...before, layers: before.layers.map((l, i) => i === before.current ? moved : l)};
-			} else {
-				return {...before, layers: before.layers.map(l => moveLayer(l, place, apply))};
+		} else {
+			// (all the picture is carried onto a canvas that holds it, whose corner is where its own bounds begin)
+			let size = rect.size();
+			if (!layer) {
+				const bounds = carriedBounds(carry, selection ? selection.bounds() : rect);
+				if (!bounds || bounds.empty())
+					return undefined;
+				carry	= shiftCarry(carry, float2(0, 0), bounds.min.neg());
+				size	= bounds.size();
 			}
-		}
+			const carried	= carry;
 
-		switch (change.kind) {
-			case 'flip':
-				after = moveLayers(before,
-					area => float2(change.horizontal ? before.width - area.max.x : area.min.x, change.horizontal ? area.min.y : before.height - area.max.y),
-					i => flip(i, change.horizontal)
-				);
-				break;
-
-			case 'rotate':
-				after = moveLayers(before,
-					area => float2(change.clockwise ? before.height - area.max.y : area.min.y, change.clockwise ? area.min.x : before.width - area.max.x),
-					i => rotate(i, change.clockwise)
-				);
-				// (the canvas is turned too)
-				after = after && {...after, width: before.height, height: before.width};
-				break;
-
-			case 'crop': {
-				const {x, y} = change.rect.min, {x: width, y: height} = change.rect.size();
-				after = {
-					width, height, current: before.current,
-					layers: before.layers.map(l => {
-						const mask = l.mask && {...l.mask, left: l.mask.left - x, top: l.mask.top - y};
-						return l.kind === 'adjustment' ? {...l, mask} : {...l, left: l.left - x, top: l.top - y, mask};
-					}),
-				};
-				break;
+			function moveLayer(layer: Layer, move: <P extends PlacedPixels>(p: P) => P) {
+				const mask = layer.mask && {...layer.mask, ...move(layer.mask)};
+				if (layer.kind === 'adjustment')
+					return {...layer, mask};
+				return {...layer, ...move(layer), mask};
 			}
-			case 'warp': {
-				const carry = change.carry;
-				const layer = change.target === 'layer' ? before.layers[before.current] : undefined;
-				if (layer && change.selection) {
-					const selection = change.selection, index = before.current;
-					after = {...before, layers: before.layers.map((l, k) => k === index && l.kind !== 'adjustment' ? {...l, image: warpSelected(l.image, selection, carry, warpPixels)} : l)};
-					break;
-				}
-				// (only moved by whole pixels, the layers are not resampled)
-				const n = carry instanceof Warp ? undefined : carry.scale(1 / carry.z.z);
-				if (n && approx_equal(n.x, float3(1, 0, 0)) && approx_equal(n.y, float3(0, 1, 0)) && approx_equal(n.z.xy, float2(Math.round(n.z.x), Math.round(n.z.y)))) {
-					const shiftx = Math.round(n.z.x), shifty = Math.round(n.z.y);
-					after = moveLayers(before,
-						area => area.min.add(float2(shiftx, shifty)),
-						i => i,
-						layer
-					);
-				} else {
-					const clip = layer && imageRect(before);
-					let local: Carry;
-					let area: float2.extent | undefined;
-					after = moveLayers(before,
-						from => {
-							const size = from.size();
-							local	= shiftCarry(carry, from.min);
-							area	= carriedBounds(local, float2.extent.fromSize(float2(0, 0), size));
-							if (area) {
-								if (clip)
-									area = area.intersect(clip);
-								if (!area.empty())
-									return area.min;
-								area = undefined;
-							}
-							return from.min;
-						},
-						i => area ? warpPixels(i, local, area) : i,
-						layer
-					);
-				}
-				break;
+
+			function moveLayers(before: Snapshot, move: <P extends PlacedPixels>(p: P) => P, layer?: Layer) {
+				return {...before, layers: before.layers.map((l, i) => layer && i !== before.current ? l : moveLayer(l, move))};
 			}
+
+			after = moveLayers(before, p => {
+				const local = shiftCarry(carried, float2(p.left, p.top));	// (from the pixels' own coordinates)
+				let area = carriedBounds(local, imageRect(p.image));
+				if (area && layer)
+					area = area.intersect(rect);
+				if (!area || area.empty())
+					return p;
+				return {left: area.min.x, top: area.min.y, image: (pixels?.(p.image, area) ?? LayeredMode.warpPixels(p.image, local, area))} as typeof p;
+			}, layer);
+			after.width		= size.x;
+			after.height	= size.y;
 		}
 
 		// the vector data that layers keep (a shape's path and its gradients) goes where the picture is carried, as the pixels did
-		if (after && !(change.kind === 'warp' && change.selection)) {
-			const W = before.width, H = before.height;
-			let map: ((x: number, y: number) => [number, number]) | undefined;
-			switch (change.kind) {
-				case 'flip':	map = change.horizontal ? (x, y) => [W - x, y] : (x, y) => [x, H - y]; break;
-				case 'rotate':	map = change.clockwise ? (x, y) => [H - y, x] : (x, y) => [y, W - x]; break;
-				case 'crop':	{ const {x: cx, y: cy} = change.rect.min; map = (x, y) => [x - cx, y - cy]; break; }
-				case 'warp':	{
-					const carry = change.carry;
-					map = (x, y) => {
-						const p = carryPoint(carry, float2(x, y));
-						return [p.x, p.y];
-					};
-					break;
-				}
-			}
-			const moved = after, carry = map;
-			if (carry) {
-				after = {...moved, layers: moved.layers.map((l, i) =>
-					l.blocks && (change.kind !== 'warp' || change.target !== 'layer' || i === before.current && !((maskBlock(l.blocks)?.flags ?? 0) & 2)) ? {...l, blocks: transformBlocks(l.blocks, carry, before, moved)} : l)};
-			}
-		}
-
-		// a text layer that is carried has its text carried, and set again (so it is crisp, not warped pixels)
-		if (after && change.kind === 'warp' && change.target === 'layer' && !change.selection) {
-			const index = before.current, l = after.layers[index], carry = change.carry, {width, height} = after;
-			if (l.kind === 'text')
-				after = {...after, layers: after.layers.map((k, i) => i === index ? carryText(l, carry, width, height) : k)};
+		if (after && !floating) {
+			const map: ((x: number, y: number) => [number, number]) = (x, y) => {
+				const p = carryPoint(carry, float2(x, y));
+				return [p.x, p.y];
+			};
+			const moved = after;
+			after = {...moved, layers: moved.layers.map((l, i) =>
+				l.blocks && (!layer || i === before.current && !((maskBlock(l.blocks)?.flags ?? 0) & 2)) ? {...l, blocks: transformBlocks(l.blocks, map, before, moved)} : l)};
 		}
 
 		if (!after)
 			return undefined;
 
-		const resized	= !(change.kind === 'warp' && change.target === 'layer');
-		const use		= (s: Snapshot) => () => {
+		// a text layer that is carried has its text carried, and set again (so it is crisp, not warped pixels); and what the picture measures in
+		// pixels (its layers' styles, the softness of their masks) is as many as the picture is bigger
+		if (!floating) {
+			const {width, height} = after;
+			const m = carry instanceof Warp ? undefined : carry.scale(1 / carry.z.z), scale = m ? Math.sqrt(Math.abs(m.x.x * m.y.y - m.x.y * m.y.x)) : 1;
+			after = {...after, layers: after.layers.map((l, i) => {
+				if (layer && i !== before.current)
+					return l;
+				const set = l.kind === 'text' ? carryText(l, carry, width, height) : l;
+				return layer || Math.abs(scale - 1) < 1e-6 ? set : scaledMeasures(set, scale);
+			})};
+		}
+
+		const use		= (s: Snapshot, sel?: Selection) => () => {
 			const self = this.live, layers = self.stack;
 			layers.restore(s);
 			self.layer = layers.layers[s.current];
@@ -1262,18 +1289,36 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			self.pan.width	= self.image.width;
 			self.pan.height	= self.image.height;
 			self.recompose();
-			if (resized)
+			if (!layer)
 				self.fit();
+			self.setSelection(sel);
 			self.redraw();
 		};
 		use(after)();
-		return {undo: use(before), redo: use(after)};
+		return {undo: use(before), redo: use(after, selafter)};
 	}
 
-	// Images dropped on it become layers above the current one: all of it one edit
+	// all the picture carried by a matrix, as one edit with the name given
+	private carryPicture(label: string, carry: Carry, selection?: Selection, pixels?: <P extends Pixels>(image: P, area: float2.extent) => P | undefined) {
+		const entry = this.warp(undefined, carry, selection, pixels);
+		if (entry)
+			history.push(entry, label);
+		return !!entry;
+	}
+
+	// Images dropped on it become layers above the current one
 	protected override async dropped(items: Dropped[]) {
+		this.addLayers(items.map(it => newLayer(it.name, {data: it.pixels.data, width: it.pixels.width, height: it.pixels.height})), items.length > 1 ? 'Add Layers' : 'Add Layer');
+	}
+
+	// The pictures of the layers other than the current one, which a style can be taken from
+	layerPictures() {
+		return this.stack.layers.filter((l): l is PixelLayer => l.kind !== 'adjustment' && l !== this.layer).map(l => ({name: l.name, image: l.image}));
+	}
+
+	// Layers put above the current one, the last of them current: all of it one edit
+	addLayers(made: PixelLayer[], label: string) {
 		const prev = this.layer;
-		const made = items.map(it => newLayer(it.name, {data: it.pixels.data, width: it.pixels.width, height: it.pixels.height}));
 		const last = made[made.length - 1];
 		let at = 0;
 		const redo = () => {
@@ -1291,7 +1336,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			self.recompose();
 		};
 		redo();
-		history.record(made.length > 1 ? 'Add Layers' : 'Add Layer', undo, redo);
+		history.record(label, undo, redo);
 	}
 
 	// the picture again from the layers (all of it, or a part), and what shows of it
@@ -1307,18 +1352,53 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		}
 	}
 
+
+	// The picture made `factor` times the size, as one edit: each layer of pixels is made bigger by the network, and the rest (masks, shapes, other
+	// layers' pixels) carried by the warp like any other scaling, which the network is not needed for. A layer of text is set again at the new size, a shape's path and
+	// a layer style's measurements go with the picture. (A shape's pixels are the old ones made bigger, until its path is edited.)
+	private async upscaleLayers(factor: 2 | 4 | 8) {
+		const bigger = new Map<Pixels, Pixels>();
+		for (const l of this.stack.layers) {
+			if (l.kind === 'image' && l.image.width && l.image.height) {
+				const result = await upscale(l.image, factor);
+				if (!result)
+					return false;
+				bigger.set(l.image, result);
+			}
+		}
+		// (what has been done meanwhile is what is upscaled: the layers whose pixels have changed are warped, as the rest are)
+		const carry = float3x3(float3(factor, 0, 0), float3(0, factor, 0), float3(0, 0, 1));
+		return this.carryPicture('Upscale', carry, undefined, image => bigger.get(image) as typeof image | undefined);
+	}
+
 	override run(op: string) {
+		const layers = this.stack;
+		const selection = this.selection();
+		const W = layers.width, H = layers.height;
+		const matrix = (x: float3, y: float3, z: float3) => float3x3(x, y, z);
+
 		switch (op) {
 			case 'newLayer':	this.addNewLayer(); return true;
 			case 'deleteLayer':	return this.layer ? (this.removeLayer(this.layer), true) : false;
 			case 'raiseLayer':	return this.layer ? (this.moveLayer(this.layer, 1), true) : false;
 			case 'lowerLayer':	return this.layer ? (this.moveLayer(this.layer, -1), true) : false;
+			case 'upscale2':
+			case 'upscale4':
+			case 'upscale8':	return this.upscaleLayers(Number(op.slice(7)) as 2 | 4 | 8);
+
+			case 'flipHorizontal':		return this.carryPicture(op, matrix(float3(-1, 0, 0), float3(0, 1, 0), float3(W, 0, 1)));
+			case 'flipVertical':		return this.carryPicture(op, matrix(float3(1, 0, 0), float3(0, -1, 0), float3(0, H, 1)));
+			case 'rotateClockwise':		return this.carryPicture(op, matrix(float3(0, 1, 0), float3(-1, 0, 0), float3(H, 0, 1)));
+			case 'rotateAnticlockwise':	return this.carryPicture(op, matrix(float3(0, -1, 0), float3(1, 0, 0), float3(0, W, 1)));
+			case 'crop':
+				return !!selection && this.carryPicture(op, float3x3.translate(selection.min.neg()), selection);
+
 			default:			return super.run(op);
 		}
 	}
 
 	// a layer moved to another place in the order, by index: it is one edit when it is dropped
-	dragger(layer: Layer): Drag {
+	dragger(layer: Layer): CascadeDrag {
 		let drag: {layer: Layer, order: Layer[]} | undefined;
 		const stack = this.stack;
 		const changed = () => this.live.recompose();
@@ -1387,12 +1467,12 @@ function layerThumbnail(width: number, height: number, size: number, layer: Pixe
 	const ctx	= canvas.getContext('2d')!;
 	const out	= ctx.createImageData(w, h);
 	const small = shapeSmall(layer, width, height, w, h) ?? (layer.image.width && layer.image.height
-		? warpPixels(layer.image, float3x3(float3(w / width, 0, 0), float3(0, h / height, 0), float3(left * w / width, top * h / height, 1)), new float2.extent(float2(0, 0), float2(w, h)))
+		? LayeredMode.warpPixels(layer.image, float3x3(float3(w / width, 0, 0), float3(0, h / height, 0), float3(left * w / width, top * h / height, 1)), new float2.extent(float2(0, 0), float2(w, h)))
 		: undefined);
 	const over = effectLayers(layer, width, height).map(e => ({
 		alpha:	layer.opacity ? Math.min(1, e.opacity / layer.opacity) : 1,
 		pixels:	e.image.width && e.image.height
-			? warpPixels(e.image, float3x3(float3(w / width, 0, 0), float3(0, h / height, 0), float3(e.left * w / width, e.top * h / height, 1)), new float2.extent(float2(0, 0), float2(w, h)))
+			? LayeredMode.warpPixels(e.image, float3x3(float3(w / width, 0, 0), float3(0, h / height, 0), float3(e.left * w / width, e.top * h / height, 1)), new float2.extent(float2(0, 0), float2(w, h)))
 			: undefined,
 	}));
 	for (let y = 0; y < h; y++) {

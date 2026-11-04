@@ -3,16 +3,15 @@
 // extension reads a shape into the points the editor takes.
 import { vscode, RPC, handleResult, Splitter } from '@isopodlabs/vscode_utils/webview/shared.js';
 import { createSession } from './svgsession.js';
-import type { curveVertex } from '@isopodlabs/binary_fonts';
+import type { curveVertex } from '@isopodlabs/binary_fonts/curves';
+import { ViewOptions, DEFAULT_OPTIONS, simplifyPoints, fitStroke } from './pathedit.js';
 
 export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
 	| {command: 'status', text: string}
-	| {command: 'edit', text: string, label: string, continues?: boolean}
 	| {command: 'shapePoints', name: string, attributes: Record<string, string>}
-	| {command: 'simplifyPoints', points: curveVertex[], tol: number, cubic: boolean}
-	| {command: 'fitStroke', stroke: number[], tol: number}
+	| {command: 'edit', text: string, label: string, continues?: boolean}
 	| {command: 'editImage', id: string, href: string};
 
 export type MessageIn =
@@ -26,11 +25,15 @@ const post	= (message: MessageOut) => vscode.postMessage(message);
 
 const errorBox	= $('scad-error');
 
-const session = createSession({view: $('insp-view'), tree: $('svg-tree'), props: $('svg-props')}, {
+const session = createSession({
+	view:		$('insp-view'),
+	tree:		$('svg-tree'), props: $('svg-props'),
+	options:	new ViewOptions({...DEFAULT_OPTIONS, grid: true})
+}, {
 	save:		(text, label, continues) => post({command: 'edit', text, label, continues}),
 	shapePoints: (name, attributes) => RPC<curveVertex[]>({command: 'shapePoints', name, attributes}),
-	simplifyPoints: (points, tol) => RPC<curveVertex[]>({command: 'simplifyPoints', points, tol, cubic: true}),
-	fitStroke:	(stroke, tol) => RPC<curveVertex[]>({command: 'fitStroke', stroke, tol}),
+	simplifyPoints: (points, tol) => simplifyPoints(points, tol, true),
+	fitStroke,
 	editImage:	(id, href) => post({command: 'editImage', id, href}),
 	status:		text => post({command: 'status', text}),
 	error:		message => {

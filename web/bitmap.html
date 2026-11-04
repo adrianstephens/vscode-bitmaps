@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Bitmap Editor</title>
+	<script type="importmap">{"imports": {
+		"@isopodlabs/vscode_utils/webview/": "../node_modules/@isopodlabs/vscode_utils/dist/webview/",
+		"@isopodlabs/maths/vector": "../node_modules/@isopodlabs/maths/esm/vector.js",
+		"@isopodlabs/maths/quaternion": "../node_modules/@isopodlabs/maths/esm/quaternion.js",
+		"@isopodlabs/maths/geometry": "../node_modules/@isopodlabs/maths/esm/geometry.js",
+		"@isopodlabs/maths/linear": "../node_modules/@isopodlabs/maths/esm/linear.js",
+		"@isopodlabs/binary": "../node_modules/@isopodlabs/binary/esm/index.js",
+		"@isopodlabs/binary_ml/browser": "../node_modules/@isopodlabs/binary_ml/esm/browser.js",
+		"@isopodlabs/xml": "../node_modules/@isopodlabs/xml/esm/xml.js",
+		"@isopodlabs/binary_bitmaps": "../node_modules/@isopodlabs/binary_bitmaps/esm/browser.js",
+		"@isopodlabs/binary_fonts": "../node_modules/@isopodlabs/binary_fonts/esm/browser.js",
+		"@isopodlabs/binary_fonts/curves": "../node_modules/@isopodlabs/binary_fonts/esm/curves.js"
+	}}</script>
+	<link rel="stylesheet" href="../node_modules/@isopodlabs/vscode_utils/assets/shared.css">
+	<link rel="stylesheet" href="../assets/pathedit.css">
+	<link rel="stylesheet" href="../assets/bitmap.css">
+	<link rel="stylesheet" href="../assets/cascade.css">
+</head>
+<body style="--cascade-size:32px;--cascade-scale:1;--cascade-magnify:1.6">
+	<div id="bitmap-root">
+		<div id="bitmap-main">
+			<div id="bitmap-stage">
+				<canvas id="viewport"></canvas>
+				<canvas id="overlay" class="hidden"></canvas>
+				<canvas id="transform-overlay" class="hidden"></canvas>
+			</div>
+		</div>
+	</div>
+	<!-- the page talks to this instead of to the extension: it must exist before the page's modules run -->
+	<script type="module" src="./host.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 import { Tooltip, Splitter, vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shared.js';
 import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
-import { Canvas3D, ShaderProgram, rectGeometry } from './opengl.ts';
-import { float3, float3x3, orthonormalise } from '@isopodlabs/maths/vector';
+import { Canvas3D, ShaderProgram, rectGeometry, rectNormal } from './opengl.ts';
+import { float3, float3x3, normalise, orthonormalise } from '@isopodlabs/maths/vector';
 import { Gizmo } from './gizmo.ts';
 
 // The tensor viewer of a GGUF file: the tensor list, and the values of the tensor in one float volume texture (a matrix is a stack of
@@ -521,13 +521,22 @@ async function reduceTensor(message: Extract<TensorIn, {command: 'tensorReduce'}
 	applyVolumeTexture(offscreen.texture, values, dims, extent, scale, `${info}; full colour at +-${scale.toPrecision(3)}`);
 }
 
+function rayDirection(canvas: HTMLCanvasElement, x: number, y: number) {
+	const rect = canvas.getBoundingClientRect();
+	const p = rectNormal(rect, x, y);
+	const aspect = rect.width / rect.height;
+	return normalise(float3((p.x * 2 - 1) * aspect, (1 - p.y * 2), -fovy));
+}
+
 // The voxel a pointer is over: where the ray has become mostly opaque, else the strongest one along it.
 // This walks the grid as tensor.frag does.
 function pickVoxel(event: {clientX: number, clientY: number}) {
 	if (!volume)
 		return;
 	const {dims, values, scale: colourScale} = volume;
-	const rd = basis.mul(canvas3d.rayDirection(event.clientX, event.clientY, fovy))._values;
+
+
+	const rd = basis.mul(rayDirection(canvas3d.canvas, event.clientX, event.clientY))._values;
 	const ro = basis.z.scale(distance)._values;
 
 	const half = volume.half, size = half.map((h, i) => 2 * h / dims[i]), unit = Math.cbrt(size[0] * size[1] * size[2]);	// of a voxel, and its mean side

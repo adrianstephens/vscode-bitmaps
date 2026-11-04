@@ -3,9 +3,9 @@
 // its elements and the fill and stroke of the one that is selected. The SVG editor's page is one of these, and the font
 // viewer holds another for the glyphs of a colour font. Every edit hands the host the whole text of the drawing.
 import { createElement, createSVGElement, SVG_NS } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { PathEditor, ViewOptions, svgPath, type DragHandler, type ElementTransform, type ShapeKind, type ToolChoice } from './pathedit.js';
+import { PathEditor, ViewOptions, svgPath, type DragHandler, type ElementTransform, type ShapeKind, type ToolChoice, gridSpacing, gridDraw, View } from './pathedit.js';
 import { float2, float2x3 } from '@isopodlabs/maths/vector';
-import type { curveVertex } from '@isopodlabs/binary_fonts';
+import type { curveVertex } from '@isopodlabs/binary_fonts/curves';
 import { choiceItem, valueItem, svgFace, swatchFace, colourItems, type CascadeItem } from './cascade.js';
 import { Tree } from '@isopodlabs/vscode_utils/webview/tree.js';
 import { type RGB, toHex, fromHex, mixColour, clamp01 } from './colour.js';
@@ -18,11 +18,10 @@ export interface SessionUi {
 	tree:		HTMLElement;		// the outline of the drawing's elements
 	props:		HTMLElement;		// the selected element's properties
 	options?:	ViewOptions;		// shared with another editor over the same place
-	views?:		string[];			// view options beyond the common ones, which the menu offers
 	pageItems?(): CascadeItem[];	// what the page adds to the head of the menu
 	active?():	boolean;			// whether it is the one showing, where the page has another editor over the same place
 	home?():	string | undefined;	// the id of the element that new shapes go in, where not the drawing's root
-	guides?(X: (x: number) => number, Y: (y: number) => number, w: number, h: number): string;
+	guides?(view: View, w: number, h: number): string;
 }
 
 export interface SessionBackend {
@@ -1170,7 +1169,6 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 	class SvgPath extends PathEditor {
 		constructor() {
 			super(ui.view, ui.options);
-			this.extraViews = ui.views ?? [];
 			this.cubic = true;
 			this.rounding = 0;
 			this.content.append(display);
@@ -1182,7 +1180,6 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 		canEdit() { return !readOnly && !mode && !!points && !!shapeOf(selected); }
 		protected structural() { return !mode; }
 		active() { return !!src && (ui.active?.() ?? true); }
-		protected guides(X: (x: number) => number, Y: (y: number) => number, w: number, h: number) { return ui.guides?.(X, Y, w, h) ?? ''; }
 		status(text: string) {
 			if (text !== lastStatus)
 				backend.status(lastStatus = text);
@@ -1221,11 +1218,22 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			updateMatrix();
 		}
 
-		protected paper(X: (x: number) => number, Y: (y: number) => number) {
-			const v = viewBoxOf(), s = this.view.s;
+		protected paper(view: View, w: number, h: number) {
+			const v = viewBoxOf(), {s, t} = this.view;
+			const X = (x: number) => x * s + t.x, Y = (y: number) => y * s + t.y;
 			const fill = {theme: 'none', white: '#fff', black: '#000', checker: 'url(#svg-checker)'}[background] ?? 'none';
-			return `<defs><pattern id="svg-checker" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="16" height="16" fill="#fff"/><rect width="8" height="8" fill="#ccc"/><rect x="8" y="8" width="8" height="8" fill="#ccc"/></pattern></defs>`
+			let back = `<defs><pattern id="svg-checker" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="16" height="16" fill="#fff"/><rect width="8" height="8" fill="#ccc"/><rect x="8" y="8" width="8" height="8" fill="#ccc"/></pattern></defs>`
 				+ `<rect class="svg-paper" x="${num(X(v.x))}" y="${num(Y(v.y))}" width="${num(v.w * s)}" height="${num(v.h * s)}" fill="${fill}"/>`;
+
+			if (this.option('grid')) {
+				this.gridStep = gridSpacing(s);
+				back += gridDraw(view, w, h, this.gridStep, this.yUp);
+			}
+
+			if (this.option('metrics'))
+				back += ui.guides?.(view, w, h) ?? ''
+				
+			return back;
 		}
 
 		// what is not a shape that has points is marked by its box

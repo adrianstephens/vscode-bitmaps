@@ -19,6 +19,10 @@ export interface CascadeDrag {
 	to(place: number):	void,
 	drop():				void
 };
+// a way of moving a layer as the menu's strip has it, which lists the last first
+export function reversed(r: CascadeDrag, count: () => number): CascadeDrag {
+	return {begin: r.begin, to: (place: number) => r.to(count() - 1 - place), drop: r.drop};
+}
 
 export interface CascadeItem {
 	id?:				string;				// the icon's data-id, for finding it from outside
@@ -37,7 +41,7 @@ export interface CascadeItem {
 	// reordered as it goes.
 	hover?(on: boolean): void;				// the pointer has come to rest on this icon, or gone from it to another
 	track?:				number;				// a button this many pixels long along its strip, standing for the whole range of its owner's scrub (see sliderItem): a press on it sets the value there
-	drag?:			CascadeDrag;
+	drag?:				CascadeDrag;
 }
 
 /** Items from different places made one list: of those with the same id, the later ones' strips come after the first's in its, and it
@@ -61,7 +65,11 @@ export function mergeItems(items: CascadeItem[]): CascadeItem[] {
 
 export const icons = {
 	view:		'<path d="M1 8 C4 3 12 3 15 8 C12 13 4 13 1 8Z"/><circle cx="8" cy="8" r="2"/>',
+	transform:	'<path d="M4 3.5h8.5V12H4z"/><rect x="2.5" y="2" width="3" height="3" fill="currentColor"/><rect x="11" y="2" width="3" height="3" fill="currentColor"/><rect x="11" y="10.5" width="3" height="3" fill="currentColor"/><rect x="2.5" y="10.5" width="3" height="3" fill="currentColor"/>',
+	image:		'<rect x="1.5" y="1.5" width="13" height="13" stroke-dasharray="2 1.5"/><path d="M5 11l6-6M8 5h3v3M5 8v3h3"/>',
 	grid:		'<path d="M2 2H14V14H2ZM6 2V14M10 2V14M2 6H14M2 10H14"/>',
+	metrics:	'<path d="M1 4H15M1 8H15M1 12H15" stroke-dasharray="3 2"/>',
+	fill:		'<path d="M3 13C3 4 8 2 13 3C14 8 12 13 3 13Z" fill="currentColor" fill-opacity="0.45"/>',
 };
 
 export const svgFace = (body: string) =>
@@ -74,28 +82,32 @@ export const swatchFace = (colour: string, second?: string) => second
 	? `<span class="cascade-swatch2"><span style="background:${second}"></span><span style="background:${colour}"></span></span>`
 	: `<span class="cascade-swatch" style="background:${colour}"></span>`;
 
-export function opItem(icon: string, caption: string, run: () => void, id?: string): CascadeItem {
+export function opItem(icon: string, caption: string, run: () => boolean|void, id?: string): CascadeItem {
 	return {
 		id,
 		face:		() => svgFace(icon),
 		caption:	() => caption,
-		select:		() => { run(); },
+		select:		run,
 	};
 }
 
 // a number that the wheel changes, and that a strip of presets can set
-export interface ValueOptions {
+export interface ValueOptionsBase {
 	id?:			string;				// the icon's data-id, for finding it from outside
 	label:			string;				// short, to fit on the icon
 	caption:		string;
-	get():			number;
-	set(v: number): void;
 	min:			number;
 	max:			number;
+	set(v: number): void;
 	step?(value: number, steps: number): number;	// the value after turning the wheel; by default up or down by one
-	presets?:		number[];				// increasing
 	resolution?:	number;				// what a value dragged along the presets is rounded to; by default 1
 	format?(value: number): string;
+}
+
+// a number that the wheel changes, and that a strip of presets can set
+export interface ValueOptions extends ValueOptionsBase {
+	get():			number;
+	presets?:		number[];				// increasing
 }
 
 export function valueItem(o: ValueOptions): CascadeItem {
@@ -105,6 +117,7 @@ export function valueItem(o: ValueOptions): CascadeItem {
 	const clamp = (v: number) => Math.min(o.max, Math.max(o.min, v));
 
 	return {
+		id:			o.id,
 		face:		() => valueFace(o.label, format(o.get())),
 		caption:	() => `${o.caption} ${format(o.get())} (scroll${o.presets ? ' or drag' : ''})`,
 		wheel:		steps => {
@@ -130,15 +143,24 @@ export function valueItem(o: ValueOptions): CascadeItem {
 	};
 }
 
-export interface SliderOptions extends Omit<ValueOptions, 'presets'> {
-	length?:	number;					// of the slider, in pixels; by default 160
-	markers?:	number[] | number;		// values to mark with a tick along the bar
+export function valueItemPersist(o: ValueOptions) {
+	let value = o.min;
+	const set = o.set;
+	return valueItem({...o, 
+		get: () => value, set: v => set(value = v),
+	})
+}
+
+export interface SliderOptions extends ValueOptionsBase {
+	get():			number;
+	length?:		number;					// of the slider, in pixels; by default 160
+	markers?:		number[] | number;		// values to mark with a tick along the bar
 }
 
 // a value like valueItem's, but whose strip is one bar and not a row of presets: the pointer's place along it is the value, linearly
 // from min to max (the same wheel, and a drag as well as a press)
 export function sliderItem(o: SliderOptions): CascadeItem {
-	const format = o.format ?? (v => String(Math.round(v)));
+	const format 	= o.format ?? (v => String(Math.round(v)));
 	const item = valueItem(o);
 	const resolution = o.resolution;
 	const quant: (v: number) => number = resolution === undefined ? v => Math.round(v) : resolution === 0 ? v => v : v => Math.round(v / resolution) * resolution;
@@ -159,6 +181,13 @@ export function sliderItem(o: SliderOptions): CascadeItem {
 			caption:	() => `${o.caption} ${format(o.get())}`,
 		}],
 	};
+}
+export function sliderItemPersist(o: ValueOptions) {
+	let value = o.min;
+	const set = o.set;
+	return sliderItem({...o, 
+		get: () => value, set: v => set(value = v),
+	})
 }
 
 // where a value falls among increasing presets, in presets: between them in proportion, and beyond them out to half a
@@ -236,9 +265,6 @@ export function colourItems(idp: string, get: () => RGB, put: (colour: RGB, fina
 		...sliderItem({
 			length:		128,
 			markers:	[0, 64, 128, 192, 255],
-/*		...valueItem({
-			presets:	[0, 64, 128, 192, 255],
-*/
 			label:		channel.toUpperCase(),
 			caption:	['Red', 'Green', 'Blue'][i],
 			get:		() => Math.round(get()[channel]),
@@ -275,12 +301,12 @@ interface Strip {
 	mag?:		{scale: number, shift: number}[];	// each button's magnification, and how far that moves it along the strip
 }
 
-const GAP = 3;				// between the icons of a strip, and between a strip and the icon it came out of
-const WHEEL_STEP = 50;		// pixels of a smooth wheel (a trackpad) to a step
-const WHEEL_PAUSE = 250;		// ms without the wheel after which the next movement is a new gesture
-const RELEASE_DELAY = 300;	// the right button let go this long after the menu opened chooses the icon under it
-const DRAG_START = 4;		// pixels the pointer moves with the button down before it is a drag and not a click
-const MAGNIFY = 1.6;		// the most an icon grows under the pointer, without --cascade-magnify
+const GAP			= 3;	// between the icons of a strip, and between a strip and the icon it came out of
+const WHEEL_STEP	= 50;	// pixels of a smooth wheel (a trackpad) to a step
+const WHEEL_PAUSE	= 250;	// ms without the wheel after which the next movement is a new gesture
+const RELEASE_DELAY	= 300;	// the right button let go this long after the menu opened chooses the icon under it
+const DRAG_START	= 4;	// pixels the pointer moves with the button down before it is a drag and not a click
+const MAGNIFY		= 1.6;	// the most an icon grows under the pointer, without --cascade-magnify
 
 // the magnification around the pointer, as a fraction of the most, is a bump of (1 + cos(πt)) / 2 out to t = ±1 (the strip's reach):
 // how much of the bump's area is before t
@@ -341,9 +367,15 @@ export class Cascade {
 					this.dragTo(e, true);
 			}
 		});
+		// a press away from the menu closes it; one on the picture it is over does only that (it does not paint, or select)
 		window.addEventListener('pointerdown', e => {
-			if (this.isOpen && !this.root.contains(e.target as Node) && e.button !== 2)
+			if (this.isOpen && !this.root.contains(e.target as Node) && e.button !== 2) {
 				this.close();
+				if (this.stage.contains(e.target as Node)) {
+					e.stopPropagation();
+					e.preventDefault();
+				}
+			}
 		}, true);
 		window.addEventListener('pointerup', e => {
 			if (this.reorder && e.button === 0) {
@@ -414,8 +446,11 @@ export class Cascade {
 		return this.root.contains(node);
 	}
 
-	// the first strip, running down from a point on the screen
+	// the first strip, running down from a point on the screen. Not while the page does not have the focus (a right click on VS Code's window
+	// while another application has it): the pointer's moves would not come to the menu, which could only be closed
 	open(x: number, y: number, items = this.items()) {
+		if (!document.hasFocus())
+			return;
 		this.closeFrom(0, false);
 		this.root.classList.remove('hidden');
 		this.openedAt = performance.now();
@@ -565,15 +600,15 @@ export class Cascade {
 			const i = Math.max(0, Math.min(centres.length - 2, Math.floor(p)));
 			return centres.length > 1 ? centres[i] + (p - i) * (centres[i + 1] - centres[i]) : centres[0] + p * spacing;
 		};
-		const n = centres.length;
-		const p = Math.max(-0.5, Math.min(n - 0.5, s.owner.gauge()));
-		const start = at(-0.5), end = at(n - 0.5), value = at(p);
-		const [lo, hi] = [Math.min(start, end), Math.max(start, end)];
-		const g = s.gauge, fill = g.firstElementChild as HTMLElement;
+		const n			= centres.length;
+		const p			= Math.max(-0.5, Math.min(n - 0.5, s.owner.gauge()));
+		const start		= at(-0.5), end = at(n - 0.5), value = at(p);
+		const [lo, hi]	= [Math.min(start, end), Math.max(start, end)];
+		const g			= s.gauge, fill = g.firstElementChild as HTMLElement;
 		const [pos, len] = s.vertical ? ['top', 'height'] as const : ['left', 'width'] as const;
 		g.classList.toggle('vertical', s.vertical);
-		g.style[pos] = `${lo}px`;
-		g.style[len] = `${hi - lo}px`;
+		g.style[pos]	= `${lo}px`;
+		g.style[len]	= `${hi - lo}px`;
 		fill.style[pos] = `${Math.min(start, value) - lo}px`;
 		fill.style[len] = `${Math.abs(value - start)}px`;
 	}

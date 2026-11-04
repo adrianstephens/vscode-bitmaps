@@ -310,3 +310,65 @@ body.tensors {
   border-radius: 6px;
   pointer-events: none;
 }
+
+/* work that takes a while: shown over the picture once it has gone on for a moment, with a spinner that turns without the page, and how
+   far it has got where that is known */
+#busy {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 0.9em;
+  white-space: nowrap;
+  pointer-events: none;
+  color: var(--vscode-editorWidget-foreground, var(--vscode-editor-foreground));
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border, transparent);
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+  opacity: 0;
+  visibility: hidden;
+  will-change: opacity;
+}
+#busy.on {
+  visibility: visible;
+  animation: busy-in 0.15s ease-out 0.4s forwards;
+}
+@keyframes busy-in {
+  to { opacity: 0.95; }
+}
+#busy svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--vscode-progressBar-background, #0e70c0);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-dasharray: 30 100;
+  will-change: transform;
+  animation: busy-turn 0.9s linear infinite;
+}
+@keyframes busy-turn {
+  to { transform: rotate(360deg); }
+}
+#busy .busy-bar {
+  display: none;
+  width: 80px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.3));
+  overflow: hidden;
+}
+#busy.known .busy-bar {
+  display: block;
+}
+#busy .busy-bar span {
+  display: block;
+  height: 100%;
+  background: var(--vscode-progressBar-background, #0e70c0);
+  transition: width 0.2s;
+}

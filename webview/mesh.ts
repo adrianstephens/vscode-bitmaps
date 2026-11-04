@@ -1,7 +1,7 @@
 // The mesh viewer's page: it draws the meshes the extension read from a file, each where the file places it, over the
 // floor the scad viewer draws, and says what is under the cursor.
 import { vscode, RPC, handleResult } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Canvas3D, RGBAPixels, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
+import { Canvas3D, Pixels, ShaderProgram, Offscreen, rectGeometry, createVertexArray } from './opengl.js';
 import { Orbit } from './orbit.js';
 import { Input } from './navigate.js';
 import { Gizmo } from './gizmo.js';
@@ -29,12 +29,12 @@ export interface InstanceData {
 	object:		string;
 }
 
-export type TextureData = RGBAPixels;
+export type TextureData = Pixels<4>;
 
 export interface RenderData {
 	meshes:		MeshData[],
 	instances:	InstanceData[],
-	textures:	(RGBAPixels | undefined)[],
+	textures:	(Pixels<4> | undefined)[],
 	info:		string,
 	warnings:	string[],
 	unit:		string,

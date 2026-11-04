@@ -5,7 +5,16 @@ export interface RGB {
 	g: number;
 	b: number;
 }
-export function RGB(r: number, g: number, b: number) { return {r, g, b}; }
+export interface RGBA {
+	r: number;
+	g: number;
+	b: number;
+	a: number;
+}
+export function RGB(r: number, g: number, b: number)					{ return {r, g, b}; }
+export function RGBA(r: number, g: number, b: number, a: number): RGBA	{ return {r, g, b, a}; }
+
+export function asRGBA(p?: Iterable<number>): RGBA|undefined { if (p) { const [r,g,b,a] = p; return {r, g, b, a}; } }
 
 export const toHex = ({r, g, b}: RGB) => '#' + [r, g, b].map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('');
 

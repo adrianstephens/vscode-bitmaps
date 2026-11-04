@@ -23,7 +23,8 @@ Module._load = function (request: string, ...rest: unknown[]) {
 		: origLoad.call(this, request, ...rest);
 };
 const { SvgDocument } = require('../out/src/SvgViewer.js');
-const { shapePoints } = require('../out/src/FontViewer.js');
+const { parseSVGshape, makeCurve, bezier3Curve } = require('@isopodlabs/binary_fonts');
+const shapePoints = (name: string, attributes: any) => bezier3Curve(makeCurve(parseSVGshape({name, attributes}, true) ?? {run() {}}), 1e-6);
 const { strips } = require('./cascadehost');
 const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -38,7 +39,7 @@ const SAMPLE = fs.readFileSync(path.join(__dirname, 'svgfiles', 'sample.svg'), '
 		if (url === '/index.html') {
 			res.writeHead(200, {'content-type': 'text/html'});
 			res.end(`<!DOCTYPE html><html><head>
-				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/dist/browser.mjs'}})}</script>
+				<script type="importmap">${JSON.stringify({imports: {'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/', '@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/esm/browser.js', '@isopodlabs/binary_fonts/curves': '/node_modules/@isopodlabs/binary_fonts/esm/curves.js', '@isopodlabs/binary': '/node_modules/@isopodlabs/binary/esm/index.js', '@isopodlabs/xml': '/node_modules/@isopodlabs/xml/esm/xml.js', '@isopodlabs/maths/linear': '/node_modules/@isopodlabs/maths/esm/linear.js', '@isopodlabs/maths/quaternion': '/node_modules/@isopodlabs/maths/esm/quaternion.js'}})}</script>
 				<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css"><link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/tree.css"><link rel="stylesheet" href="/assets/bitmap.css"><link rel="stylesheet" href="/assets/pathedit.css"><link rel="stylesheet" href="/assets/font.css"><link rel="stylesheet" href="/assets/svg.css"><link rel="stylesheet" href="/assets/cascade.css">
 				<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 			</head><body class="tensors">

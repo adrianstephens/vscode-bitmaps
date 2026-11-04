@@ -7,38 +7,47 @@ uniform highp sampler2D u_glyphs;	// signed-distance atlas of the characters a n
 uniform vec4	u_glyphCell;	// em position of a cell's left and bottom edge, and its width and height in ems
 uniform vec4	u_glyphInfo;	// em advance of a cell, em distance a texel saturates at, number of cells (0: no numbers), em height of a digit
 
-// How much of a line of a grid of spacing s covers this point: 1 on a line, 0 between them. w is half the width a
-// line should have here, which the caller works out from how far away the floor was hit -- without it a grid aliases
-// into moire at any distance, and the lines get fainter as they get further away because they are drawn wider.
-float gridLine(vec2 p, float s, float w) {
-	vec2 g = abs(fract(p / s - 0.5) - 0.5) * s;
-	return 1.0 - smoothstep(0.0, w, min(g.x, g.y));
+// The most a line's half-width grows to, in pixels of the display, and the number of levels that keeps the top one at it: the top level
+// is at least 1000 * LINE_CAP pixels apart (the finest is at least one, each is ten times the last), which is where a line of a
+// thousandth of its spacing reaches the cap. Change them together.
+const float LINE_CAP = 3.0;
+const int LINE_LEVELS = 5;
+
+// How much a line of a grid of spacing s is drawn at when a pixel is w: a line is a thousandth of its spacing wide, and fades out as it
+// gets narrower than half a pixel. The numbers beside the axes come and go by the same test, so they stay with their lines.
+float gridLineFade(float s, float w) {
+	return min(s / 1000.0 / w * 2.0, 1.0);
 }
 
-// Three levels of grid, in the model's own units, which are mm. Each fades out once its spacing is down to the size
-// of a pixel: a 1mm grid over a 90mm model is a moire pattern at a glance, so it is drawn only where it can be seen.
-// The fade and the weight of a level are defined once, here, because the numbers beside the axes belong to the same
-// levels and must come and go exactly as their lines do.
-float gridLevelSpacing(int level) {
-	return pow(10.0, float(level));
+// How much of a line of a grid of spacing s covers this point: 1 on a line, 0 between them. w is half the width a
+// line should have here, which the caller works out from how far away the floor was hit -- without it a grid aliases
+// into moire at any distance, and the lines get fainter as they get further away because they are drawn wider. d is the pixel of
+// the display: a line is a thousandth of its spacing wide but never wider than that, so the coarsest levels, which a view this close
+// to the floor sees only as lines through the origin, are all one width and the axis does not change width as a level leaves.
+float gridLine(vec2 p, float s, float w, float d) {
+	vec2 g = abs(fract(p / s - 0.5) - 0.5) * s;
+	float x = min(s / 1000.0, d * LINE_CAP);
+	return 1.0 - smoothstep(x, x + w, min(g.x, g.y));
 }
-// A level is drawn while its lines are far enough apart to be resolved: below about two pixels of spacing they
-// cannot be, and that is the moire. Written as pixels of spacing rather than as a width, because it is the spacing
-// that aliases -- a line thinner than a pixel is only fainter, its width being a fraction of the spacing with a floor
-// of one pixel, so the two come to the same test.
-float gridLevelFade(float s, float w) {
-	return smoothstep(2.0, 6.0, s / w);
+
+// The finest level's spacing for a pixel of size w: the decade that is one to ten pixels, so the finest level is always on the
+// point of being resolved and fades in as the view closes on it (gridLine fades a line out once it is narrower than a pixel), and the
+// coarser two are a decade apiece above.
+// It goes by the pixel, not the model, and has no floor: the camera can get as close to the floor as it likes.
+float viewGridStep(float w) {
+	return pow(10.0, floor(log(w) / 2.302585 + 1e-4) + 1.0);
 }
-// How strongly a level is drawn: the finer the level, the fainter, so the coarse lines read as the structure.
-float gridLevelWeight(int level) {
-	return level == 0 ? 0.35 : level == 1 ? 0.65 : 1.0;
-}
-// All the levels' lines together, each at its own fade and weight.
+// All the levels' lines together. A level's line is a thousandth of its spacing wide, so the coarser levels read as the structure
+// without needing a weight. There are LINE_LEVELS, the top one always wide enough to be at the width cap: the set of levels moves a decade
+// as the view closes in, and what leaves at the top must look like what replaces it.
 float floorGrid(vec2 p, float w) {
 	float lines = 0.0;
-	for (int i = 0; i < 3; i++) {
-		float s = gridLevelSpacing(i);
-		lines = max(lines, gridLine(p, s, min(w * 0.9 + s * 0.002, s * 0.15)) * gridLevelFade(s, w) * gridLevelWeight(i));
+	float d = w * u_labelPixel / u_pixel;		// the pixel of the display: the levels and fades go by it, so they hold while the view is drawn small
+	float s = viewGridStep(d);
+
+	for (int i = 0; i < LINE_LEVELS; i++) {
+		lines = max(lines, gridLine(p, s, w, d) * gridLineFade(s, d));
+		s *= 10.0;
 	}
 	return lines;
 }
@@ -50,7 +59,7 @@ float floorGrid(vec2 p, float w) {
 // are in the model's own size, so it suits a part and a tray alike.
 float floorFade(float dist) {
 	float scale = max(max(u_half.x, u_half.y), u_half.z);
-	return exp(-max(0.0, dist - scale * 1.5) / (scale * 3.0));
+	return exp(-max(0.0, dist + scale * 1.5) / (scale * 8.0));
 }
 
 // Where a ray meets the floor, or -1. The floor is the plane z = 0, wherever the model is: it is where the file's own
@@ -89,7 +98,11 @@ float glyphDistance(int g, vec2 q) {
 // How many characters an integer takes to spell.
 int labelLength(int value) {
 	int a = abs(value);
-	return (a >= 10000 ? 5 : a >= 1000 ? 4 : a >= 100 ? 3 : a >= 10 ? 2 : 1) + (value < 0 ? 1 : 0);
+	int n = 1;
+	for (int i = 0; i < 8; i++)
+		if (a >= int(pow(10.0, float(i + 1)) + 0.5))
+			n = i + 2;
+	return n + (value < 0 ? 1 : 0);
 }
 
 // The character in slot k of the integer's spelling: cell 10 is the minus sign, cells 0-9 the digits.
@@ -102,7 +115,7 @@ int labelCell(int value, int k) {
 	int a = abs(value);
 	int digits = labelLength(a);
 	int scale = 1;
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 8; i++)
 		if (i < digits - 1 - k)
 			scale *= 10;
 	return (a / scale) % 10;
@@ -125,61 +138,84 @@ vec2 labelCoverage(int value, vec2 q, float pixel) {
 	return vec2(clamp(0.5 - d / pixel, 0.0, 1.0), clamp(0.5 - (d - 0.07) / pixel, 0.0, 1.0));
 }
 
-// The size of a pixel at a point on the floor, in the model's units: what the grid's own fade is measured against,
-// worked out for a label's anchor rather than for each pixel, so a label is one size and fades as one piece.
-float pixelAt(vec3 anchor) {
-	return length(anchor - u_origin) * u_pixel;
-}
-// The same for a pixel of the display rather than of this drawing: while the view moves the page is drawn at half
-// size, and a label sized in drawing pixels would double on screen for as long as it did. The fade is measured in
-// drawing pixels, as the grid's is, so that the numbers and their lines still come and go together.
+// The size of a pixel of the display at a point on the floor, in the model's units, worked out for a label's anchor rather than
+// for each pixel, so a label is one size and fades as one piece. It is the display's pixel and not this drawing's: while the view
+// moves the page is drawn at half size, and a label sized in drawing pixels would double on screen for as long as it did. The
+// grid's levels and fades go by it too (floorGrid), so nothing changes when the drawing is made smaller.
 float displayPixelAt(vec3 anchor) {
 	return length(anchor - u_origin) * u_labelPixel;
 }
 
+// The size of a level's numbers in ems, as a fraction of its spacing, so they scale with the grid squares they belong to.
+const float LABEL_EM = 0.1;
+// The sizes on the display, in pixels of em, over which a level's numbers fade out as they grow. They are not held to a comfortable
+// size: the camera closing on the floor only makes a level's numbers bigger until they fade, and by then the next level is there. The
+// end must not pass LABEL_EM * 1000, the largest a level's spacing gets to be in pixels, or the level that is dropped at the top
+// as the view closes in would still be showing.
+const vec2 LABEL_FADE = vec2(75.0, 100.0);
+
+// How much a level's numbers show at a point where a pixel of the display is dp: in as their lines do (gridLineFade), out as they grow
+// large (LABEL_FADE). It is a function of the spacing in pixels alone, so a level seen at a given size looks the same whichever of
+// the levels it is, and nothing pops as the set of levels moves a decade.
+float labelAlpha(float step, float dp) {
+	return gridLineFade(step, dp) * (1.0 - smoothstep(LABEL_FADE.x, LABEL_FADE.y, LABEL_EM * step / dp));
+}
+
 // (fill, halo) of one grid level's numbers at a point of the floor: every step along x is written under the x axis,
 // centred on its tick, and every step along y to the left of the y axis, right-aligned against it and centred on its
-// tick. A tick that a coarser level already numbers is left to it. A level's numbers fade and weigh exactly as its
-// lines do (the same gridLevelFade and gridLevelWeight, measured at the label's anchor). Their size is a fraction of
-// the spacing, so they scale with the grid squares they belong to -- but never past a comfortable size on the screen,
-// or the coarse levels' numbers would fill the view once the camera is close. w is the size of a pixel here.
+// tick. A tick that the next level also numbers is shared with it: that level's number shows as much as it does, and this one's
+// the rest, so the number crosses over as the coarser one fades out. The coarsest level numbers every tick. w is the size of a
+// pixel here.
 vec2 levelLabels(vec3 at, float w, int level) {
 	vec2 p = at.xy;
-	float stepSize = gridLevelSpacing(level);
-	float weight = gridLevelWeight(level);
-	bool coarsest = level == 2;
-	float emMax = stepSize * 0.4;
-	float reach = emMax * (0.3 + u_glyphInfo.w + u_glyphInfo.y);		// the furthest from an axis any number of this level reaches
-	int unit = int(stepSize + 0.5);
 	vec2 result = vec2(0.0);
+	bool coarsest = level == 2;
+	float scale = pow(10.0, float(level));
 
-	if (p.y < u_glyphInfo.y * emMax && p.y > -reach) {
-		float i = floor(p.x / stepSize + 0.5);
-		int value = int(i) * unit;
-		if (abs(i) <= 60.0 && (coarsest || (value != 0 && value % (unit * 10) != 0))) {
-			vec3 anchor = vec3(i * stepSize, 0.0, at.z);
-			float alpha = gridLevelFade(stepSize, pixelAt(anchor)) * weight;
-			if (alpha > 0.0) {
-				float em = min(emMax, 22.0 * displayPixelAt(anchor));
-				float cap = u_glyphInfo.w * em, gap = 0.3 * em;
-				float width = float(labelLength(value)) * u_glyphInfo.x * em;
-				vec2 q = vec2(p.x - i * stepSize + width * 0.5, p.y + gap + cap) / em;
-				result = max(result, labelCoverage(value, q, w / em) * alpha);
+	// The step of a level goes by the pixel at the axis, not at this fragment: the axis is where the numbers are, and a floor seen
+	// at a slant has pixels of every size along it, so a step taken from the fragment would change partway across a number.
+	float stepX = viewGridStep(displayPixelAt(vec3(p.x, 0.0, at.z))) * scale;
+	if (stepX >= 1.0) {
+		float em = stepX * LABEL_EM;
+		float reach = em * (0.3 + u_glyphInfo.w + u_glyphInfo.y);		// the furthest from an axis any number of this level reaches
+		int unit = int(stepX + 0.5);
+		if (p.y < u_glyphInfo.y * em && p.y > -reach) {
+			float i = floor(p.x / stepX + 0.5);
+			int value = int(i) * unit;
+			if (abs(i) <= 60.0) {
+				vec3 anchor = vec3(i * stepX, 0.0, at.z);
+				float dp = displayPixelAt(anchor);
+				float alpha = labelAlpha(stepX, dp);
+				if (!coarsest && value % (unit * 10) == 0)
+					alpha *= 1.0 - labelAlpha(stepX * 10.0, dp);
+				if (alpha > 0.0) {
+					float cap = u_glyphInfo.w * em, gap = 0.3 * em;
+					float width = float(labelLength(value)) * u_glyphInfo.x * em;
+					vec2 q = vec2(p.x - i * stepX + width * 0.5, p.y + gap + cap) / em;
+					result = max(result, labelCoverage(value, q, w / em) * alpha);
+				}
 			}
 		}
 	}
-	if (p.x < u_glyphInfo.y * emMax && p.x > -(emMax * (0.3 + 5.0 * u_glyphInfo.x + u_glyphInfo.y))) {
-		float i = floor(p.y / stepSize + 0.5);
-		int value = int(i) * unit;
-		if (i != 0.0 && abs(i) <= 60.0 && (coarsest || value % (unit * 10) != 0)) {
-			vec3 anchor = vec3(0.0, i * stepSize, at.z);
-			float alpha = gridLevelFade(stepSize, pixelAt(anchor)) * weight;
-			if (alpha > 0.0) {
-				float em = min(emMax, 22.0 * displayPixelAt(anchor));
-				float cap = u_glyphInfo.w * em, gap = 0.3 * em;
-				float width = float(labelLength(value)) * u_glyphInfo.x * em;
-				vec2 q = vec2(p.x + gap + width, p.y - i * stepSize + cap * 0.5) / em;
-				result = max(result, labelCoverage(value, q, w / em) * alpha);
+	float stepY = viewGridStep(displayPixelAt(vec3(0.0, p.y, at.z))) * scale;
+	if (stepY >= 1.0) {
+		float em = stepY * LABEL_EM;
+		int unit = int(stepY + 0.5);
+		if (p.x < u_glyphInfo.y * em && p.x > -(em * (0.3 + 9.0 * u_glyphInfo.x + u_glyphInfo.y))) {
+			float i = floor(p.y / stepY + 0.5);
+			int value = int(i) * unit;
+			if (i != 0.0 && abs(i) <= 60.0) {
+				vec3 anchor = vec3(0.0, i * stepY, at.z);
+				float dp = displayPixelAt(anchor);
+				float alpha = labelAlpha(stepY, dp);
+				if (!coarsest && value % (unit * 10) == 0)
+					alpha *= 1.0 - labelAlpha(stepY * 10.0, dp);
+				if (alpha > 0.0) {
+					float cap = u_glyphInfo.w * em, gap = 0.3 * em;
+					float width = float(labelLength(value)) * u_glyphInfo.x * em;
+					vec2 q = vec2(p.x + gap + width, p.y - i * stepY + cap * 0.5) / em;
+					result = max(result, labelCoverage(value, q, w / em) * alpha);
+				}
 			}
 		}
 	}
@@ -194,19 +230,6 @@ vec2 axisLabels(vec3 at, float w) {
 	for (int i = 0; i < 3; i++)
 		result = max(result, levelLabels(at, w, i));
 	return result;
-}
-
-// The floor's colour between its lines and on them, and how the two lights in the camera's frame (as the models' own
-// shading has them) light it
-const vec3 FLOOR_BASE = vec3(0.26, 0.28, 0.31);
-const vec3 FLOOR_LINE = vec3(0.62, 0.65, 0.70);
-vec3 floorColour(float lines) {
-	return mix(FLOOR_BASE, FLOOR_LINE, lines);
-}
-float floorLight() {
-	vec3 key	= normalize(u_basis * vec3(-0.4, 0.6, 0.7));
-	vec3 fill	= normalize(u_basis * vec3(0.7, -0.2, 0.5));
-	return 0.45 + 0.55 * max(key.z, 0.0) + 0.2 * max(fill.z, 0.0);
 }
 
 // The numbers go on last and unlit: they are annotation, not part of the floor, so neither shadow nor light should touch

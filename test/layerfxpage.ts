@@ -30,10 +30,6 @@ const W = 700, H = 500;
 				edits.push(m.label);
 			else if (m.command === 'error')
 				errors.push(m.message);
-			else if (m.command === 'fitStroke') {		// (the extension's fit is not here: the stroke's first, middle and last points will do)
-				const q = m.stroke as number[], n = q.length / 2, at = (i: number, flags: number) => ({x: q[2 * i], y: q[2 * i + 1], flags});
-				reply([at(0, 0), at(n >> 1, 1), at(n - 1, 4)]);
-			}
 		},
 	});
 	await readyP;

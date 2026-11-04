@@ -8,8 +8,8 @@ import {
 	ModuleInstantiation as Inst, type UserModule, type FunctionDefinition
 } from './parser';
 import type { Sdf, Support } from './sdf';
-import { compileField, compileColor, compileDisplacement, FnError, Texture, type Resolver } from './fnsurface';
-import type { ScadFiles } from '../filereader';
+import { compileField, compileColor, compileDisplacement, FnError, SlopeMap, Texture, type Resolver } from './fnsurface';
+import type { SyncFiles } from '../filereader';
 import { findFont, layoutText } from '../fonts';
 import { random, colors } from '@isopodlabs/utilities';
 import * as bitmap from '@isopodlabs/binary_bitmaps';
@@ -17,7 +17,7 @@ import * as meshes from '@isopodlabs/binary_meshes';
 import * as path from 'path';
 import { empty,
 	bounds2,	hullVertices2,	convexHull2, verticesOf2, sameRadiusCircles, is2d,
-	SDF,	hullVertices3,	convexHull3, verticesOf3, polytopeOfIntersection, sameRadiusSpheres, weightedPoints3, weightedHull3,
+	SDF,	hullVertices3,	convexHull3, verticesOf3, polytopeOfIntersection, sameRadiusSpheres, hullOfCylinders, weightedPoints3, weightedHull3,
 	isConformal, projection, heightmap, type Wrap,
 	sameMaterial, DEFAULT_MATERIAL, inverseOrIdentity, type Material,
 	trimesh, scaleHeightmap, Box3
@@ -37,7 +37,7 @@ class Ctx implements Warner {
 		this.seen.set(message, (this.seen.get(message) ?? 0) + 1);
 	}
 
-	get list(): string[] {
+	get warnings(): string[] {
 		return [...this.seen].map(([message, count]) => count > 1 ? `${message} (x${count})` : message);
 	}
 
@@ -45,7 +45,7 @@ class Ctx implements Warner {
 	// user-defined modules currently instantiating, outermost first, for $parent_modules/parent_module() -- a
 	// builtin module (translate(), difference(), ...) is not one of OpenSCAD's own either, so it is not pushed here
 	moduleStack	= [] as string[];
-	constructor(public files: ScadFiles, public filename: string) {}
+	constructor(public files: SyncFiles, public filename: string) {}
 
 	// What `reader` makes of the file a call names, found as OpenSCAD finds it (beside the file the call is written in,
 	// then the library path); undefined, reported, when it cannot be. The result is shared by every call and every
@@ -119,7 +119,7 @@ export interface Closure {
 	closure:	true;
 	definition:	FunctionDefinition;
 	resolver:	Resolver;
-	call:	(env: Env, args: Assignment[]) => Value;
+	call:		(env: Env, args: Assignment[]) => Value;
 	texture?:	Texture;
 }
 
@@ -204,10 +204,11 @@ function show(v: Value): string {
 const positional	= (args: Assignment[]) => args.filter(a => !a.name);
 const named			= (args: Assignment[], name: string) => args.find(a => a.name === name);
 
-const argGetter = (inst: Inst, env: Env, ctx: Ctx) => {
+const argGetter = (inst: Inst, env: Env) => {
 	const args	= inst.args ?? [];
+	const ctx	= env.ctx;
 	const p		= positional(args);
-	const eva	= (e: Expr|undefined) => env.evalExpr(e, ctx);
+	const eva	= (e: Expr|undefined) => env.evalExpr(e);
 	const get	= (name: string, index = -1) => {
 		const byName = named(args, name);
 		return byName ? eva(byName.expr) : index >= 0 && index < p.length ? eva(p[index].expr) : undefined;
@@ -255,11 +256,11 @@ const argGetter = (inst: Inst, env: Env, ctx: Ctx) => {
 		},
 		special: (name: string) => {
 			const byName = named(args, name);
-			return byName ? eva(byName.expr) : env.get(name, ctx);
+			return byName ? eva(byName.expr) : env.get(name);
 		},
-		child:			(frame: Frame) => evalScope(new Env(env), inst.scope, frame, ctx),
-		children:		(frame: Frame) => inst.scope.moduleInstantiations.map(i => instantiate(new Env(env), i, frame, ctx)),
-		transformed:	(frame: Frame, m: float3x4, scale: number) => evalScope(new Env(env), inst.scope, {m: frame.m.mulAffine(m), scale: frame.scale * scale}, ctx),
+		child:			(frame: Frame) => evalScope(new Env(env), inst.scope, frame),
+		children:		(frame: Frame) => inst.scope.moduleInstantiations.map(i => instantiate(new Env(env), i, frame)),
+		transformed:	(frame: Frame, m: float3x4, scale: number) => evalScope(new Env(env), inst.scope, {m: frame.m.mulAffine(m), scale: frame.scale * scale}),
 
 		arity:			(name: string, count: number) => {
 			const extra = positional.length - count;
@@ -275,18 +276,18 @@ type argGetter = ReturnType<typeof argGetter>;
 // variables use): each one sees every binding before it in the same let(), so it evaluates each expression in
 // `target` itself -- which accumulates them one at a time -- rather than in the outer `env` a plain module-call
 // argument list would use, where the arguments cannot see each other at all.
-function bindArguments(args: Assignment[], target: Env, ctx: Ctx) {
+function bindArguments(args: Assignment[], target: Env) {
 	for (const a of args)
 		if (a.name)
-			target.values.set(a.name, target.evalExpr(a.expr, ctx));
+			target.values.set(a.name, target.evalExpr(a.expr));
 }
 
 
 // The material in force here, from `$` variables. OpenSCAD ignores them, and this viewer reads them exactly the way
 // it reads $fn -- including their dynamic scope, so a module can set one and everything it instantiates sees it. That
 // is what keeps a file that uses them a valid scad file, which a material() module of our own would not be.
-function ambientMaterial(env: Env, ctx: Ctx): Material {
-	const number = (name: string) => num(env.get(name, ctx), ctx, name);
+function ambientMaterial(env: Env): Material {
+	const number = (name: string) => num(env.get(name), env.ctx, name);
 	return {
 		...DEFAULT_MATERIAL,
 		specular:	number('$specular') 	?? DEFAULT_MATERIAL.specular,
@@ -441,7 +442,7 @@ function forEachIteration(args: argGetter, leaf: (inner: Env) => void) {
 			leaf(inner);
 		} else {
 			const loop	= args.raw[i];
-			const range	= inner.evalExpr(loop.expr, args.ctx);
+			const range	= inner.evalExpr(loop.expr);
 			for (const value of isList(range) ? range : [range]) {
 				const next = new Env(inner);
 				next.values.set(loop.name || 'i', value);
@@ -471,31 +472,6 @@ const MESH_READERS: Record<string, (bytes: Uint8Array) => meshes.Model|Promise<m
 	'.3mf': meshes.ThreeMF.read,
 	'.obj': meshes.OBJ.read,
 };
-
-function vectorOfPoints(v: Value, warn: Warner): float3[] | undefined {
-	if (!isList(v))
-		return undefined;
-	const out: float3[] = [];
-	for (const p of v) {
-		const point = vec3(p, warn, 'a polyhedron point');
-		if (!point)
-			return undefined;
-		out.push(point);
-	}
-	return out;
-}
-
-function vectorOfFaces(v: Value): number[][] | undefined {
-	if (!isList(v))
-		return undefined;
-	const out: number[][] = [];
-	for (const face of v) {
-		if (!isList(face))
-			return undefined;
-		out.push(face.map(x => (typeof x === 'number' ? Math.round(x) : NaN)));
-	}
-	return out;
-}
 
 // A polyhedron's faces as half-spaces, whose furthest is the polyhedron itself only when it is convex -- which this
 // says, so that one that is not can be drawn from its triangles instead (see solidOf).
@@ -549,6 +525,253 @@ function solidOf(points: float3[], faces: number[][], warn: Warner): Sdf {
 }
 
 //-----------------------------------------------------------------------------
+// curves
+//-----------------------------------------------------------------------------
+// A run of curve vertices from a begin to an end, as the curve format has them (see curveVertex): the first vertex
+// begins it, the last is on the curve, and between are lines' on-curve points and cubics' two off-curve points.
+type Curve = curveVertex[];
+
+// Contours as a flat shape, kept as curves as a font's glyphs are -- a circle or an arc is exact up to a tolerance, not
+// segments. `curves` are cubics and lines (see Curve); the fill is even-odd, so an outline inside another is a hole.
+function curvePath(curves: Curve, center: boolean): Sdf {
+	const box	= float2.extent.from(curves.map(v => float2(v.x, v.y)));
+	let curve	= bezier2Curve(curves, 1e-4 * Math.max(box.max.x - box.min.x, box.max.y - box.min.y, 1e-3));
+	if (center) {
+		const mid = box.centre();
+		curve = curve.map(v => curveVertex(v.x - mid.x, v.y - mid.y, v.flags));
+	}
+	return {k: 'curvepath2', paths: curve};
+}
+
+// Curves joined at their ends into outlines, as DxfData joins them: ends are snapped to a grid (to an occupied
+// neighbouring cell if there is one, which is how nearly-meeting ends meet), open paths are walked from their loose
+// ends first, and whatever is left forms closed loops. A closed loop does not repeat its first point, as the format
+// closes a contour itself.
+function joinCurves(curves: Curve[], GRID = 0.0009765625): {curve: Curve, closed: boolean}[] {
+	const cells = new Map<string, number[]>();
+	const snap	= (p: {x: number, y: number}) => {
+		let ix = Math.round(p.x / GRID), iy = Math.round(p.y / GRID);
+		if (!cells.has(`${ix},${iy}`)) {
+			let best = 10;
+			for (let jx = ix - 1; jx <= ix + 1; jx++)
+				for (let jy = iy - 1; jy <= iy + 1; jy++)
+					if (cells.has(`${jx},${jy}`) && Math.abs(ix - jx) + Math.abs(iy - jy) < best) {
+						best = Math.abs(ix - jx) + Math.abs(iy - jy);
+						[ix, iy] = [jx, jy];
+					}
+		}
+		return {key: `${ix},${iy}`, at: float2(ix * GRID, iy * GRID)};
+	};
+
+	const lines = curves.filter(c => c.length >= 2).map((curve, i) => {
+		const ends = [snap(curve[0]), snap(curve[curve.length - 1])];
+		for (const e of ends)
+			cells.set(e.key, [...cells.get(e.key) ?? [], i]);
+		return {curve, ends};
+	});
+
+	const done = new Array<boolean>(lines.length).fill(false);
+	// the curve of `line`, from its end `from`, with both its ends where they snapped to
+	const oriented = (line: number, from: number) => {
+		const {curve, ends} = lines[line];
+		const out = curve.slice();
+		if (from !== 0)
+			out.reverse();
+		out[0]				= curveVertex(ends[from].at.x, ends[from].at.y, ON_BEGIN);
+		out[out.length - 1] = curveVertex(ends[1 - from].at.x, ends[1 - from].at.y, ON_CURVE);
+		return out;
+	};
+	const walk = (line: number, from: number, closed: boolean) => {
+		const out = oriented(line, from);
+		for (let l: number | undefined = line, f = from; ; ) {
+			const end: {key: string, at: float2} = lines[l].ends[1 - f];
+			done[l] = true;
+			const next: number | undefined = cells.get(end.key)!.find(k => !done[k]);
+			if (next === undefined)
+				break;
+			f = lines[next].ends[0].key === end.key ? 0 : 1;
+			out.push(...oriented(next, f).slice(1));
+			l = next;
+		}
+		if (closed)
+			out.pop();
+		return {curve: out, closed};
+	};
+
+	const paths: {curve: Curve, closed: boolean}[] = [];
+	// an open path starts at an end no other line shares, and which is not its own other end
+	for (let again = true; again; ) {
+		again = false;
+		for (let i = 0; i < lines.length && !again; i++)
+			for (let j = 0; j < 2 && !done[i] && !again; j++)
+				if (lines[i].ends[0].key !== lines[i].ends[1].key && cells.get(lines[i].ends[j].key)!.every(k => k === i || done[k])) {
+					paths.push(walk(i, j, false));
+					again = true;
+				}
+	}
+
+	lines.forEach((_, i) => {
+		if (!done[i])
+			paths.push(walk(i, 0, true));
+	});
+	return paths;
+}
+
+function loadDXF(module: string, args: argGetter) {
+	const written = args.str('file');
+	if (typeof written !== 'string') {
+		args.warn(`${module}() without a file name`);
+		return undefined;
+	}
+	return args.ctx.openFile(module, written, args.filename(), 'dxf', bytes => {
+		const model = meshes.DXF.read(bytes);
+		return model.extras.document as dwg.DXF;
+	});
+}
+
+// dxf_dim(): the measurement of the DIMENSION of that name (the first, without one), worked out from its points as
+// OpenSCAD's dxfdim.cc does
+function dxfDim(args: argGetter): Value {
+	const doc	= loadDXF('dxf_dim', args);
+	if (!doc)
+		return undefined;
+
+	const name	= args.str('name');
+	const layer = args.str('layer');
+
+	const dim = doc.entities.filter(e => e instanceof dwg.Dimension).find(e => (!layer || e.layer === layer) && (!name || name === (e.user_text ?? '')));
+	if (!dim) {
+		args.warn(`dxf_dim(): no dimension '${name}'`);
+		return undefined;
+	}
+
+	const origin	= args.vec2('origin') ?? float2(0, 0);
+	const scale		= args.num('scale') ?? 1;
+	const at		= (p?: dwg.Vec2) => p ? float2((p.x - origin.x) * scale, (p.y - origin.y) * scale) : float2(0, 0);
+
+	const lines		= dim instanceof dwg.DRW_DIMENSION_LINEAR || dim instanceof dwg.DRW_DIMENSION_ALIGNED || dim instanceof dwg.DRW_DIMENSION_ORDINATE;
+	const angular	= dim instanceof dwg.DRW_DIMENSION_ANG_LN2 || dim instanceof dwg.DRW_DIMENSION_ANG_PT3;
+	const defpoint	= at(lines || angular || dim instanceof dwg.DRW_DIMENSION_RADIUS || dim instanceof dwg.DRW_DIMENSION_DIAMETER ? dim.defpoint : undefined);
+	const def1		= at(lines || angular ? dim.def1 : undefined);
+	const def2		= at(lines || angular ? dim.def2 : undefined);
+	const centre	= at(angular ? dim.centrePoint : dim instanceof dwg.DRW_DIMENSION_RADIUS || dim instanceof dwg.DRW_DIMENSION_DIAMETER ? dim.circlePoint : undefined);
+	const angle		= deg(dim instanceof dwg.DRW_DIMENSION_LINEAR ? dim.angle : 0);
+
+	const dx = def2.x - def1.x, dy = def2.y - def1.y;
+	switch (dim.tflags & 7) {
+		case 0:	return Math.abs(dx * Math.cos(angle * Math.PI / 180) + dy * Math.sin(angle * Math.PI / 180));
+		case 1:	return Math.hypot(dx, dy);
+		// as dxfdim.cc has it, x before y
+		case 2:	return Math.abs(atan2Degrees(defpoint.x - centre.x, defpoint.y - centre.y) - atan2Degrees(dx, dy));
+		case 3: case 4:	return Math.hypot(centre.x - defpoint.x, centre.y - defpoint.y);
+		case 6:	return dim.tflags & 64 ? def1.x : def1.y;
+	}
+	args.warn(`dxf_dim(): dimension '${name}' is of a type OpenSCAD does not measure`);
+	return undefined;
+}
+
+// What a drawing's entity amounts to as curves, each point carried through `mat` (the placement of the entity's own
+// space in the result's, so a block's entities compose the INSERT's into it). An arc or an ellipse is cubic pieces of
+// at most an eighth of a turn -- exact to a millionth of its size, and exact under any `mat`, a shear or an unequal
+// scale included. An entity OpenSCAD cannot draw is reported through `warn`, when there is one.
+function dxfRender(doc: dwg.DXF, e: dwg.Obj, curves: Curve[], mat: float2x3, warn?: (message: string) => void, depth = 0) {
+	const to2	= (p: {x: number, y: number}) => mat.mulPos(float2(p.x, p.y));
+	const vert	= (p: float2, flags: number) => curveVertex(p.x, p.y, flags);
+
+	// the ellipse centre + major cos(t) + minor sin(t), from t = from over `sweep` radians
+	const ellipse = (centre: float2, major: float2, minor: float2, from: number, sweep: number) => {
+		const at	= (t: number) => centre.add(major.scale(Math.cos(t))).add(minor.scale(Math.sin(t)));
+		const slope	= (t: number) => minor.scale(Math.cos(t)).sub(major.scale(Math.sin(t)));
+		const n		= Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 4) - 1e-9));
+		const step	= sweep / n, k = 4 / 3 * Math.tan(step / 4);
+		const curve: Curve = [vert(mat.mulPos(at(from)), ON_BEGIN)];
+		for (let i = 0; i < n; i++) {
+			const t0 = from + step * i, t1 = t0 + step;
+			curve.push(
+				vert(mat.mulPos(at(t0).add(slope(t0).scale(k))), OFF_BEZ3),
+				vert(mat.mulPos(at(t1).sub(slope(t1).scale(k))), OFF_BEZ3),
+				vert(mat.mulPos(at(t1)), ON_CURVE),
+			);
+		}
+		curves.push(curve);
+	};
+
+	if (e instanceof dwg.DRW_LINE) {
+		curves.push([vert(to2(e.point1), ON_BEGIN), vert(to2(e.point2), ON_CURVE)]);
+
+	} else if (e instanceof dwg.DRW_LWPOLYLINE) {
+		const verts = e.vertlist.map(to2);
+		if (e.closed && verts.length > 1)
+			verts.push(verts[0]);
+		curves.push(verts.map((p, i) => vert(p, i ? ON_CURVE : ON_BEGIN)));
+
+	} else if (e instanceof dwg.DRW_ARC) {
+		let end = e.angle1;
+		while (e.angle0 > end)
+			end += 2 * Math.PI;
+		const r = e.radius;
+		ellipse(float2(e.centre.x, e.centre.y), float2(r, 0), float2(0, r), e.angle0, end - e.angle0);
+
+	} else if (e instanceof dwg.DRW_CIRCLE) {
+		const r = e.radius;
+		ellipse(float2(e.centre.x, e.centre.y), float2(r, 0), float2(0, r), 0, 2 * Math.PI);
+
+	} else if (e instanceof dwg.DRW_ELLIPSE) {
+		let end = e.angle1;
+		while (e.angle0 > end)
+			end += 2 * Math.PI;
+		// point2 is the major axis from the centre, and ratio the minor's share of it
+		const major = float2(e.point2.x, e.point2.y);
+		ellipse(float2(e.point1.x, e.point1.y), major, float2(-major.y, major.x).scale(e.ratio), e.angle0, end - e.angle0);
+
+	} else if (e instanceof dwg.DRW_INSERT) {
+		const block = doc.blocks.get(e.block_name ?? '');
+		// a block drawn inside itself would never end; OpenSCAD cannot see one, as it reads blocks in file order
+		if (!block || depth > 32)
+			return;
+
+		const a		= e.angle, s = e.scale;
+		const inner = mat.mulAffine(float2x3(
+			float2(Math.cos(a) * s.x, Math.sin(a) * s.x),
+			float2(-Math.sin(a) * s.y, Math.cos(a) * s.y),
+			float2(e.base_point.x, e.base_point.y)
+		));
+		for (const b of block.entities)
+			dxfRender(doc, b, curves, inner, warn, depth + 1);
+
+	} else if (warn && !/^DRW_(DIM|TEXT|MTEXT|POINT)/.test(e.constructor.name)) {
+		warn(`import(): a ${e.constructor.name.replace(/^DRW_/, '')} in the drawing, which is not drawn`);
+	}
+}
+
+// dxf_cross(): where the first two single lines of the layer cross
+function dxfCross(args: argGetter): Value {
+	const doc	= loadDXF('dxf_cross', args);
+	if (!doc)
+		return undefined;
+
+	const pieces: Curve[] = [];
+
+	const origin	= args.vec2('origin') ?? float2(0, 0);
+	const scale		= args.num('scale') ?? 1;
+	const top		= float2x3(float2(scale, 0), float2(0, scale), origin.scale(-scale));
+	const layer		= args.str('layer');
+
+	for (const e of doc.entities.filter(e => !layer || (e instanceof dwg.Entity && e.layer === layer)))
+		dxfRender(doc, e, pieces, top);
+
+	// the lines that stand alone
+	const [a, b]	= joinCurves(pieces).filter(p => !p.closed && p.curve.length === 2).map(p => p.curve.map(v => float2(v.x, v.y)));
+	const dem		= b && (b[1].y - b[0].y) * (a[1].x - a[0].x) - (b[1].x - b[0].x) * (a[1].y - a[0].y);
+	if (!dem) {
+		args.warn('dxf_cross(): no two lines that cross');
+		return undefined;
+	}
+	const ua = ((b[1].x - b[0].x) * (a[0].y - b[0].y) - (b[1].y - b[0].y) * (a[0].x - b[0].x)) / dem;
+	return [a[0].x + ua * (a[1].x - a[0].x), a[0].y + ua * (a[1].y - a[0].y)];
+}
+
+//-----------------------------------------------------------------------------
 // a Minkowski operand, from the expression it is written as
 //-----------------------------------------------------------------------------
 
@@ -570,30 +793,31 @@ export function maxSingularValue(m: float3x3): number {
 // flat brush (scale([1,1,0]) sphere(r), the "flat disc on a cube" pattern below) is only ever valid *as* a
 // minkowski operand: built as an ordinary shape it is empty (see 'scale' above), so reading it off a built Sdf
 // instead of the AST would lose it. undefined when the operand is not a sphere.
-function supportOf(inst: Inst, env: Env, frame: Frame, ctx: Ctx, depth = 0, own: float3x4 = float3x4.identity()): (Support & {shift: float3}) | undefined {
+function supportOf(inst: Inst, env: Env, frame: Frame, depth = 0, own: float3x4 = float3x4.identity()): (Support & {shift: float3}) | undefined {
 	if (depth > 16)
 		return undefined;
 
+	const ctx	= env.ctx;
 	const name	= inst.modname ?? '';
 	const scope	= inst.scope;
 	const only	= () => scope.moduleInstantiations[0];
-	const values = argGetter(inst, env, ctx);
+	const values = argGetter(inst, env);
 
 	switch (name) {
 		case 'translate': {
 			const v = values.vec3('v', 0);
-			return v ? supportOf(only(), env, frame, ctx, depth + 1, own.mulAffine(float3.translate(v))) : undefined;
+			return v ? supportOf(only(), env, frame, depth + 1, own.mulAffine(float3.translate(v))) : undefined;
 		}
 		case 'rotate': {
 			const first = values.get('a', 0);
 			const m = typeof first === 'number'
 				? rotationAxis(num(first, ctx, 'rotate()') ?? 0, values.vec3('v', 1) ?? float3(0, 0, 1))
 				: rotation(vec3(first, ctx, 'rotate()') ?? float3(0, 0, 0));
-			return supportOf(only(), env, frame, ctx, depth + 1, own.mulAffine(m));
+			return supportOf(only(), env, frame, depth + 1, own.mulAffine(m));
 		}
 		case 'scale': {
 			const v = values.vec3('v', 0) ?? float3(1, 1, 1);
-			return supportOf(only(), env, frame, ctx, depth + 1, own.mulAffine(scaling(v)));
+			return supportOf(only(), env, frame, depth + 1, own.mulAffine(scaling(v)));
 		}
 		case 'sphere': {
 			const d = values.num('d', 2);
@@ -625,12 +849,12 @@ function supportOf(inst: Inst, env: Env, frame: Frame, ctx: Ctx, depth = 0, own:
 // support the way sibling minkowski operands -- separate terms of the *same* sum -- are; see the 'minkowski'
 // case). Still structural, like supportOf, and for the same reason: a for loop's own body is only ever entered
 // with the real per-iteration env, never built as a shape to inspect afterwards.
-function supportsOf(inst: Inst, env: Env, frame: Frame, ctx: Ctx): (Support & {shift: float3})[] | undefined {
+function supportsOf(inst: Inst, env: Env, frame: Frame): (Support & {shift: float3})[] | undefined {
 	const name = inst.modname ?? '';
 	if (name === 'union' || name === 'group') {
 		const out: (Support & {shift: float3})[] = [];
 		for (const child of inst.scope.moduleInstantiations) {
-			const v = supportsOf(child, env, frame, ctx);
+			const v = supportsOf(child, env, frame);
 			if (!v)
 				return undefined;
 			out.push(...v);
@@ -648,14 +872,14 @@ function supportsOf(inst: Inst, env: Env, frame: Frame, ctx: Ctx): (Support & {s
 				return;
 			if (i >= args.length) {
 				for (const child of inst.scope.moduleInstantiations) {
-					const v = supportsOf(child, inner, frame, ctx);
+					const v = supportsOf(child, inner, frame);
 					if (!v) { ok = false; return; }
 					out.push(...v);
 				}
 				return;
 			}
 			const loop = args[i];
-			const range = inner.evalExpr(loop.expr, ctx);
+			const range = inner.evalExpr(loop.expr);
 			for (const value of isList(range) ? range : [range]) {
 				const next = new Env(inner);
 				if (loop.name)
@@ -668,7 +892,7 @@ function supportsOf(inst: Inst, env: Env, frame: Frame, ctx: Ctx): (Support & {s
 		recurse(0, env);
 		return ok ? out : undefined;
 	}
-	const s = supportOf(inst, env, frame, ctx);
+	const s = supportOf(inst, env, frame);
 	return s ? [s] : undefined;
 }
 
@@ -760,7 +984,7 @@ const builtin_functions: Record<string, (args: argGetter) => Value> = {
 			definition:	{parameters: [{name: 'u'}, {name: 'v'}], expr: {type: 'call', callee: ident('texture'), arguments: [{name: '', expr: ident('u')}, {name: '', expr: ident('v')}]} as Expr},
 			resolver:	{get: () => undefined, findFunction: name => name === 'texture' ? tex : undefined},
 			call: (env, call) => {
-				const pos = positional(call).map(a => env.evalExpr(a.expr, args.ctx));
+				const pos = positional(call).map(a => env.evalExpr(a.expr));
 				const uv = pos.length === 1 && isList(pos[0]) ? pos[0] : pos;
 				const u = num(uv[0], args.ctx, 'the u of a texture'), v = num(uv[1], args.ctx, 'the v of a texture');
 				return u === undefined || v === undefined ? undefined : tex.at(u, v);
@@ -850,9 +1074,7 @@ const builtin_functions: Record<string, (args: argGetter) => Value> = {
 	exp:		(args) => numerical(args, Math.exp, 'exp'),
 	ln:			(args) => numerical(args, Math.log, 'log'),
 	log:		(args) => numerical(args, Math.log, 'log'),
-	// OpenSCAD's trig functions are all in degrees: the three forward ones take degrees in, the four inverse ones
-	// give degrees out -- Math's are all radians, so the conversion belongs here at the boundary, not left to
-	// whichever caller remembers it.
+
 	sin:		(args) => numerical(args, a => Math.sin(rad(a)), 'sin'),
 	cos:		(args) => numerical(args, a => Math.cos(rad(a)), 'cos'),
 	tan:		(args) => numerical(args, a => Math.tan(rad(a)), 'tan'),
@@ -878,7 +1100,7 @@ const builtin_functions: Record<string, (args: argGetter) => Value> = {
 // is one vector, not three). This pushes whatever `expr` contributes onto `out`, recursing for the constructs that
 // nest -- a `for` inside a `for`, an `if` inside a `for`'s body -- and falling back to a single evalExpr() for
 // anything else, which is what an ordinary item is.
-function pushComprehension(expr: Expr, env: Env, ctx: Ctx, out: Value[]): void {
+function pushComprehension(expr: Expr, env: Env, out: Value[]): void {
 	const LIMIT = 100000;
 	switch (expr.type) {
 		case 'lcfor': {
@@ -888,11 +1110,11 @@ function pushComprehension(expr: Expr, env: Env, ctx: Ctx, out: Value[]): void {
 				if (out.length >= LIMIT)
 					return;
 				if (i >= expr.args.length) {
-					pushComprehension(expr.expr, inner, ctx, out);
+					pushComprehension(expr.expr, inner, out);
 					return;
 				}
 				const loop = expr.args[i];
-				const range = inner.evalExpr(loop.expr, ctx);
+				const range = inner.evalExpr(loop.expr);
 				for (const value of isList(range) ? range : [range]) {
 					if (out.length >= LIMIT)
 						return;
@@ -911,26 +1133,26 @@ function pushComprehension(expr: Expr, env: Env, ctx: Ctx, out: Value[]): void {
 			const inner = new Env(env);
 			for (const a of expr.args)
 				if (a.name)
-					inner.values.set(a.name, inner.evalExpr(a.expr, ctx));
+					inner.values.set(a.name, inner.evalExpr(a.expr));
 			let n = 0;
-			while (truthy(inner.evalExpr(expr.cond, ctx)) && n++ < LIMIT && out.length < LIMIT) {
-				pushComprehension(expr.expr, inner, ctx, out);
+			while (truthy(inner.evalExpr(expr.cond)) && n++ < LIMIT && out.length < LIMIT) {
+				pushComprehension(expr.expr, inner, out);
 				for (const a of expr.incrargs)
 					if (a.name)
-						inner.values.set(a.name, inner.evalExpr(a.expr, ctx));
+						inner.values.set(a.name, inner.evalExpr(a.expr));
 			}
 			return;
 		}
 		case 'lcif':
-			if (truthy(env.evalExpr(expr.cond, ctx)))
-				pushComprehension(expr.ifexpr, env, ctx, out);
+			if (truthy(env.evalExpr(expr.cond)))
+				pushComprehension(expr.ifexpr, env, out);
 			else if (expr.elseexpr !== undefined)
-				pushComprehension(expr.elseexpr, env, ctx, out);
+				pushComprehension(expr.elseexpr, env, out);
 			return;
 		case 'lceach': {
 			// `each` splices a list in rather than nesting it one level deeper; a non-list value is just added, as
 			// OpenSCAD's own `each` does for one that turns out not to be a list
-			const v = env.evalExpr(expr.expr, ctx);
+			const v = env.evalExpr(expr.expr);
 			if (isList(v))
 				out.push(...v);
 			else if (v !== undefined)
@@ -941,8 +1163,8 @@ function pushComprehension(expr: Expr, env: Env, ctx: Ctx, out: Value[]): void {
 			const inner = new Env(env);
 			for (const a of expr.args)
 				if (a.name)
-					inner.values.set(a.name, env.evalExpr(a.expr, ctx));
-			pushComprehension(expr.expr, inner, ctx, out);
+					inner.values.set(a.name, env.evalExpr(a.expr));
+			pushComprehension(expr.expr, inner, out);
 			return;
 		}
 		case 'let': {
@@ -950,12 +1172,12 @@ function pushComprehension(expr: Expr, env: Env, ctx: Ctx, out: Value[]): void {
 			// and its `if`) as the ordinary let expression, so its body may be a for/if/each that has to be expanded
 			// here rather than handed to evalExpr() -- bound sequentially, as the expression form is
 			const inner = new Env(env);
-			bindArguments(expr.arguments, inner, ctx);
-			pushComprehension(expr.expr, inner, ctx, out);
+			bindArguments(expr.arguments, inner);
+			pushComprehension(expr.expr, inner, out);
 			return;
 		}
 		default:
-			out.push(env.evalExpr(expr, ctx));
+			out.push(env.evalExpr(expr));
 	}
 }
 
@@ -967,7 +1189,7 @@ function eq(l: Value, r: Value): boolean {
 }
 
 function le(l: Value, r: Value, warn: Warner): boolean|undefined {
-	const a = num(l, warn, `the left of ''`), b = num(r, warn, `the right of ''`);
+	const a = num(l, warn, `the left of '<='`), b = num(r, warn, `the right of '<='`);
 	return a === undefined || b === undefined ? undefined : a <= b;
 }
 
@@ -1036,10 +1258,10 @@ function binary(op: string, l: Value, r: Value, warn: Warner): Value {
 				const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0);
 				const out = lRows.map(lr => cols.map(c => dot(lr, c)));
 
-				if (!lIsMatrix && !rIsMatrix) return out[0][0];	// vector . vector: a scalar
-				if (!lIsMatrix) return out[0];						// vector * matrix: one row
-				if (!rIsMatrix) return out.map(orow => orow[0]);	// matrix * vector: one column, flattened
-				return out;											// matrix * matrix
+				return !lIsMatrix && !rIsMatrix ? out[0][0]	// vector . vector: a scalar
+					: !lIsMatrix ? out[0]					// vector * matrix: one row
+					: !rIsMatrix ? out.map(orow => orow[0])	// matrix * vector: one column, flattened
+					: out;									// matrix * matrix
 			}
 			// a number times a vector (either side) scales it componentwise; two lists is linear-algebra `*` -- a dot
 			// product, a matrix against a vector, or two matrices -- so `*` is the one operator whose vector form is
@@ -1084,9 +1306,7 @@ function binary(op: string, l: Value, r: Value, warn: Warner): Value {
 			return undefined;
 	}
 }
-// Whether a polygon's own vertex order traces a convex, simply-wound boundary -- every turn the same way, not just
-// "these points happen to be in convex position" (a hull would tell you that, but not whether the given order
-// traces it without folding back on itself). Undefined for fewer than three vertices or a degenerate polygon.
+
 function polygonConvexity(points: float2[]): {ccw: boolean} | undefined {
 	const n = points.length;
 	if (n < 3)
@@ -1105,6 +1325,7 @@ function polygonConvexity(points: float2[]): {ccw: boolean} | undefined {
 	}
 	return sign ? {ccw: sign > 0} : undefined;
 }
+
 // Whether every edge of a mitred result still points the same way as the edge it came from -- the check the caller
 // runs to catch a delta that shrinks a convex polygon past itself. A shrink that far can still (by coincidence, for
 // a symmetric shape) come back round to a result that is itself convex and correctly wound, so re-checking
@@ -1180,7 +1401,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		if (!rgba)
 			return body;
 
-		const ambient	= ambientMaterial(args.env, args.ctx);
+		const ambient	= ambientMaterial(args.env);
 
 		// an explicit argument wins over the `$` variable, which is what setting one for a scope and another for one object means
 		const property = (name: string) => args.num(name) ?? args.num(`$${name}`) ?? (ambient as any)[name === 'refractive_index' ? 'ior' : name];
@@ -1229,17 +1450,19 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		// an extra island). Omitting paths= means one loop, the points in the order given.
 		const points: float2[] = [];
 		const v = args.get('points', 0);
-		if (isList(v))
+		if (isList(v)) {
 			for (const p of v) {
 				const q = vec2(p, args);
 				if (!q)
 					break;
 				points.push(q);
 			}
+		}
 		if (points.length < 3) {
 			args.warn('a polygon() with fewer than three readable points, so nothing is drawn');
 			return empty;
 		}
+		
 		const pathsArg = args.get('paths', 1);
 		let paths: float2[][];
 		if (isList(pathsArg) && pathsArg.length > 0) {
@@ -1292,7 +1515,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 			if (glyphs.length === 0)
 				return empty;
 
-			const children: Sdf[] = glyphs.map(curve => ({k: 'curvepath2', paths: curve}));
+			const children = glyphs.map(curve => ({k: 'curvepath2', paths: curve} as const));
 			return place(frame, children.length === 1 ? children[0] : {k: 'union', children});
 		}
 		return empty;
@@ -1390,7 +1613,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 	// each iteration becomes its own operand here, the way it reads like it should but plain `for` never does
 	intersection_for: (args, frame) => {
 		const children: Sdf[] = [];
-		forEachIteration(args, inner => children.push(...evalScopeList(inner, args.scope, frame, args.ctx)));
+		forEachIteration(args, inner => children.push(...evalScopeList(inner, args.scope, frame)));
 		return combineIntersection(children);
 	},
 
@@ -1410,7 +1633,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		// checks them to (see below), and composing a transform in two baked steps instead of one, while
 		// mathematically the same field, is not bit-for-bit the same floating point, which is enough to
 		// miss that epsilon. Reused directly as the body when it needs no other frame than this one.
-		const probe = instantiate(new Env(args.env), insts[0], frame, args.ctx);
+		const probe = instantiate(new Env(args.env), insts[0], frame);
 
 		if (is2d(probe)) {
 			// A 2-D Minkowski sum's useful case is a sum with circles, which is exactly offset(r) -- what
@@ -1420,7 +1643,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 			// real-frame build would have been -- offset() has no equivalent of findPlaneBrush's precision
 			// sensitivity, so building insts[0] a second time this way, only when it is not the body, costs
 			// nothing but a little work.
-			const built			= insts.map(i => instantiate(new Env(args.env), i, identityFrame, args.ctx));
+			const built			= insts.map(i => instantiate(new Env(args.env), i, identityFrame));
 			const resolved		= built.map(b => circleSupportsOfSdf(b, frame));
 			const unresolved	= resolved.map((r, i) => r ? -1 : i).filter(i => i >= 0);
 			const bodyIndex		= unresolved.length === 1 ? unresolved[0] : 0;
@@ -1467,10 +1690,10 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 			return children.length === 1 ? children[0] : {k: 'union', children};
 		} else {
 			//3D
-			const resolved		= insts.map(i => supportsOf(i, args.env, frame, args.ctx));
+			const resolved		= insts.map(i => supportsOf(i, args.env, frame));
 			const unresolved	= resolved.map((r, i) => r ? -1 : i).filter(i => i >= 0);
 			const bodyIndex		= unresolved.length === 1 ? unresolved[0] : 0;
-			const body			= bodyIndex === 0 ? probe : instantiate(new Env(args.env), insts[bodyIndex], frame, args.ctx);
+			const body			= bodyIndex === 0 ? probe : instantiate(new Env(args.env), insts[bodyIndex], frame);
 
 			// `base` starts as "no growth operand seen yet", not a zero support, so that a single non-round
 			// operand (the flat-brush pattern above, most often) keeps its q exactly: addSupport() is only
@@ -1496,7 +1719,7 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 				if (!term) {
 					// not a sphere: grow by the bounding sphere of what it is, and say so. A 2-D operand is not
 					// a solid at all, and growing a solid by its flat bounding sphere is not what the file meant.
-					const built = i === 0 ? probe : instantiate(new Env(args.env), insts[i], frame, args.ctx);
+					const built = i === 0 ? probe : instantiate(new Env(args.env), insts[i], frame);
 					args.warn(is2d(built)
 						? 'a minkowski operand that is a 2-D shape, which is not a solid to grow by'
 						: 'a minkowski operand that is not a sphere, so it is grown by its bounding sphere');
@@ -1577,6 +1800,10 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 				if (hull)
 					return {k: 'dilate', body: {k: 'planes', planes: hull.planes, points: [...new Set(hull.faces.flat())], faces: hull.faces}, support: {r: round.r, q: null, bound: round.r}};
 			}
+			// Smooth cylinders that are alike and stand on one plane: a rounded polygon extruded (the corners of a rounded box)
+			const rods = hullOfCylinders(body);
+			if (rods)
+				return rods;
 			// A mix of sharp corners and spheres of any and varying radii -- a sailboat hull of boxes
 			// and a bow sphere is exactly this -- reduces to a list of weighted points (a sharp corner is r = 0)
 			// and builds an exact hull from them: offset faces, capsules/round cones along the edges, tried only
@@ -1599,15 +1826,15 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 			return empty;
 		}
 		if (args.positional.length === 0)
-			return evalScope(new Env(outer.env), outer.scope, frame, args.ctx);
+			return evalScope(new Env(outer.env), outer.scope, frame);
 		const index		= args.num('index', 0) ?? 0;
 		const chosen	= outer.scope.moduleInstantiations[index];
-		return chosen ? instantiate(new Env(outer.env), chosen, frame, args.ctx) : empty;
+		return chosen ? instantiate(new Env(outer.env), chosen, frame) : empty;
 	},
 
 	for: (args, frame) => {
 		const out: Sdf[] = [];
-		forEachIteration(args, inner => out.push(evalScope(inner, args.scope, frame, args.ctx)));
+		forEachIteration(args, inner => out.push(evalScope(inner, args.scope, frame)));
 		return out.length === 0 ? empty : out.length === 1 ? out[0] : {k: 'union', children: out};
 	},
 
@@ -1615,8 +1842,8 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		const inner = new Env(args.env);
 		for (const a of args.raw)
 			if (a.name)
-				inner.values.set(a.name, args.env.evalExpr(a.expr, args.ctx));
-		return evalScope(inner, args.scope, frame, args.ctx);
+				inner.values.set(a.name, args.env.evalExpr(a.expr));
+		return evalScope(inner, args.scope, frame);
 	},
 
 	echo: (args, frame) => {
@@ -1742,12 +1969,27 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 	},
 
 	polyhedron: (args, frame) => {
-		const points	= vectorOfPoints(args.get('points', 0), args);
-		const faces		= vectorOfFaces(args.get('faces', 1));
-		if (!points || !faces) {
+		const points0	= args.get('points', 0);
+		const faces0	= args.get('faces', 1);
+		if (!isList(points0) || !isList(faces0)) {
 			args.warn('polyhedron without readable points and faces');
 			return empty;
 		}
+
+		const points: float3[] = [];
+		for (const p of points0) {
+			const point = vec3(p, args, 'a polyhedron point');
+			if (!point)
+				break;
+			points.push(point);
+		}
+		const faces: number[][] = [];
+		for (const face of faces0) {
+			if (!isList(face))
+				break;
+			faces.push(face.map(x => (typeof x === 'number' ? Math.round(x) : NaN)));
+		}
+
 		return place(frame, solidOf(points, faces, args));
 	},
 
@@ -1853,11 +2095,12 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 		const slope = args.num('slope');
 		try {
 			let fn = compileField(f.definition, f.resolver, {kind: 'height', bound: slope});
-			// as for implicit_fn(): the slope here is no bound on the slope nearby, so use the steepest in the rectangle
+			// The slope here is no bound on the slope nearby, so look at it over the rectangle: how steep it is in each place, which
+			// a ray or a cube can divide the field by there, where one bound for the whole would be that of its steepest corner.
 			if (slope === undefined) {
-				const steepest = fn.steepest([xr.x, yr.x, 0], [xr.y, yr.y, 0], 96);
-				if (steepest !== undefined && steepest > 1)
-					fn = compileField(f.definition, f.resolver, {kind: 'height', bound: Math.sqrt(steepest * steepest - 1) * 1.25, size: Math.max(xr.y - xr.x, yr.y - yr.x) / 2});
+				const flat = fn;
+				const map = new SlopeMap(xr.x, xr.y, yr.x, yr.y, (x, y) => flat.lipschitz(x, y, 0), (x, y) => -flat.value(x, y, 0));
+				fn = compileField(f.definition, f.resolver, {kind: 'height', map});
 			}
 
 			// the heights over a lattice, which is where the surface can be found without being drawn
@@ -2192,6 +2435,8 @@ const builtin_modules: Record<string, (args: argGetter, frame: Frame) => Sdf> = 
 
 
 class Env {
+	ctx:		Ctx;
+	parent?:	Env;
 	values		= new Map<string, Value>();
 	// A scope's own assignments, registered up front by evalScope() but not yet evaluated: OpenSCAD's variables are
 	// not sequentially scoped the way a JS block's are, so a module instantiation earlier in the same scope than a
@@ -2203,20 +2448,27 @@ class Env {
 	modules		= new Map<string, UserModule>();
 	functions	= new Map<string, NonNullable<ReturnType<Scope['functions']['get']>>>();
 
-	constructor(public parent?: Env) {}
+	constructor(parent: Ctx | Env) {
+		if (parent instanceof Env) {
+			this.ctx = parent.ctx;
+			this.parent = parent;
+		} else {
+			this.ctx = parent;
+		}
+	}
 
 	// Deleting from `pending` before evaluating (rather than after) is what keeps a self-referential assignment
 	// (x = x + 1, or two names that refer to each other) from recursing forever: the inner lookup no longer finds
 	// the name pending -- it isn't resolved yet either -- so it falls out as an honest "used before it is assigned"
 	// rather than a stack overflow, the same outcome a genuinely-absent name gets.
-	private resolvePending(name: string, ctx: Ctx): Value {
+	private resolvePending(name: string): Value {
 		const expr = this.pending.get(name);
 		this.pending.delete(name);
-		const value = this.evalExpr(expr, ctx);
+		const value = this.evalExpr(expr);
 		this.values.set(name, value);
 		return value;
 	}
-	get(name: string, ctx: Ctx): Value {
+	get(name: string): Value {
 		for (let e: Env | undefined = this; e; e = e.parent) {
 			// `pending` (a scope's own assignment) is checked before `values` (what the frame started with) because
 			// a module body's assignment may share a name with one of the call's parameters and must win: MCAD's
@@ -2226,14 +2478,14 @@ class Env {
 			// ScopeContext::init() runs the body's assignments over them. resolvePending removes the pending entry
 			// before evaluating it, so the right-hand side still sees `values`.
 			if (e.pending.has(name))
-				return e.resolvePending(name, ctx);
+				return e.resolvePending(name);
 			if (e.values.has(name))
 				return e.values.get(name);
 		}
 		return undefined;
 	}
-	getT<T>(name: string, ctx: Ctx, convert: (v: Value, warn: Warner, what: string) => T | undefined) {
-		return convert(this.get(name, ctx), ctx, name);
+	getT<T>(name: string, convert: (v: Value, warn: Warner, what: string) => T | undefined) {
+		return convert(this.get(name), this.ctx, name);
 	}
 
 	has(name: string): boolean {
@@ -2252,20 +2504,20 @@ class Env {
 	// What a call by name means, as OpenSCAD's lookup_function finds it: the nearest scope that has one, and within a
 	// scope a `function name(...)` before a variable of that name holding a function literal. A variable that holds
 	// anything else is not callable and the search goes on outward.
-	findCallable(name: string, ctx: Ctx): FunctionDefinition | Closure | undefined {
+	findCallable(name: string): FunctionDefinition | Closure | undefined {
 		for (let e: Env | undefined = this; e; e = e.parent) {
 			const f = e.functions.get(name);
 			if (f)
 				return f;
 			if (e.values.has(name) || e.pending.has(name)) {
-				const v = e.get(name, ctx);
+				const v = e.get(name);
 				if (isClosure(v))
 					return v;
 			}
 		}
 	}
 
-	evalExpr(expr: Expr | undefined, ctx: Ctx): Value {
+	evalExpr(expr: Expr | undefined): Value {
 		if (expr === undefined || expr === null)
 			return undefined;
 
@@ -2276,14 +2528,14 @@ class Env {
 			case 'identifier': {
 				const name = expr.name;
 				if (!this.has(name) && !name.startsWith('$'))
-					ctx.warn(`'${name}' is used before it is assigned`);
-				return this.get(name, ctx);
+					this.ctx.warn(`'${name}' is used before it is assigned`);
+				return this.get(name);
 			}
 
 			case 'vector': {
 				const out: Value[] = [];
 				for (const x of expr.value)
-					pushComprehension(x, this, ctx, out);
+					pushComprehension(x, this, out);
 				return out;
 			}
 
@@ -2291,9 +2543,9 @@ class Env {
 				return {closure: true, 
 					definition:	expr,
 					resolver: {
-						get: (name: string) => this.get(name, ctx),
+						get: (name: string) => this.get(name),
 						findFunction: (name: string) => {
-							const f = this.findCallable(name, ctx);
+							const f = this.findCallable(name);
 							return f && isClosure(f) ? f.texture ?? f.definition : f;
 						}
 					},
@@ -2303,18 +2555,18 @@ class Env {
 						const pos = positional(args);
 						for (const p of expr.parameters) {
 							const named = args.find(a => a.name === p.name);
-							call.values.set(p.name, named ? env.evalExpr(named.expr, ctx)
-								: pi < pos.length ? env.evalExpr(pos[pi++].expr, ctx)
-								: p.expr ? call.evalExpr(p.expr, ctx) : undefined);
+							call.values.set(p.name, named ? env.evalExpr(named.expr)
+								: pi < pos.length ? env.evalExpr(pos[pi++].expr)
+								: p.expr ? call.evalExpr(p.expr) : undefined);
 						}
-						return call.evalExpr(expr.expr, ctx);
+						return call.evalExpr(expr.expr);
 					}
 				};
 
 			case 'range': {
-				const begin = num(this.evalExpr(expr.begin, ctx), ctx, 'a range bound') ?? 0;
-				const end	= num(this.evalExpr(expr.end, ctx), ctx, 'a range bound') ?? 0;
-				const step	= expr.step === undefined ? 1 : num(this.evalExpr(expr.step, ctx), ctx, 'a range step') ?? 1;
+				const begin = num(this.evalExpr(expr.begin), this.ctx, 'a range bound') ?? 0;
+				const end	= num(this.evalExpr(expr.end), this.ctx, 'a range bound') ?? 0;
+				const step	= expr.step === undefined ? 1 : num(this.evalExpr(expr.step), this.ctx, 'a range step') ?? 1;
 				const out: Value[] = [];
 				if (step === 0)
 					return out;
@@ -2327,90 +2579,77 @@ class Env {
 			}
 
 			case 'unary': {
-				const v = this.evalExpr(expr.operand, ctx);
+				const v = this.evalExpr(expr.operand);
 				if (expr.operator === '!')
 					return !truthy(v);
 				// a vector negates componentwise, recursing so a matrix does too
 				if (isList(v) && expr.operator !== '~')
-					return expr.operator === '-' ? binary('*', v, -1, ctx) : v;
-				const n = num(v, ctx, `the operand of '${expr.operator}'`);
+					return expr.operator === '-' ? binary('*', v, -1, this.ctx) : v;
+				const n = num(v, this.ctx, `the operand of '${expr.operator}'`);
 				if (n === undefined)
 					return undefined;
 				return expr.operator === '-' ? -n : expr.operator === '+' ? n : ~n;
 			}
 
 			case 'binary': {
-				const left = this.evalExpr(expr.left, ctx);
+				const left = this.evalExpr(expr.left);
 				if (expr.operator === '&&')
-					return truthy(left) && truthy(this.evalExpr(expr.right, ctx));
+					return truthy(left) && truthy(this.evalExpr(expr.right));
 				if (expr.operator === '||')
-					return truthy(left) || truthy(this.evalExpr(expr.right, ctx));
-				return binary(expr.operator, left, this.evalExpr(expr.right, ctx), ctx);
+					return truthy(left) || truthy(this.evalExpr(expr.right));
+				return binary(expr.operator, left, this.evalExpr(expr.right), this.ctx);
 			}
 
 			case 'conditional':
-				return truthy(this.evalExpr(expr.test, ctx)) ? this.evalExpr(expr.consequent, ctx) : this.evalExpr(expr.alternate, ctx);
+				return truthy(this.evalExpr(expr.test)) ? this.evalExpr(expr.consequent) : this.evalExpr(expr.alternate);
 
 			case 'let': {
 				const inner = new Env(this);
-				bindArguments(expr.arguments, inner, ctx);
-				return inner.evalExpr(expr.expr, ctx);
+				bindArguments(expr.arguments, inner);
+				return inner.evalExpr(expr.expr);
 			}
 
 			case 'echo': case 'assert': {
-				const values = (expr.arguments ?? []).map(x => this.evalExpr(x.expr, ctx));
+				const values = (expr.arguments ?? []).map(x => this.evalExpr(x.expr));
 				if (expr.type === 'echo')
 					console.log('ECHO:', values.map(show).join(' '));
-				return expr.expr === undefined ? undefined : this.evalExpr(expr.expr, ctx);
+				return expr.expr === undefined ? undefined : this.evalExpr(expr.expr);
 			}
 
 			case 'arraylookup': {
-				const array = this.evalExpr(expr.array, ctx), index = this.evalExpr(expr.index, ctx);
+				const array = this.evalExpr(expr.array), index = this.evalExpr(expr.index);
 				if (!isList(array))
 					return undefined;
-				const i = num(index, ctx, 'an index');
+				const i = num(index, this.ctx, 'an index');
 				return i === undefined ? undefined : array[i < 0 ? array.length + i : i];
 			}
 
 			case 'call': {
 				const name = expr.callee.type === 'identifier' ? expr.callee.name : undefined;
 				if (name !== undefined)
-					return this.callFunction(name, expr.arguments ?? [], ctx);
-				const callee = this.evalExpr(expr.callee, ctx);
+					return this.callFunction(name, expr.arguments ?? []);
+				const callee = this.evalExpr(expr.callee);
 				if (isClosure(callee))
 					return callee.call(this, expr.arguments ?? []);
-				ctx.warn('a call to something other than a named function');
+				this.ctx.warn('a call to something other than a named function');
 				return undefined;
 			}
 
 			case 'functioncall':
-				return this.callFunction(expr.name, expr.arguments ?? [], ctx);
+				return this.callFunction(expr.name, expr.arguments ?? []);
 
 			case 'memberlookup':
-				ctx.warn('a member lookup');
+				this.ctx.warn('a member lookup');
 				return undefined;
 
 			default:
-				ctx.warn(`'${(expr as {type: string}).type}' is not evaluated`);
+				this.ctx.warn(`'${(expr as {type: string}).type}' is not evaluated`);
 				return undefined;
 		}
 	}
-/*
-	private callClosure(c: Closure, args: Assignment[], ctx: Ctx): Value {
-		const call = new Env(c.env as Env);
-		let pi = 0;
-		const pos = positional(args);
-		for (const p of c.parameters) {
-			const named = args.find(a => a.name === p.name);
-			call.values.set(p.name, named ? this.evalExpr(named.expr, ctx)
-				: pi < pos.length ? this.evalExpr(pos[pi++].expr, ctx)
-				: p.expr ? call.evalExpr(p.expr, ctx) : undefined);
-		}
-		return call.evalExpr(c.expr, ctx);
-	}
-*/
-	private callFunction(name: string, args: Assignment[], ctx: Ctx): Value {
-		const found = this.findCallable(name, ctx);
+
+	private callFunction(name: string, args: Assignment[]): Value {
+		const found = this.findCallable(name);
 		if (found && isClosure(found))
 			return found.call(this, args);
 		const user = found;
@@ -2420,16 +2659,16 @@ class Env {
 			const pos = positional(args);
 			for (const p of user.parameters) {
 				const named = args.find(a => a.name === p.name);
-				call.values.set(p.name, named ? this.evalExpr(named.expr, ctx)
-					: pi < pos.length ? this.evalExpr(pos[pi++].expr, ctx)
-					: p.expr ? call.evalExpr(p.expr, ctx) : undefined);
+				call.values.set(p.name, named ? this.evalExpr(named.expr)
+					: pi < pos.length ? this.evalExpr(pos[pi++].expr)
+					: p.expr ? call.evalExpr(p.expr) : undefined);
 			}
-			return call.evalExpr(user.expr, ctx);
+			return call.evalExpr(user.expr);
 		}
 		const builtin = builtin_functions[name];
 		if (builtin)
-			return builtin(argGetter({args} as Inst, this, ctx));
-		ctx.warn(`the function '${name}'`);
+			return builtin(argGetter({args} as Inst, this));
+		this.ctx.warn(`the function '${name}'`);
 		return undefined;
 	}
 
@@ -2456,25 +2695,25 @@ class Env {
 // so a for loop or an if/else can hand its statements up to whatever contains *them* as separate siblings
 // (see instantiateList) instead of pre-combining into a union no matter what that container is -- the same
 // list this union-wraps when a scope is asked for as one shape on its own.
-function evalScopeList(env: Env, scope: Scope, frame: Frame, ctx: Ctx): Sdf[] {
+function evalScopeList(env: Env, scope: Scope, frame: Frame): Sdf[] {
 	const out: Sdf[] = [];
 	for (const inst of env.declare(scope)) {
 		// A scope that sets no `$` variable that colours adds no node at all. Each piece a for/if statement splices in
 		// gets the same wrap, since they all see the same ambient material.
-		const mat = ambientMaterial(env, ctx);
+		const mat = ambientMaterial(env);
 
 		// what this one statement amounts to -- almost always one shape, but a for loop's iterations or an
 		// if/else's taken branch are splices of several, so they are collected here and appended below
 		const pieces: Sdf[] = [];
 		if (inst instanceof IfElseModuleInstantiation) {
-			const taken = truthy(env.evalExpr(inst.expr, ctx)) ? inst.scope : inst.else_scope;
+			const taken = truthy(env.evalExpr(inst.expr)) ? inst.scope : inst.else_scope;
 			if (taken)
-				pieces.push(...evalScopeList(new Env(env), taken, frame, ctx));
+				pieces.push(...evalScopeList(new Env(env), taken, frame));
 		} else if (inst.modname === 'for') {
 			const innerscope = inst.scope;
-			forEachIteration(argGetter(inst, env, ctx), inner => pieces.push(...evalScopeList(inner, innerscope, frame, ctx)));
+			forEachIteration(argGetter(inst, env), inner => pieces.push(...evalScopeList(inner, innerscope, frame)));
 		} else {
-			pieces.push(instantiate(env, inst, frame, ctx));
+			pieces.push(instantiate(env, inst, frame));
 		}
 
 		for (const body of pieces)
@@ -2483,22 +2722,23 @@ function evalScopeList(env: Env, scope: Scope, frame: Frame, ctx: Ctx): Sdf[] {
 	return out;
 }
 
-function evalScope(env: Env, scope: Scope, frame: Frame, ctx: Ctx): Sdf {
-	const out = evalScopeList(env, scope, frame, ctx);
+function evalScope(env: Env, scope: Scope, frame: Frame): Sdf {
+	const out = evalScopeList(env, scope, frame);
 	return out.length === 0 ? empty : out.length === 1 ? out[0] : {k: 'union', children: out};
 }
 
 
-function instantiate(env: Env, inst: Inst, frame: Frame, ctx: Ctx): Sdf {
+function instantiate(env: Env, inst: Inst, frame: Frame): Sdf {
 	// if / else: only the branch taken is built, so a dead branch cannot fail on what it mentions
 	if (inst instanceof IfElseModuleInstantiation) {
-		const taken = truthy(env.evalExpr(inst.expr, ctx)) ? inst.scope : inst.else_scope;
-		return taken ? evalScope(new Env(env), taken, frame, ctx) : empty;
+		const taken = truthy(env.evalExpr(inst.expr)) ? inst.scope : inst.else_scope;
+		return taken ? evalScope(new Env(env), taken, frame) : empty;
 	}
 
+	const ctx	= env.ctx;
 	const name	= inst.modname ?? '';
 	const scope	= inst.scope;
-	const args	= argGetter(inst, env, ctx);
+	const args	= argGetter(inst, env);
 
 	// a module the file defines itself
 	const user = env.findModule(name);
@@ -2507,7 +2747,7 @@ function instantiate(env: Env, inst: Inst, frame: Frame, ctx: Ctx): Sdf {
 		const p		= args.positional;
 		let pi = 0;
 		for (const param of user.parameters)
-			call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr, ctx) : param.expr ? call.evalExpr(param.expr, ctx) : undefined));
+			call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr) : param.expr ? call.evalExpr(param.expr) : undefined));
 
 		// $children is the count children() sees for *this* call -- set directly on the call's own env, the
 		// same as a parameter, so it is visible throughout the body without going through the identifier lookup
@@ -2518,7 +2758,7 @@ function instantiate(env: Env, inst: Inst, frame: Frame, ctx: Ctx): Sdf {
 		call.values.set('$parent_modules', ctx.moduleStack.length);
 		ctx.children.push({scope, env: env});
 		ctx.moduleStack.push(name);
-		const body = evalScope(call, user.body, frame, ctx);
+		const body = evalScope(call, user.body, frame);
 		ctx.moduleStack.pop();
 		ctx.children.pop();
 		return body;
@@ -2533,260 +2773,20 @@ function instantiate(env: Env, inst: Inst, frame: Frame, ctx: Ctx): Sdf {
 }
 
 //-----------------------------------------------------------------------------
-// curves
-//-----------------------------------------------------------------------------
-// A run of curve vertices from a begin to an end, as the curve format has them (see curveVertex): the first vertex
-// begins it, the last is on the curve, and between are lines' on-curve points and cubics' two off-curve points.
-type Curve = curveVertex[];
-
-// Contours as a flat shape, kept as curves as a font's glyphs are -- a circle or an arc is exact up to a tolerance, not
-// segments. `curves` are cubics and lines (see Curve); the fill is even-odd, so an outline inside another is a hole.
-function curvePath(curves: Curve, center: boolean): Sdf {
-	const box	= float2.extent.from(curves.map(v => float2(v.x, v.y)));
-	let curve	= bezier2Curve(curves, 1e-4 * Math.max(box.max.x - box.min.x, box.max.y - box.min.y, 1e-3));
-	if (center) {
-		const mid = box.centre();
-		curve = curve.map(v => curveVertex(v.x - mid.x, v.y - mid.y, v.flags));
-	}
-	return {k: 'curvepath2', paths: curve};
-}
-
-// Curves joined at their ends into outlines, as DxfData joins them: ends are snapped to a grid (to an occupied
-// neighbouring cell if there is one, which is how nearly-meeting ends meet), open paths are walked from their loose
-// ends first, and whatever is left forms closed loops. A closed loop does not repeat its first point, as the format
-// closes a contour itself.
-function joinCurves(curves: Curve[], GRID = 0.0009765625): {curve: Curve, closed: boolean}[] {
-	const cells = new Map<string, number[]>();
-	const snap	= (p: {x: number, y: number}) => {
-		let ix = Math.round(p.x / GRID), iy = Math.round(p.y / GRID);
-		if (!cells.has(`${ix},${iy}`)) {
-			let best = 10;
-			for (let jx = ix - 1; jx <= ix + 1; jx++)
-				for (let jy = iy - 1; jy <= iy + 1; jy++)
-					if (cells.has(`${jx},${jy}`) && Math.abs(ix - jx) + Math.abs(iy - jy) < best) {
-						best = Math.abs(ix - jx) + Math.abs(iy - jy);
-						[ix, iy] = [jx, jy];
-					}
-		}
-		return {key: `${ix},${iy}`, at: float2(ix * GRID, iy * GRID)};
-	};
-
-	const lines = curves.filter(c => c.length >= 2).map((curve, i) => {
-		const ends = [snap(curve[0]), snap(curve[curve.length - 1])];
-		for (const e of ends)
-			cells.set(e.key, [...cells.get(e.key) ?? [], i]);
-		return {curve, ends};
-	});
-
-	const done = new Array<boolean>(lines.length).fill(false);
-	// the curve of `line`, from its end `from`, with both its ends where they snapped to
-	const oriented = (line: number, from: number) => {
-		const {curve, ends} = lines[line];
-		const out = curve.slice();
-		if (from !== 0)
-			out.reverse();
-		out[0]				= curveVertex(ends[from].at.x, ends[from].at.y, ON_BEGIN);
-		out[out.length - 1] = curveVertex(ends[1 - from].at.x, ends[1 - from].at.y, ON_CURVE);
-		return out;
-	};
-	const walk = (line: number, from: number, closed: boolean) => {
-		const out = oriented(line, from);
-		for (let l: number | undefined = line, f = from; ; ) {
-			const end: {key: string, at: float2} = lines[l].ends[1 - f];
-			done[l] = true;
-			const next: number | undefined = cells.get(end.key)!.find(k => !done[k]);
-			if (next === undefined)
-				break;
-			f = lines[next].ends[0].key === end.key ? 0 : 1;
-			out.push(...oriented(next, f).slice(1));
-			l = next;
-		}
-		if (closed)
-			out.pop();
-		return {curve: out, closed};
-	};
-
-	const paths: {curve: Curve, closed: boolean}[] = [];
-	// an open path starts at an end no other line shares, and which is not its own other end
-	for (let again = true; again; ) {
-		again = false;
-		for (let i = 0; i < lines.length && !again; i++)
-			for (let j = 0; j < 2 && !done[i] && !again; j++)
-				if (lines[i].ends[0].key !== lines[i].ends[1].key && cells.get(lines[i].ends[j].key)!.every(k => k === i || done[k])) {
-					paths.push(walk(i, j, false));
-					again = true;
-				}
-	}
-
-	lines.forEach((_, i) => {
-		if (!done[i])
-			paths.push(walk(i, 0, true));
-	});
-	return paths;
-}
-
-function loadDXF(module: string, args: argGetter) {
-	const written = args.str('file');
-	if (typeof written !== 'string') {
-		args.warn(`${module}() without a file name`);
-		return undefined;
-	}
-	return args.ctx.openFile(module, written, args.filename(), 'dxf', bytes => {
-		const model = meshes.DXF.read(bytes);
-		return model.extras.document as dwg.DXF;
-	});
-}
-
-// dxf_dim(): the measurement of the DIMENSION of that name (the first, without one), worked out from its points as
-// OpenSCAD's dxfdim.cc does
-function dxfDim(args: argGetter): Value {
-	const doc	= loadDXF('dxf_dim', args);
-	if (!doc)
-		return undefined;
-
-	const name	= args.str('name');
-	const layer = args.str('layer');
-
-	const dim = doc.entities.filter(e => e instanceof dwg.Dimension).find(e => (!layer || e.layer === layer) && (!name || name === (e.user_text ?? '')));
-	if (!dim) {
-		args.warn(`dxf_dim(): no dimension '${name}'`);
-		return undefined;
-	}
-
-	const origin	= args.vec2('origin') ?? float2(0, 0);
-	const scale		= args.num('scale') ?? 1;
-	const at		= (p?: dwg.Vec2) => p ? float2((p.x - origin.x) * scale, (p.y - origin.y) * scale) : float2(0, 0);
-
-	const lines		= dim instanceof dwg.DRW_DIMENSION_LINEAR || dim instanceof dwg.DRW_DIMENSION_ALIGNED || dim instanceof dwg.DRW_DIMENSION_ORDINATE;
-	const angular	= dim instanceof dwg.DRW_DIMENSION_ANG_LN2 || dim instanceof dwg.DRW_DIMENSION_ANG_PT3;
-	const defpoint	= at(lines || angular || dim instanceof dwg.DRW_DIMENSION_RADIUS || dim instanceof dwg.DRW_DIMENSION_DIAMETER ? dim.defpoint : undefined);
-	const def1		= at(lines || angular ? dim.def1 : undefined);
-	const def2		= at(lines || angular ? dim.def2 : undefined);
-	const centre	= at(angular ? dim.centrePoint : dim instanceof dwg.DRW_DIMENSION_RADIUS || dim instanceof dwg.DRW_DIMENSION_DIAMETER ? dim.circlePoint : undefined);
-	const angle		= deg(dim instanceof dwg.DRW_DIMENSION_LINEAR ? dim.angle : 0);
-
-	const dx = def2.x - def1.x, dy = def2.y - def1.y;
-	switch (dim.tflags & 7) {
-		case 0:	return Math.abs(dx * Math.cos(angle * Math.PI / 180) + dy * Math.sin(angle * Math.PI / 180));
-		case 1:	return Math.hypot(dx, dy);
-		// as dxfdim.cc has it, x before y
-		case 2:	return Math.abs(atan2Degrees(defpoint.x - centre.x, defpoint.y - centre.y) - atan2Degrees(dx, dy));
-		case 3: case 4:	return Math.hypot(centre.x - defpoint.x, centre.y - defpoint.y);
-		case 6:	return dim.tflags & 64 ? def1.x : def1.y;
-	}
-	args.warn(`dxf_dim(): dimension '${name}' is of a type OpenSCAD does not measure`);
-	return undefined;
-}
-
-// What a drawing's entity amounts to as curves, each point carried through `mat` (the placement of the entity's own
-// space in the result's, so a block's entities compose the INSERT's into it). An arc or an ellipse is cubic pieces of
-// at most an eighth of a turn -- exact to a millionth of its size, and exact under any `mat`, a shear or an unequal
-// scale included. An entity OpenSCAD cannot draw is reported through `warn`, when there is one.
-function dxfRender(doc: dwg.DXF, e: dwg.Obj, curves: Curve[], mat: float2x3, warn?: (message: string) => void, depth = 0) {
-	const to2	= (p: {x: number, y: number}) => mat.mulPos(float2(p.x, p.y));
-	const vert	= (p: float2, flags: number) => curveVertex(p.x, p.y, flags);
-
-	// the ellipse centre + major cos(t) + minor sin(t), from t = from over `sweep` radians
-	const ellipse = (centre: float2, major: float2, minor: float2, from: number, sweep: number) => {
-		const at	= (t: number) => centre.add(major.scale(Math.cos(t))).add(minor.scale(Math.sin(t)));
-		const slope	= (t: number) => minor.scale(Math.cos(t)).sub(major.scale(Math.sin(t)));
-		const n		= Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 4) - 1e-9));
-		const step	= sweep / n, k = 4 / 3 * Math.tan(step / 4);
-		const curve: Curve = [vert(mat.mulPos(at(from)), ON_BEGIN)];
-		for (let i = 0; i < n; i++) {
-			const t0 = from + step * i, t1 = t0 + step;
-			curve.push(
-				vert(mat.mulPos(at(t0).add(slope(t0).scale(k))), OFF_BEZ3),
-				vert(mat.mulPos(at(t1).sub(slope(t1).scale(k))), OFF_BEZ3),
-				vert(mat.mulPos(at(t1)), ON_CURVE),
-			);
-		}
-		curves.push(curve);
-	};
-
-	if (e instanceof dwg.DRW_LINE) {
-		curves.push([vert(to2(e.point1), ON_BEGIN), vert(to2(e.point2), ON_CURVE)]);
-
-	} else if (e instanceof dwg.DRW_LWPOLYLINE) {
-		const verts = e.vertlist.map(to2);
-		if (e.closed && verts.length > 1)
-			verts.push(verts[0]);
-		curves.push(verts.map((p, i) => vert(p, i ? ON_CURVE : ON_BEGIN)));
-
-	} else if (e instanceof dwg.DRW_ARC) {
-		let end = e.angle1;
-		while (e.angle0 > end)
-			end += 2 * Math.PI;
-		const r = e.radius;
-		ellipse(float2(e.centre.x, e.centre.y), float2(r, 0), float2(0, r), e.angle0, end - e.angle0);
-
-	} else if (e instanceof dwg.DRW_CIRCLE) {
-		const r = e.radius;
-		ellipse(float2(e.centre.x, e.centre.y), float2(r, 0), float2(0, r), 0, 2 * Math.PI);
-
-	} else if (e instanceof dwg.DRW_ELLIPSE) {
-		let end = e.angle1;
-		while (e.angle0 > end)
-			end += 2 * Math.PI;
-		// point2 is the major axis from the centre, and ratio the minor's share of it
-		const major = float2(e.point2.x, e.point2.y);
-		ellipse(float2(e.point1.x, e.point1.y), major, float2(-major.y, major.x).scale(e.ratio), e.angle0, end - e.angle0);
-
-	} else if (e instanceof dwg.DRW_INSERT) {
-		const block = doc.blocks.get(e.block_name ?? '');
-		// a block drawn inside itself would never end; OpenSCAD cannot see one, as it reads blocks in file order
-		if (!block || depth > 32)
-			return;
-
-		const a		= e.angle, s = e.scale;
-		const inner = mat.mulAffine(float2x3(
-			float2(Math.cos(a) * s.x, Math.sin(a) * s.x),
-			float2(-Math.sin(a) * s.y, Math.cos(a) * s.y),
-			float2(e.base_point.x, e.base_point.y)
-		));
-		for (const b of block.entities)
-			dxfRender(doc, b, curves, inner, warn, depth + 1);
-
-	} else if (warn && !/^DRW_(DIM|TEXT|MTEXT|POINT)/.test(e.constructor.name)) {
-		warn(`import(): a ${e.constructor.name.replace(/^DRW_/, '')} in the drawing, which is not drawn`);
-	}
-}
-
-// dxf_cross(): where the first two single lines of the layer cross
-function dxfCross(args: argGetter): Value {
-	const doc	= loadDXF('dxf_cross', args);
-	if (!doc)
-		return undefined;
-
-	const pieces: Curve[] = [];
-
-	const origin	= args.vec2('origin') ?? float2(0, 0);
-	const scale		= args.num('scale') ?? 1;
-	const top		= float2x3(float2(scale, 0), float2(0, scale), origin.scale(-scale));
-	const layer		= args.str('layer');
-
-	for (const e of doc.entities.filter(e => !layer || (e instanceof dwg.Entity && e.layer === layer)))
-		dxfRender(doc, e, pieces, top);
-
-	// the lines that stand alone
-	const [a, b]	= joinCurves(pieces).filter(p => !p.closed && p.curve.length === 2).map(p => p.curve.map(v => float2(v.x, v.y)));
-	const dem		= b && (b[1].y - b[0].y) * (a[1].x - a[0].x) - (b[1].x - b[0].x) * (a[1].y - a[0].y);
-	if (!dem) {
-		args.warn('dxf_cross(): no two lines that cross');
-		return undefined;
-	}
-	const ua = ((b[1].x - b[0].x) * (a[0].y - b[0].y) - (b[1].y - b[0].y) * (a[0].x - b[0].x)) / dem;
-	return [a[0].x + ua * (a[1].x - a[0].x), a[0].y + ua * (a[1].y - a[0].y)];
-}
-
-//-----------------------------------------------------------------------------
 // entry
 //-----------------------------------------------------------------------------
+
+export interface Camera {
+	vpt?: 		float3;
+	vpr?: 		float3;
+	vpd?: 		number;
+	vpf?: 		number;
+}
 
 export interface Evaluated {
 	sdf:		Sdf;
 	warnings:	string[];
-	camera: {vpt?: [number, number, number], vpr?: [number, number, number], vpd?: number, vpf?: number};
+	camera:		Camera;
 }
 
 // `use <file>` makes a library's modules and functions available without drawing its geometry or importing its
@@ -2795,7 +2795,7 @@ export interface Evaluated {
 // could not be found, the path as written, which `files.read` below then fails on and this reports as a warning).
 // A library's own `use`s are loaded too, each path read at most once; a name already bound -- by this file, or by
 // a library asked for earlier -- is left alone, so the first (most local) definition wins.
-function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: ScadFiles | undefined, env: Env, ctx: Ctx, seen: Set<string>) {
+function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: SyncFiles | undefined, env: Env, seen: Set<string>) {
 	if (!files)
 		return;
 	for (const path of file.usedlibs) {
@@ -2806,11 +2806,11 @@ function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: Scad
 		try {
 			text = files.read(path, 'text', bytes => new TextDecoder('utf-8').decode(bytes)) ?? '';
 		} catch {
-			ctx.warn(`a use<>d library that could not be read: ${path}`);
+			env.ctx.warn(`a use<>d library that could not be read: ${path}`);
 			continue;
 		}
 		const lib = parse(text, path, files);
-		loadUsedLibraries(lib, files, env, ctx, seen);
+		loadUsedLibraries(lib, files, env, seen);
 		for (const [name, mod] of lib.scope.modules)
 			if (!env.modules.has(name))
 				env.modules.set(name, mod);
@@ -2823,8 +2823,8 @@ function loadUsedLibraries(file: {path: string, usedlibs: string[]}, files: Scad
 // The defaults OpenSCAD itself starts these at, kept on a synthetic parent of the real root env: a nested read
 // that never finds its own assignment falls through to these exactly as it would any other outer scope's, while
 // `env`'s own `values` (checked directly, not through this parent) stays clean for topLevel() to test.
-function rootDefaults(values: Record<string, Value>): Env {
-	const defaults = new Env();
+function rootDefaults(ctx: Ctx, values: Record<string, Value>): Env {
+	const defaults = new Env(ctx);
 	defaults.values = new Map(Object.entries({
 		'PI':		Math.PI,
 		'$fn':		0,
@@ -2843,30 +2843,31 @@ function rootDefaults(values: Record<string, Value>): Env {
 // `preview` is false only for a final export (see exportStl()): OpenSCAD's own $preview, which a file may use to
 // skip a preview-only simplification, since here that step -- unlike a re-evaluation on a moved camera -- is one
 // this viewer already always pays for.
-export function evaluate(file: SourceFile, filename: string, files: ScadFiles, values: Record<string, Value>) {
-	const env		= new Env(rootDefaults(values));
-	const ctx		= new Ctx(files, filename);
-	loadUsedLibraries(file, files, env, ctx, new Set([filename]));
 
-	const sdf		= new SDF(evalScope(env, file.scope, identityFrame, ctx));
+export function evaluate(file: SourceFile, filename: string, files: SyncFiles, values: Record<string, Value>) {
+	const ctx		= new Ctx(files, filename);
+	const env		= new Env(rootDefaults(ctx, values));
+	loadUsedLibraries(file, files, env, new Set([filename]));
+
+	const sdf		= new SDF(evalScope(env, file.scope, identityFrame));
 	let box		= sdf.bounds();
 	if (!box && values.$entry) {
 		const inst = new Inst(values.$entry as string);
-		sdf.root = instantiate(env, inst, identityFrame, ctx,)
+		sdf.root = instantiate(env, inst, identityFrame,)
 		box		= sdf.bounds();
 	}
 
 	const size		= box ? box.size().len() : 0;
 	const center	= box ? box.centre() : float3(0, 0, 0);
-	const vpf		= env.getT('$vpf', ctx, num) ?? 22.5;
+	const vpf		= env.getT('$vpf', num) ?? 22.5;
 
-	const camera = {
-		vpt: env.getT('$vpt', ctx, maybe(vec3)) ?? center,
-		vpr: env.getT('$vpr', ctx, maybe(vec3)) ?? float3(0, 0, 0),
-		vpd: env.getT('$vpd', ctx, num) ?? size / Math.sin(rad(vpf)) * 1.1,
+	const camera: Camera = {
+		vpt: env.getT('$vpt', maybe(vec3)) ?? center,
+		vpr: env.getT('$vpr', maybe(vec3)) ?? float3(0, 0, 0),
+		vpd: env.getT('$vpd', num) ?? size / Math.sin(rad(vpf)) * 1.1,
 		vpf,
 	};
-	return {sdf, box, warnings: ctx.list, camera};
+	return {sdf, box, warnings: ctx.warnings, camera};
 }
 
 //-----------------------------------------------------------------------------
@@ -2923,31 +2924,32 @@ function csgValue(v: Value): string {
 		: 'undef';
 }
 
-function csgScope(scope: Scope, env: Env, ctx: Ctx, out: string[], depth: number) {
+function csgScope(scope: Scope, env: Env, out: string[], depth: number) {
 	for (const inst of env.declare(scope))
-		csgInstance(inst, env, ctx, out, depth);
+		csgInstance(inst, env, out, depth);
 }
 
-function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: number) {
+function csgInstance(inst: Inst, env: Env, out: string[], depth: number) {
 	const pad		= '\t'.repeat(depth);
 	const block		= (head: string, body: (depth: number) => void) => {
 		out.push(`${pad}${head} {`);
 		body(depth + 1);
 		out.push(`${pad}}`);
 	};
-	const inner		= (scope: Scope, e: Env, d: number) => csgScope(scope, new Env(e), ctx, out, d);
+	const inner		= (scope: Scope, e: Env, d: number) => csgScope(scope, new Env(e), out, d);
 
 	if (inst instanceof IfElseModuleInstantiation) {
-		const taken = truthy(env.evalExpr(inst.expr, ctx)) ? inst.scope : inst.else_scope;
+		const taken = truthy(env.evalExpr(inst.expr)) ? inst.scope : inst.else_scope;
 		if (taken)
-			csgScope(taken, new Env(env), ctx, out, depth);
+			csgScope(taken, new Env(env), out, depth);
 		return;
 	}
 
+	const ctx		= env.ctx;
 	const name		= inst.modname ?? '';
 	const scope		= inst.scope;
 	const rawargs	= inst.args ?? [];
-	const args		= argGetter(inst, env, ctx);
+	const args		= argGetter(inst, env);
 
 	// a module the file defines itself: a group of what its body builds
 	const user = env.findModule(name);
@@ -2956,12 +2958,12 @@ function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: numbe
 		const p		= args.positional;
 		let pi = 0;
 		for (const param of user.parameters)
-			call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr, ctx) : param.expr ? call.evalExpr(param.expr, ctx) : undefined));
+			call.values.set(param.name, args.get(param.name) ?? (pi < p.length ? env.evalExpr(p[pi++].expr) : param.expr ? call.evalExpr(param.expr) : undefined));
 		call.values.set('$children', scope.moduleInstantiations.length);
 		call.values.set('$parent_modules', ctx.moduleStack.length);
 		ctx.children.push({scope, env});
 		ctx.moduleStack.push(name);
-		block('group()', d => csgScope(user.body, call, ctx, out, d));
+		block('group()', d => csgScope(user.body, call, out, d));
 		ctx.moduleStack.pop();
 		ctx.children.pop();
 		return;
@@ -2969,19 +2971,19 @@ function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: numbe
 
 	switch (name) {
 		case 'for':
-			block('group()', d => forEachIteration(args, it => csgScope(scope, it, ctx, out, d)));
+			block('group()', d => forEachIteration(args, it => csgScope(scope, it, out, d)));
 			return;
 
 		case 'intersection_for':
-			block('intersection()', d => forEachIteration(args, it => block('group()', d2 => csgScope(scope, it, ctx, out, d2))));
+			block('intersection()', d => forEachIteration(args, it => block('group()', d2 => csgScope(scope, it, out, d2))));
 			return;
 
 		case 'let': {
 			const e = new Env(env);
 			for (const a of rawargs)
 				if (a.name)
-					e.values.set(a.name, env.evalExpr(a.expr, ctx));
-			csgScope(scope, e, ctx, out, depth);
+					e.values.set(a.name, env.evalExpr(a.expr));
+			csgScope(scope, e, out, depth);
 			return;
 		}
 
@@ -2994,18 +2996,18 @@ function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: numbe
 			// the children were written where the module was called, so their own children() belong to that call's
 			ctx.children.pop();
 			if (args.positional.length === 0 && !named(rawargs, 'index'))
-				csgScope(outer.scope, new Env(outer.env), ctx, out, depth);
+				csgScope(outer.scope, new Env(outer.env), out, depth);
 			else {
 				const chosen = outer.scope.moduleInstantiations[args.num('index', 0) ?? 0];
 				if (chosen)
-					csgInstance(chosen, new Env(outer.env), ctx, out, depth);
+					csgInstance(chosen, new Env(outer.env), out, depth);
 			}
 			ctx.children.push(outer);
 			return;
 		}
 
 		case 'echo': case 'assert':
-			console.log(name.toUpperCase() + ':', args.positional.map(a => env.evalExpr(a.expr, ctx)).map(show).join(' '));
+			console.log(name.toUpperCase() + ':', args.positional.map(a => env.evalExpr(a.expr)).map(show).join(' '));
 			inner(scope, env, depth);
 			return;
 	}
@@ -3073,12 +3075,12 @@ function csgInstance(inst: Inst, env: Env, ctx: Ctx, out: string[], depth: numbe
 }
 
 // The tree evaluate() would build, as .csg text: OpenSCAD's own export of the same file.
-export function evaluateCsg(code: string, filename: string, files: ScadFiles) {
+export function evaluateCsg(code: string, filename: string, files: SyncFiles) {
 	const file	= parse(code, filename, files);
-	const env	= new Env(rootDefaults({$preview: false}));
 	const ctx	= new Ctx(files, filename);
-	loadUsedLibraries(file, files, env, ctx, new Set([filename]));
+	const env	= new Env(rootDefaults(ctx, {$preview: false}));
+	loadUsedLibraries(file, files, env, new Set([filename]));
 	const out: string[] = [];
-	csgScope(file.scope, env, ctx, out, 0);
-	return {csg: out.join('\n') + '\n', warnings: ctx.list};
+	csgScope(file.scope, env, out, 0);
+	return {csg: out.join('\n') + '\n', warnings: ctx.warnings};
 }

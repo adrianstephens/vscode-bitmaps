@@ -1637,6 +1637,14 @@ function restrict(s: Sdf, c: float3, r: number): Restricted {
 			const inner = restrict(s.body, c, r);
 			return new Restricted(inner.root === s.body ? s : {...s, body: inner.root}, inner.lo, inner.hi);
 		}
+		case 'fnfield': {
+			// the box is a distance, the field's estimate changes by what it says it can over the ball (see FieldFn.reach)
+			const q = s.box.centre(), h = s.box.size().scale(0.5);
+			const qx = Math.abs(c.x - q.x) - h.x, qy = Math.abs(c.y - q.y) - h.y, qz = Math.abs(c.z - q.z) - h.z;
+			const b = Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0);
+			const d = s.fn.distance(c.x, c.y, c.z), reach = s.fn.reach(c.x, c.y, c.z, r) * r;
+			return new Restricted(s, Math.max(b - r, d - reach), Math.max(b + r, d + reach));
+		}
 		case 'dilate': {
 			const pieces = brushPiecesOf(s);
 			if (pieces)
@@ -2416,6 +2424,75 @@ export function sameRadiusSpheres(body: Sdf): {centres: float3[], r: number} | u
 	if (found.some(f => Math.abs(f.r - r) > 1e-9 * Math.max(1, Math.abs(r))))
 		return undefined;
 	return {centres: found.map(f => f.centre), r};
+}
+
+// A smooth cylinder as it stands in the world: where its bottom is, which way it points, how long and how wide.
+interface Rod {
+	base:	float3;
+	axis:	float3;		// a unit vector
+	h:		number;
+	r:		number;
+}
+function rodList(s: Sdf, out: Rod[]): boolean {
+	switch (s.k) {
+		case 'material':
+			return rodList(s.body, out);
+		case 'union':
+			return s.children.every(c => rodList(c, out));
+		case 'cylinder':
+			out.push({base: float3(0, 0, s.center ? -s.h / 2 : 0), axis: float3(0, 0, 1), h: s.h, r: s.r});
+			return true;
+		case 'domain': {
+			if (!isConformal(s.m))
+				return false;
+			const inner: Rod[] = [];
+			if (!rodList(s.body, inner))
+				return false;
+			for (const {base, axis, h, r} of inner) {
+				const bottom = s.m.mulPos(base), along = safeNormalise(s.m.mulPos(base.add(axis)).sub(bottom));
+				if (!along)
+					return false;
+				out.push({base: bottom, axis: along, h: h * s.scale, r: r * s.scale});
+			}
+			return true;
+		}
+		default:
+			return false;
+	}
+}
+
+// The hull of smooth cylinders that are alike -- the same radius and length, pointing the same way, standing on one plane (the four
+// corners of a rounded box) -- is the hull of their axes' feet grown by the radius, carried along the axis: a rounded polygon extruded,
+// exact, and not a union of what it was to cover. Undefined for any other cylinders, whose hull is not that.
+export function hullOfCylinders(body: Sdf): Sdf | undefined {
+	const rods: Rod[] = [];
+	if (!rodList(body, rods) || rods.length === 0)
+		return undefined;
+	const first = rods[0], tol = 1e-7 * Math.max(1, first.h, first.r);
+	if (!rods.every(c => Math.abs(c.r - first.r) <= tol && Math.abs(c.h - first.h) <= tol && c.axis.dot(first.axis) > 1 - 1e-9 && Math.abs(c.base.sub(first.base).dot(first.axis)) <= tol))
+		return undefined;
+	if (rods.length === 1)
+		return body;
+
+	// where the feet are, in the plane they stand on
+	const [a, b] = perpendicular(first.axis);
+	const feet = rods.map(c => float2(c.base.sub(first.base).dot(a), c.base.sub(first.base).dot(b)));
+	const hull = convexHull2(feet);
+	let shape: Sdf;
+	if (hull) {
+		shape = {k: 'offset', r: first.r, body: {k: 'polygon2', paths: [hull]}};
+	} else {
+		// all in a line (or all in one place): the two furthest apart are its ends
+		let [p, q] = [feet[0], feet[0]], far = 0;
+		for (const u of feet)
+			for (const v of feet)
+				if (u.sub(v).len() > far) {
+					far = u.sub(v).len();
+					[p, q] = [u, v];
+				}
+		shape = far > tol ? {k: 'stadium2', a: p, b: q, r: first.r} : {k: 'circle2', r: first.r, n: 0};
+	}
+	return {k: 'domain', m: float3x4(a, b, first.axis, first.base), scale: 1, body: {k: 'extrude', h: first.h, center: false, body: shape}};
 }
 
 // The 2-D form of sameRadiusSpheres: every leaf a smooth circle, all the same radius.
@@ -3897,8 +3974,9 @@ function emit(e: Emit, out: string[], v: string, s: Sdf, p: string, indent: stri
 				// the point is always asked.
 				const box = boxDistOf(c, p);
 				if (box) {
-					line(`float ${v}_b${i} = ${box};`);
-					line(`if (${v}_b${i} <= 0.0 || ${v}_b${i} < -${v}.x) {`);
+					// (not ${v}_b${i}: a union that was emitted as the base into the same variable has its terms' boxes by that name)
+					line(`float ${v}_cut${i} = ${box};`);
+					line(`if (${v}_cut${i} <= 0.0 || ${v}_cut${i} < -${v}.x) {`);
 				} else {
 					line(`{`);
 				}

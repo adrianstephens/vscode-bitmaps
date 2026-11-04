@@ -1,31 +1,33 @@
 // What the bitmap viewer's modes share: the page's canvas and the programs it draws with, the tools, the current mode,
 // and the modes the others are made from (Mode, PanMode, PictureMode)
 import { Tooltip, vscode, RPC } from '@isopodlabs/vscode_utils/webview/shared.js';
-import { Canvas3D, ShaderProgram, rectGeometry, bitmapToImage, Pixels, RGBAPixels, RGBA, asRGBA, imageSize, imageRect, getPixel } from './opengl.js';
+import { RGBA, asRGBA } from './colour.js';
+import { Canvas3D, ShaderProgram, rectGeometry, bitmapToImage, Pixels, imageSize, imageRect, getPixel, PixelStorage, resizePixels, Offscreen } from './opengl.js';
 import { float2, float3, float2x3, float3x3, float4x4 } from '@isopodlabs/maths/vector';
 import { Selection } from './bitmapSelection.js';
-import { Painter, PaintHost, type ShadePreview, type CloneSource } from './paint.js';
-import { Transformer, DocumentChange, TransformTarget, TransformSession } from './transform.js';
+import { Painter, PaintHost, type CloneSource } from './paint.js';
+import { Transformer, TransformSession } from './transform.js';
 import { History, type HistoryEntry } from './history.js';
 import { SheetFan } from './sheetfan.js';
 import { Cascade, CascadeItem, mergeItems, valueItem, toggleItem, svgFace, icons } from './cascade.js';
 import { warp, meshWarp, shade, ShadePass, drawQuad, alphaExtent, liftSelection, warpSelected } from './raster.js';
-import { Warp, type Carry, carriedBounds, planar } from './transformbox.js';
+import { Warp, type Carry, carriedBounds, planar, shiftCarry, transformIcons } from './transformbox.js';
 import { Pan } from './pan.js';
 import { NavigateHooks, Input, Place } from './navigate.js';
 import type { RawImage, MessageOut, shaderType } from './bitmap.js';
 
 export interface Dropped { name: string, pixels: ImageData }
 
+// what a transform is of: the current layer (or the picture, within its canvas, if it has none), or the whole document
 export const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
-export const canvas: HTMLCanvasElement	= $('viewport');
+const canvas: HTMLCanvasElement	= $('viewport');
 export const canvas3d	= new Canvas3D(canvas, {onError: message => postMessage({command: 'error', message})});
 export const tooltip 	= new Tooltip();
 
 export let programBG:		ShaderProgram;
 export let programLayer:	ShaderProgram;	// what layers (and slices) are drawn with, in the fan and as one is transformed
-const filterPrograms: Record<string, ShaderProgram> = {};	// the other filters' shaders, by name (see Mode.shade)
+export const filterPrograms: Record<string, ShaderProgram> = {};	// the other filters' shaders, by name (see Mode.shade)
 let programWarp:	ShaderProgram;	// what carries pictures onto another plane, for a transform and for the menu's thumbnails
 export let programTextWarp:	ShaderProgram;	// what carries a picture by a mesh: the flat text to where its warp puts it, and a warp transform
 export let blank:			WebGLTexture;	// transparent, to bind where nothing is wanted
@@ -43,7 +45,7 @@ export function shader(type: shaderType, geometry = rectGeometry) {
 export async function loadPrograms() {
 	programBG		= await shader('bg');
 	programWarp		= await shader('warp');
-	for (const name of ['blur', 'levels', 'convolve', 'gradient'] as const)
+	for (const name of ['blur', 'levels', 'convolve', 'gradient', 'flatten', 'ink'] as const)
 		filterPrograms[name] = await shader(name);
 	programLayer	= await shader('layer', gridGeometry(32));
 	programLayer.use({u_span: [0, 0, 1, 1]});	// (all of each layer, unless a warp says otherwise)
@@ -62,6 +64,53 @@ function gridGeometry(n: number) {
 
 export function postMessage(message: MessageOut) {
 	vscode.postMessage(message);
+}
+
+//-----------------------------------------------------------------------------
+// work that takes a while
+//-----------------------------------------------------------------------------
+
+// What is being worked on, latest last, which is the one shown: a spinner, what it is, and how far it has got where that is known (0..1).
+// It fades in only once the work has gone on for a moment, so that what is quick does not flash it; and its spinner turns without the
+// page, so it shows the page is busy even while the work keeps the page from doing anything else.
+const jobs: {label: string, fraction?: number}[] = [];
+let busyBox: HTMLElement | undefined;
+
+function showWork() {
+	busyBox ??= Object.assign(document.createElement('div'), {id: 'busy', innerHTML:
+		'<svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg><span class="busy-label"></span><span class="busy-bar"><span></span></span>'});
+	if (!busyBox.isConnected)
+		canvas.parentElement!.append(busyBox);
+	const job = jobs[jobs.length - 1];
+	busyBox.classList.toggle('on', !!job);
+	if (job) {
+		const known = job.fraction !== undefined;
+		busyBox.querySelector('.busy-label')!.textContent = known ? `${job.label} ${Math.round(job.fraction! * 100)}%` : job.label;
+		busyBox.classList.toggle('known', known);
+		(busyBox.querySelector('.busy-bar span') as HTMLElement).style.width = `${(job.fraction ?? 0) * 100}%`;
+	}
+}
+
+// the next frame, so that what has been changed is shown (or a moment, where the page is hidden and has no frames)
+export const nextFrame = () => new Promise<void>(resolve => { requestAnimationFrame(() => resolve()); setTimeout(resolve, 100); });
+
+/** Work shown over the picture while it goes on, as `label`. The work is told `progress(fraction)` as it gets on, where it knows how far
+ *  it has got; waiting on that gives the page a frame to show it, which work that keeps the page busy needs between its parts. */
+export async function working<T>(label: string, work: (progress: (fraction: number) => Promise<void>) => T | Promise<T>): Promise<T> {
+	const job: {label: string, fraction?: number} = {label};
+	jobs.push(job);
+	showWork();
+	await nextFrame();
+	try {
+		return await work(fraction => {
+			job.fraction = Math.min(1, Math.max(0, fraction));
+			showWork();
+			return nextFrame();
+		});
+	} finally {
+		jobs.splice(jobs.indexOf(job), 1);
+		showWork();
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -123,81 +172,84 @@ export function viewToggle(mode: Mode, fan: SheetFan): CascadeItem {
 // modes
 //-----------------------------------------------------------------------------
 
+export interface CoordinateInterface {
+	toScreen(p: float2):						float2;				// a point of the image, in canvas pixels
+	pixelSize():								number;				// how long a canvas pixel is, in the image's pixels
+	toImage(x: number, y: number):				float2;				// image coordinates, not whole pixels
+}
+
 // What the picture is: a plain image, a picture of layers, an array of slices, a cubemap or a volume. A mode is what is done
 // differently for each: how it is drawn, moved about in, edited, and kept in a file. One is made for each picture which is loaded,
 // holds everything of it (its pixels, its textures, its view), and is given back (`dispose`) when another is made current (`mode`,
 // by `enter`).
 export abstract class Mode implements PaintHost {
 
-// the tools and the transforms can be used, or cannot (the picture is in 3D, or there is nothing to edit)
-static toolsEnabled(on: boolean) {
-	painter.enabled(on);
-	transformer.enabled(on);
-}
-// another mode is the current one
-static enter(next: Mode) {
-	tooltip.hide();
-	mode.dispose();
-	mode = next;
-	painter.host = transformer.host = next;
-	Mode.toolsEnabled(true);	// (and one that cannot be drawn on)
-	next.activate();
-}
-// A new picture, in a mode made for it: what was done to the last one (and is being done) is dropped
-static enterPicture(next: Mode) {
-	history.clear();
-	transformer.end(false);
-	painter.reset();
-	Mode.enter(next);
-}
-
-// the fan has come up, or gone away: the tools cannot be used in 3D, and what is drawn over the picture is not part of it
-static fanOpened(open: boolean) {
-	Mode.toolsEnabled(!open);
-	if (open)
-		tooltip.hide();
-	else
-		drawOverlays();
-}
-static fanTip(text: string | undefined, x: number, y: number) { text === undefined ? tooltip.hide() : tooltip.show(text, x + 12, y + 12); }
-
-
-	readonly canvas = canvas;
-	readonly canvas3d = canvas3d;
-	shade(program: string, image: Pixels, area: float2.extent, passes: ShadePass[] | Record<string, any>, reach = 0) { return shade(canvas3d, filterPrograms[program], image, area, passes, reach); }
-
-	// An image shown as a filter's shader draws it from its pixels, by drawing into the texture it is shown from (which its own pixels
-	// are put back into at the end)
-	previewShade(image: RGBAPixels, program: string, extra: Pixels[] = []): ShadePreview | undefined {
-		const shown = this.shownBy(image), shader = filterPrograms[program];
-		const target = shown && shader && canvas3d.offscreenOn(shown.texture, image.width, image.height, shown.layer);
-		if (!target)
-			return undefined;
-		const textures = [image, ...extra].map(p => canvas3d.createTextureFromImage(p, {format: p.channels === 1 ? 'r8' : 'rgba8', min: 'nearest', mag: 'nearest'}));
-		return {
-			show: uniforms => {
-				const gl = canvas3d.gl, blend = gl.isEnabled(gl.BLEND);
-				gl.disable(gl.BLEND);
-				target.begin();
-				textures.forEach((t, i) => canvas3d.bindTexture2D(t, i));
-				shader.draw({u_image: 0, ...uniforms});
-				textures.forEach((_, i) => canvas3d.bindTexture2D(null, i));
-				target.end();
-				if (blend)
-					gl.enable(gl.BLEND);
-				canvas3d.initViewport();
-				shown.drawn();
-			},
-			end: () => {
-				target.delete(true);
-				for (const t of textures)
-					canvas3d.deleteTexture(t);
-				this.changed(image);
-			},
-		};
+	// the tools and the transforms can be used, or cannot (the picture is in 3D, or there is nothing to edit)
+	static toolsEnabled(on: boolean) {
+		painter.enabled(on);
+		mode.toolsChanged(on);
 	}
+	// another mode is the current one
+	static enter(next: Mode) {
+		tooltip.hide();
+		mode.dispose();
+		mode = next;
+		painter.host = next;
+		Mode.toolsEnabled(true);	// (and one that cannot be drawn on)
+		next.activate();
+	}
+	// A new picture, in a mode made for it: what was done to the last one (and is being done) is dropped
+	static enterPicture(next: Mode) {
+		history.clear();
+		painter.reset();
+		Mode.enter(next);
+	}
+
+	// the fan has come up, or gone away: the tools cannot be used in 3D, and what is drawn over the picture is not part of it
+	static fanOpened(open: boolean) {
+		Mode.toolsEnabled(!open);
+		if (open)
+			tooltip.hide();
+		//else
+		//	drawOverlays();
+	}
+	static fanTip(text: string | undefined, x: number, y: number) { text === undefined ? tooltip.hide() : tooltip.show(text, x + 12, y + 12); }
+
+	static openMenu(x: number, y: number, items?: CascadeItem[]) {
+		tooltip.hide();
+		painter.menuOpened(x, y);
+		menu.open(x, y, items);
+	}
+	static viewItem(children: () => CascadeItem[]): CascadeItem {
+		return {id: 'view', face: () => svgFace(icons.view), caption: () => 'View', children};
+	}
+
+	// A selection, with what it selects carried (from the image's coordinates): where the coverage lands, within the image; nothing if none
+	// of it does
+	static warpSelection(s: Selection, carry: Carry, within: float2.extent) {
+		const area = carriedBounds(carry, s.bounds())?.intersect(within);
+		if (!area || area.empty())
+			return undefined;
+		const coverage	= s.mask ?? new Uint8ClampedArray(s.width * s.height).fill(255);
+		const warped	= Mode.warpPixels(Pixels(coverage, s.width, s.height, 1), shiftCarry(carry, s.min), area);
+		return new Selection(area, warped.data as Uint8ClampedArray<ArrayBuffer>).trimmed();
+	}
+
+	// pixels carried onto an area, on the GPU (a homography's unless it cannot take the image)
+	static warpPixels<P extends Pixels>(image: P, carry: Carry, area: float2.extent, outside = 0): P {
+		return carry instanceof Warp ? meshWarp(canvas3d, programTextWarp, image, carry.box, p => carry.at(p), area, outside) : warp(canvas3d, programWarp, image, carry, area, outside);
+	}
+
+	readonly canvas		= canvas;
+	readonly canvas3d	= canvas3d;
+
+	static shade(program: string, image: Pixels, area: float2.extent, passes: ShadePass[] | Record<string, any>, reach = 0) {
+		return shade(canvas3d, filterPrograms[program], image, area, passes, reach);
+	}
+
+
 	// the texture an image is shown from (rgba8, the image's size, or a layer of an array of them), and what is to be done once it is drawn into
-	protected shownBy(image: RGBAPixels): {texture: WebGLTexture, layer?: number, drawn(): void} | undefined {
+	shownBy(image: Pixels<4>): Offscreen | undefined {
 		return undefined;
 	}
 
@@ -213,6 +265,9 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 	// it is the current mode: the page is made to suit it
 	activate() {}
 
+	// the tools can be used now, or cannot: what the mode has of its own that works on the picture (a transform) is the same
+	toolsChanged(on: boolean) {}
+
 	// it is done with: it gives back what it made
 	dispose() {
 		if (this.texture)
@@ -224,7 +279,7 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 
 	//Paint Host
 	abstract pick(x: number, y: number): RGBA | undefined;
-	abstract target():		RGBAPixels | undefined;
+	abstract target():		Pixels<4> | undefined;
 	abstract toImage(x: number, y: number): float2;
 	abstract toScreen(p: float2): float2;
 	abstract pixelSize():	number;
@@ -232,7 +287,7 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 
 	//Transform Host
 	selection()						{ return painter.selection; }
-	setSelection(sel: Selection)	{ painter.selection = sel; }
+	setSelection(sel?: Selection)	{ painter.selection = sel?.empty() ? sel : undefined; }
 	select(sel: Selection | undefined, label: string) { painter.select(sel, label); }	// as an edit, which can be undone
 
 	abstract fit():			void;
@@ -240,16 +295,13 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 	tooltip(clientX: number, clientY: number): string | undefined {
 		return undefined;
 	}
-	panelOpened() {						// the tool menu has come up over the picture
-		tooltip.hide();
-	}
 
 	resized() {}						// the window has changed size
 
 	// editing
 	
 	menu(): CascadeItem[] {				// more for the tool menu (a View item among them has its strip joined to the page's)
-		return [];
+		return mergeItems([...painter.menuItems()]);
 	}
 	cloneSource(at: float2, all: boolean): CloneSource | undefined {	// what the clone stamp copies from: what the tools draw on, as it is then
 		return {
@@ -257,18 +309,10 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 			at
 		};
 	}
-	changed(changed: RGBAPixels, rect?: float2.extent) {	// pixels of an image have changed
+	changed(changed: Pixels<4>, rect?: float2.extent) {	// pixels of an image have changed
 		this.redraw();
 	}
-	beginTransform(target: TransformTarget, selection?: Selection): TransformSession | undefined {
-		return undefined;
-	}
-	transform(change: DocumentChange): HistoryEntry | undefined {
-		return undefined;
-	}
-	carryPixels<P extends Pixels>(image: P, carry: Carry, area: float2.extent): P {
-		return warpPixels(image, carry, area);
-	}
+	// the transform menu's flips, turns and crop (the whole document is changed, so a transform under way is applied first)
 	// Files dropped on it: the images among them are for it to do with as it will
 	async drop(files: File[], x: number, y: number) {
 		const items: Dropped[] = [];
@@ -288,7 +332,7 @@ static fanTip(text: string | undefined, x: number, y: number) { text === undefin
 
 	// An operation from the title menu: whether this mode does it (some do not mean anything to some modes)
 	run(op: string): boolean | Promise<boolean> {
-		return transformer.run(op) || painter.run(op);
+		return painter.run(op);
 	}
 
 	// the picture as pixels, and as the file keeps it, with what is more than pixels
@@ -334,6 +378,14 @@ export abstract class PanMode extends Mode implements NavigateHooks {
 	readonly pan: Pan = new Pan(canvas, this);
 	private unpan = Input.on(canvas).add(this.pan, Place.view);
 
+	// a right click that was not a drag (a drag pans): the menu
+	// (an arrow, as it is called without its object)
+	contextMenu = (clientX: number, clientY: number) => {
+		const items = this.menu();
+		if (items.length)
+			Mode.openMenu(clientX, clientY, items);
+	};
+
 	// the picture's own pixels to clip space, as the 2D view has them
 	protected pictureMatrix() {
 		return canvasMatrix(imageSize(canvas)).mulAffine(this.pan.matrix());
@@ -366,6 +418,7 @@ export abstract class PanMode extends Mode implements NavigateHooks {
 
 // a 2D picture, in the 2D view
 export abstract class PictureMode extends PanMode {
+	readonly transformer = new Transformer(this, canvas, $('transform-overlay'), history);
 
 	constructor(public image: ImageData, protected program2D: ShaderProgram) {
 		super();
@@ -373,29 +426,22 @@ export abstract class PictureMode extends PanMode {
 		this.pan.height	= image.height;
 	}
 
+	override resized() {
+		this.transformer.resize();
+		super.resized();
+	}
+	override toolsChanged(on: boolean) {
+		this.transformer.enabled(on);
+		if (on)
+			this.transformer.resize();
+	}
+	override dispose() {
+		this.transformer.enabled(false);	// (a transform under way is dropped)
+		super.dispose();
+	}
+
 	// how the picture is drawn while something of it is transformed (in place of drawing it as it is), if it is
 	protected preview: (() => void) | undefined;
-
-	// the whole picture is to be transformed: carried over the background
-	protected wholeSession(): TransformSession {
-		const box = new float2.extent(float2(0, 0), float2(this.image.width, this.image.height));
-		return {
-			box, target: 'image',
-			update: carry => {
-				const [matrix, warp] = planar(carry);
-				this.preview = () => {
-					programBG.draw({u_viewport: [canvas.width, canvas.height]});
-					if (this.texture)
-						drawQuad(canvas3d, programLayer, this.texture, box, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
-				};
-				this.redraw();
-			},
-			end: () => {
-				this.preview = undefined;
-				this.redraw();
-			},
-		};
-	}
 
 	protected drawFlat() {
 		canvas3d.bindTexture2D(this.texture ?? null);
@@ -415,6 +461,7 @@ export abstract class PictureMode extends PanMode {
 		else
 			this.drawFlat();
 		drawOverlays();
+		this.transformer.draw();
 	}
 
 	override tooltip(clientX: number, clientY: number) {
@@ -433,15 +480,35 @@ export abstract class PictureMode extends PanMode {
 // AtlasMode
 //-----------------------------------------------------------------------------
 
-type Slice = RGBAPixels;
+type Slice = Pixels<4>;
 
 // an image of slices, one above another: the faces of a cube, the slices of an array or a volume
 export abstract class AtlasMode extends PanMode {
+	readonly transformer = new Transformer(this, canvas, $('transform-overlay'), history);
 	layer:			Slice | undefined;		// the current slice (or face): the one the tools draw on
 	count:			number;
 	sliceHeight:	number;
 	layers:		Slice[] = [];
 	
+	override resized() {
+		this.transformer.resize();
+		super.resized();
+	}
+	override toolsChanged(on: boolean) {
+		this.transformer.enabled(on);
+		if (on)
+			this.transformer.resize();
+	}
+	override dispose() {
+		this.transformer.enabled(false);	// (a transform under way is dropped)
+		super.dispose();
+	}
+	override menu() {
+		return [...super.menu(), ...this.transformer.menu(
+			[this.transformer.item('transform-layer', icons.transform, 'Free Transform (Enter applies, Esc cancels)', () => this.beginTransform())]
+		)];
+	}
+
 	// the rectangle of one slice
 	get sliceRect() {
 		return float2.extent.fromSize(float2(0, 0), float2(this.image.width, this.sliceHeight));
@@ -459,7 +526,7 @@ export abstract class AtlasMode extends PanMode {
 
 	setSlice(slice: Slice) {
 		this.layer = slice;
-		drawOverlays();
+		this.redraw();
 	}
 
 	override picture() {
@@ -481,7 +548,7 @@ export abstract class AtlasMode extends PanMode {
 	}
 
 	// the slice (or face) `i` has these pixels on the GPU
-	protected uploadSlice(i: number, image: RGBAPixels): void {
+	protected uploadSlice(i: number, image: Pixels<4>): void {
 		throw new Error('there are no slices to put pixels in');
 	}
 	// where the pixels of slice `i`, carried by this matrix (from its own coordinates), land in clip space (for a warp, the matrix is
@@ -495,10 +562,12 @@ export abstract class AtlasMode extends PanMode {
 	override redraw() {
 		this.carried?.();
 		drawOverlays();
+		this.transformer.draw();
 	}
 	// A slice is carried by drawing it over the picture, which has its place left empty while it is
-	override beginTransform(target: TransformTarget, selection?: Selection): TransformSession | undefined {
-		const layer	= target === 'layer' ? this.layer : undefined;
+	beginTransform(): TransformSession | undefined {
+		const selection = this.selection();
+		const layer	= this.layer;
 		const box	= layer && (selection ? selection.bounds() : alphaExtent(layer));
 		if (!layer || !box)
 			return undefined;
@@ -508,7 +577,7 @@ export abstract class AtlasMode extends PanMode {
 		const own	= canvas3d.createTextureFromImage(lifted ? lifted.floating : layer);
 		this.uploadSlice(i, lifted ? lifted.rest : new ImageData(layer.width, layer.height));
 		return {
-			box, target: 'layer', selection,
+			box, label: 'Free Transform', selection,
 			update: carry => {
 				const [matrix, warp] = planar(carry);
 				this.carried = () => {
@@ -520,50 +589,47 @@ export abstract class AtlasMode extends PanMode {
 				};
 				this.redraw();
 			},
-			end: () => {
+			end: carry => {
 				this.carried = undefined;
 				canvas3d.deleteTexture(own);
 				this.uploadSlice(i, layer);
 				this.redraw();
+				if (carry) {
+					const layer = this.layer;
+					const slice = layer ? this.layers.indexOf(layer) : -1;
+					if (!layer || slice < 0 || !this.texture)
+						return undefined;
+
+					const	whole	= imageRect(layer);
+					const	before	= layer.data.slice();
+					let		after;
+
+					if (selection) {
+						// (the rest of the slice is as it was)
+						after = warpSelected(layer, selection, carry, Mode.warpPixels);
+					} else {
+						const area = carriedBounds(carry, whole)?.intersect(whole);
+						if (!area || area.empty())
+							return undefined;
+						const warped = Mode.warpPixels(layer, carry, area);
+						after = resizePixels(warped, area.min.x, area.min.y, layer.width, layer.height);
+					}
+
+					// the selection goes with what it selected, if it was that which was transformed: else it does not survive the change
+					const selafter	= selection && Mode.warpSelection(selection, carry, whole);
+
+					const set = (data: PixelStorage, selection?: Selection) => () => {
+						this.setSelection(selection);
+						layer.data.set(data);
+						this.uploadSlice(slice, layer);
+						this.redraw();
+					};
+					set(after.data, selafter)();
+					return {undo: set(before, selection), redo: set(after.data, selafter)};
+				}
 			},
 		};
 	}
-
-	override transform(change: DocumentChange) {
-		return change.kind === 'warp' ? this.warpSlice(change.carry, change.target === 'layer' ? this.layer : undefined, change.selection) : undefined;
-	}
-
-	// A slice (or face) carried (its own pixels, in its own coordinates): what is carried off the slice is lost, and what is left is
-	// transparent. One edit.
-	warpSlice(carry: Carry, layer?: Slice, selection?: Selection): HistoryEntry | undefined {
-		const slice = layer ? this.layers.indexOf(layer) : -1;
-		if (!layer || slice < 0 || !this.texture)
-			return undefined;
-		const {width} = layer, whole = imageRect(layer);
-		const before = (layer.data as Uint8ClampedArray).slice();
-		let after: Uint8ClampedArray;
-		if (selection) {
-			// (the rest of the slice is as it was)
-			after = warpSelected(layer, selection, carry, warpPixels).data as Uint8ClampedArray;
-		} else {
-			const area = carriedBounds(carry, whole)?.intersect(whole);
-			if (!area || area.empty())
-				return undefined;
-			const warped = warpPixels(layer, carry, area);
-			after = new Uint8ClampedArray(before.length);
-			const {x: w, y: h} = area.size();
-			for (let j = 0; j < h; j++)
-				after.set((warped.data as Uint8ClampedArray).subarray(j * w * 4, (j + 1) * w * 4), ((area.min.y + j) * width + area.min.x) * 4);
-		}
-		const set = (data: Uint8ClampedArray) => () => {
-			(layer.data as Uint8ClampedArray).set(data);
-			this.uploadSlice(slice, layer);
-			this.redraw();
-		};
-		set(after)();
-		return {undo: set(before), redo: set(after)};
-	}
-
 }
 
 //-----------------------------------------------------------------------------
@@ -624,27 +690,12 @@ const emptyMode		= new EmptyMode;
 export let mode: Mode		= emptyMode;
 
 // what has been done to the picture, for undo: the edits are told to the extension, which keeps them for VS Code, and sends undo and redo back
-export const history = new History(label => postMessage({command: 'edited', label}));
+export const history	= new History(label => postMessage({command: 'edited', label}));
+const menu = new Cascade(canvas.parentElement!, () => mergeItems(mode.menu()));
 
-// the menu the right button brings up: the tools, the transforms, and what the current mode adds
-const menuItems = () => mergeItems([...painter.menuItems(), ...transformer.menuItems(), ...mode.menu(), ...viewMenu()]);
-
-// the View item, last, with the grid; the mode's (a 3D view, a layer's masks) and an editor's are joined to it
-// a View item: what is shown over the picture; all the View items of the menu are one (see mergeItems)
-export const viewItem = (children: () => CascadeItem[]): CascadeItem => ({id: 'view', face: () => svgFace(icons.view), caption: () => 'View', children});
-const viewMenu = (): CascadeItem[] => [viewItem(() => [{...toggleItem('Grid', svgFace(icons.grid), () => painter.grid, v => { painter.grid = v; painter.draw(); }), id: 'grid'}])];
-const menu = new Cascade(canvas.parentElement!, menuItems);
-
-// the tools and the transforms, which work on whichever mode is current
+// the tools, which work on whichever mode is current (a mode that can be transformed has its own transformer)
 const painter: Painter = new Painter(emptyMode, $('overlay'), history, menu);
-const transformer: Transformer = new Transformer(emptyMode, $('transform-overlay'), history);
 
-// the menu, brought up at a point of the window (with other items than its own, for something there)
-export function openMenu(x: number, y: number, items?: CascadeItem[]) {
-	mode.panelOpened();
-	painter.menuOpened(x, y);
-	menu.open(x, y, items);
-}
 // Under everything else over the picture: the menu, for a right click nothing takes itself (as a 3D view turning does); and Space, which
 // while it is held gives the pointer to the view, over the tools and anything else
 const input = Input.on(canvas);
@@ -655,9 +706,9 @@ const letGo = () => {
 };
 input.add({
 	menu: e => {
-		const items = menuItems();
+		const items = mode.menu();
 		if (items.length)
-			openMenu(e.clientX, e.clientY, items);
+			Mode.openMenu(e.clientX, e.clientY, items);
 		return true;
 	},
 	key: e => {
@@ -677,29 +728,27 @@ window.addEventListener('blur', letGo);
 // what is over the picture (the tools' selection, brush and grid, and a transform's box), drawn again as the view has it now
 function drawOverlays() {
 	painter.draw();
-	transformer.draw();
 }
 // the canvas has changed size, and what is drawn over it with it
 // the canvas changes size with the window, and with the tool bars of the editor coming and going or wrapping
 new ResizeObserver(() => {
 	canvas3d.resize();
 	painter.resize();
-	transformer.resize();
 	mode.resized();
 	mode.redraw();
 }).observe(canvas);
 
-//-----------------------------------------------------------------------------
-// transforming
-//-----------------------------------------------------------------------------
+canvas.addEventListener('wheel', event => event.preventDefault(), {passive: false});
 
-// pixels carried onto an area, on the GPU (a homography's unless it cannot take the image)
-export const warpPixels = <P extends Pixels>(image: P, carry: Carry, area: float2.extent, outside = 0) =>
-	carry instanceof Warp ? meshWarp(canvas3d, programTextWarp, image, carry.box, p => carry.at(p), area, outside) : warp(canvas3d, programWarp, image, carry, area, outside);
+canvas.addEventListener('pointermove', event => {
+	const text = mode.tooltip(event.clientX, event.clientY);
+	if (text) {
+		tooltip.show(text, event.clientX + 12, event.clientY + 12);
+		return;
+	}
+	tooltip.hide();
+});
 
-export type Drag = NonNullable<CascadeItem['drag']>;
-
-// a way of moving a layer as the menu's strip has it, which lists the last first
-export function reversed(r: Drag, count: () => number): Drag {
-	return {begin: r.begin, to: (place: number) => r.to(count() - 1 - place), drop: r.drop};
-}
+canvas.addEventListener('pointerleave', () => {
+	tooltip.hide();
+});

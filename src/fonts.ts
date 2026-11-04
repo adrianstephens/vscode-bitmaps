@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as bin from '@isopodlabs/binary';
 import { load, loadAsync, Font, FontGroup, bezier2Curve, mapCurve, parseCurve, curveVertex, ON_BEGIN, ON_CURVE, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
 import { float2 } from '@isopodlabs/maths/vector';
-import { type ScadFiles, type AsyncFiles, asyncFileReader } from './filereader';
+import { type SyncFiles, type AsyncFiles, asyncFileReader } from './filereader';
 import type { GlyphRun } from '../webview/textedit';
 
 //-----------------------------------------------------------------------------
@@ -104,8 +104,8 @@ export async function installedFonts(): Promise<InstalledFont[]> {
 }
 
 function loadFont(entry: FontEntry, files: AsyncFiles): Font|Promise<Font|undefined>;
-function loadFont(entry: FontEntry, files?: ScadFiles): Font|undefined;
-function loadFont(entry: FontEntry, files?: ScadFiles | AsyncFiles) {
+function loadFont(entry: FontEntry, files?: SyncFiles): Font|undefined;
+function loadFont(entry: FontEntry, files?: SyncFiles | AsyncFiles) {
 	const key	= `${entry.filePath}#${entry.ttcIndex ?? 0}`;
 	const font	= fontCache.get(key);
 	if (font)
@@ -127,7 +127,7 @@ function loadFont(entry: FontEntry, files?: ScadFiles | AsyncFiles) {
 // family is not found -- real OpenSCAD falls back to whatever fontconfig's own default sans-serif resolves to
 const DEFAULT_FAMILIES = ['Liberation Sans', 'Arial', 'Helvetica', 'DejaVu Sans', 'Verdana', 'Segoe UI'];
 
-export function findFont(family: string, style: string | undefined, files: ScadFiles | undefined, warn: (message: string) => void): Font | undefined {
+export function findFont(family: string, style: string | undefined, files: SyncFiles | undefined, warn: (message: string) => void): Font | undefined {
 	const entries = index ?? [];
 	if (entries.length === 0) {
 		warn('text(): no system fonts could be found to draw with');
@@ -185,7 +185,7 @@ export interface TextParams {
 // would punch a hole wherever two letters' outlines happened to overlap (an italic script font, tight spacing),
 // which is not what a hole in one letter's own counter means. The caller unions them instead, the same as any
 // other collection of separate shapes.
-export function layoutText(params: TextParams, files: ScadFiles, warn: (message: string) => void) {
+export function layoutText(params: TextParams, files: SyncFiles, warn: (message: string) => void) {
 	const chars = [...params.text].filter(c => c !== '\n' && c !== '\r');
 	if (chars.length === 0)
 		return [];

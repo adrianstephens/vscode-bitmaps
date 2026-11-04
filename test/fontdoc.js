@@ -19,8 +19,10 @@ const origLoad = Module._load;
 Module._load = function (r, ...a) {
 	return r === 'vscode' ? vscode : r === '@isopodlabs/vscode_utils/webview' ? {Panel: class {}, Assets: class {}} : r === './extension' || r === './BitmapViewer' ? {} : origLoad.call(this, r, ...a);
 };
-const { FontDocument, glyphDetail } = require('../out/src/FontViewer.js');
+const { FontDocument } = require('../out/src/FontViewer.js');
 const { ON_CURVE } = require('@isopodlabs/binary_fonts');
+
+const { glyphDetail } = require('../out/src/fontmodel.js');
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.log(`   FAIL: ${msg}`); bad++; } };

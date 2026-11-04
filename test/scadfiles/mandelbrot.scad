@@ -12,7 +12,7 @@ function steps(zr, zi, cr, ci, n) =
 	1 + steps(zr*zr - zi*zi + cr, 2*zr*zi + ci, cr, ci, n - 1);
 
 // colour is a function of the point too, in the frame color() is written in -- inside the scale(), so x and y are the plane's
-scale([100,100,40]) /*color(function(x, y, z) let(t = steps(0, 0, x, y, iterations) / iterations)
+scale([100,100,100]) /*color(function(x, y, z) let(t = steps(0, 0, x, y, iterations) / iterations)
 		t > 0.999 ? [0, 0, 0] : [0.5 + 0.5 * cos(360 * (3 * t + 0.0)), 0.5 + 0.5 * cos(360 * (3 * t + 0.33)), 0.5 + 0.5 * cos(360 * (3 * t + 0.67))])*/
-	surface_fn(function(x, y) ln(ln(steps(0, 0, x, y, iterations))) - 0.8,
-	x = [-2.2, 0.8], y = [-1.5, 1.5], bottom = -1, slope = 20);
+	surface_fn(function(x, y) ln(ln(steps(0, 0, x, y, iterations)))+0.2,
+	x = [-2.2, 0.8], y = [-1.5, 1.5], bottom = 0);

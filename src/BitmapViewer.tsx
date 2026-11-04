@@ -6,8 +6,9 @@ import { JSX, CSP, CSPdefault, ImportMap, Nonce } from '@isopodlabs/vscode_utils
 import type { MessageIn, MessageOut, MessageRpc, RawImage, LayerData, shaderType } from "../webview/bitmap"
 import { setActiveViewer, readShader } from './extension';
 import { SCHEME, embedded } from './embedded';
-import { simplifyPoints, fitStroke } from './FontViewer';
 import { installedFonts, glyphOutlines } from './fonts';
+import { modelBytes, setModelStorage } from './models';
+import { openSvg } from './SvgViewer';
 
 
 class RawImage2 extends bitmap.LayerImage {
@@ -69,13 +70,156 @@ const saveFormats: Record<string, SaveFormat> = {
 	'.tga':		savefromRaw(bitmap.TGA),
 	'.tif':		savefromRaw(bitmap.TIFF),
 	'.tiff':	savefromRaw(bitmap.TIFF),
+	'.webp':	savefromRaw(bitmap.WebP),
 };
+
+let untitledCount = 0;
+
+export async function newBitmap() {
+	const text = await vscode.window.showInputBox({prompt: 'Size of the new bitmap', value: '512x512', validateInput: s => parseSize(s) ? undefined : 'Width and height in pixels, like 512x512'});
+	const size = text && parseSize(text);
+	if (size) {
+		const [width, height] = size;
+		await BitmapViewerProvider.open(`Untitled-${++untitledCount}.png`, new RawImage2({width, height, data: new Uint8Array(width * height * 4).fill(255).buffer}));
+	}
+}
+export function parseSize(text: string): [number, number] | undefined {
+	const m = /^\s*(\d+)\s*[x×,]\s*(\d+)\s*$/.exec(text);
+	if (m && +m[1] > 0 && +m[2] > 0 && +m[1] <= 16384 && +m[2] <= 16384)
+		return [+m[1], +m[2]];
+}
+
+const toBuffer = (data: bitmap.Result['pixels']) => new Uint8Array(data).buffer;
 
 class BitmapDocument implements vscode.CustomDocument {
 	public fileWatcher: vscode.Disposable | undefined;
+	public image?: bitmap.Image;
+
+	// not read from a file: there is no file until it is saved
+	public announced = false;
+	get untitled() { return this.uri.scheme === 'untitled'; }
+	get ext() 		{ return path.extname(this.uri.fsPath).toLowerCase(); }
+
 	// a PSD whose layers can't be edited (they are not 8-bit RGB) is shown flat, and must not be saved over as if it were
 	public layersNotEditable = false;
-	constructor(public readonly uri: vscode.Uri, public data: Uint8Array) {}
+	public layers: LayerData[] | undefined;
+
+	// set while this writes the file, so that the watcher does not read back what was just written (which would lose the undo history)
+	private writing = false;
+
+	// onChange is called when the file is changed by something else
+	constructor(public readonly uri: vscode.Uri, onChange: () => void) {
+		const changed = () => !this.writing && onChange();
+		if (uri.scheme === SCHEME) {
+			this.fileWatcher = embedded.onChange(uri, changed);
+		} else if (!this.untitled) {
+			const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(uri.fsPath), path.basename(uri.fsPath)));
+			watcher.onDidChange(changed);
+			watcher.onDidCreate(changed);
+			this.fileWatcher = watcher;
+		}
+	}
+
+	init(image: bitmap.Image) {
+		this.image = image;
+	}
+
+	async load(uri: vscode.Uri = this.uri, ext = this.ext) {
+		const data = await vscode.workspace.fs.readFile(uri);
+		// a backup of unsaved edits is a PNG, unless the format has more than a PNG can hold
+		if (bitmap.PNG.check(data))
+			ext = '.png';
+		switch (ext) {
+			case '.bmp':
+				this.image = bitmap.BMP.load(data);
+				break;
+
+			case '.png':
+				this.image = await bitmap.PNG.load(data);
+				break;
+
+			case '.jpg':
+			case '.jpeg':
+				this.image = bitmap.JPEG.load(data);
+				break;
+
+			case '.gif':
+				this.image = bitmap.GIF.load(data);
+				break;
+
+			case '.dds':
+				this.image = bitmap.DDS.load(data);
+				break;
+
+			case '.psd': {
+				const psd = await bitmap.PSD.load(data);
+				// layers can be edited and put back if they are plain 8-bit RGB
+				const count = psd.psd.layerAndMaskInfo?.layerInfo?.layers.length ?? 0;
+				const editable = psd.psd.depth === 8 && psd.psd.colorMode === 'RGB';
+				this.layersNotEditable = count > 0 && !editable;
+				if (count && editable) {
+					this.layers = [];
+					for (let i = 0, layer: bitmap.psd.PSDLayerImage | undefined; (layer = psd.getLayer(i)); i++) {
+						const {name, left, top, opacity, visible, blendMode, clipped, blocks} = layer;
+						this.layers.push({
+							name: name!, left: left!, top: top!, opacity: opacity!, visible: visible!, blend: blendMode!, clipped, blocks,
+							width: layer.width, height: layer.height,
+							data: toBuffer((await layer.getPixels({plane: 'RGBA'})).pixels),
+							mask: layer.mask && {...layer.mask, data: toBuffer(await layer.mask.getPixels())},
+							vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather,
+						});
+					}
+				}
+				this.image = psd;
+				break;
+			}
+			case '.tga':
+				this.image = bitmap.TGA.load(data);
+				break;
+
+			case '.tif':
+			case '.tiff':
+				this.image = bitmap.TIFF.load(data);
+				break;
+
+			case '.webp':
+				this.image = bitmap.WebP.load(data);
+				break;
+
+			default:
+				throw new Error(`Unsupported file type: ${ext}`);
+		}
+	}
+
+	// the image as the webview has it, encoded as a file
+	async encode(format: SaveFormat, cancellation: vscode.CancellationToken) {
+		const ed = BitmapViewerProvider.provider.getEditor(this);
+		const result = ed && await ed.RPC({ command: 'getTexture', type: format.type });
+		if (!result)
+			throw new Error('The image could not be read back from the editor.');
+		if ('data' in result)
+			return format.encode!(result, bitmap.Yielder(15, ()=>cancellation.isCancellationRequested));
+		return new Uint8Array(result);
+	}
+
+	async write(destination: vscode.Uri, cancellation: vscode.CancellationToken) {
+		const format = saveFormats[extension(destination)];
+		if (!format)
+			throw new Error(`Bitmap Explorer can't save ${extension(destination) || 'this'} files; use Save As to choose another type.`);
+		if (extension(destination) === '.psd' && this.layersNotEditable)
+			throw new Error('The layers of this PSD cannot be edited (only 8-bit RGB layers can), so saving would flatten it; use Save As to write it under another name.');
+		const bytes = await this.encode(format, cancellation);
+		this.writing = true;
+		try {
+			await vscode.workspace.fs.writeFile(destination, bytes);
+		} finally {
+			// the watcher's event can come after the write returns
+			setTimeout(() => this.writing = false, 500);
+		}
+		return bytes;
+	}
+
+
 	dispose(): void {
 		this.fileWatcher?.dispose();
 	}
@@ -101,6 +245,8 @@ const shaders: Record<shaderType, ShaderSource> = {
 	'levels':	{ vert: 'bitmap.vert',	frag: 'levels.frag'		},
 	'gradient':	{ vert: 'bitmap.vert',	frag: 'gradient.frag'	},
 	'convolve':	{ vert: 'bitmap.vert',	frag: 'convolve.frag'	},
+	'flatten':	{ vert: 'bitmap.vert',	frag: 'flatten.frag'	},
+	'ink':		{ vert: 'bitmap.vert',	frag: 'ink.frag'		},
 	'effect':	{ vert: 'bitmap.vert',	frag: 'effect.frag'		},
 	'textwarp':	{ vert: 'textwarp.vert',	frag: 'textwarp.frag'	},
 };
@@ -128,8 +274,10 @@ export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.A
 					"@isopodlabs/maths/geometry": assets.uri('node_modules/@isopodlabs/maths/esm/geometry.js'),
 					"@isopodlabs/maths/linear": assets.uri('node_modules/@isopodlabs/maths/esm/linear.js'),
 					"@isopodlabs/binary": assets.uri('node_modules/@isopodlabs/binary/esm/index.js'),
+					"@isopodlabs/binary_ml/browser": assets.uri('node_modules/@isopodlabs/binary_ml/esm/browser.js'),
 					"@isopodlabs/xml": assets.uri('node_modules/@isopodlabs/xml/esm/xml.js'),
 					"@isopodlabs/binary_fonts": assets.uri('node_modules/@isopodlabs/binary_fonts/esm/browser.js'),
+					"@isopodlabs/binary_fonts/curves": assets.uri('node_modules/@isopodlabs/binary_fonts/esm/curves.js'),
 				}} />
 				<link rel="stylesheet" type="text/css" href={uri('node_modules/@isopodlabs/vscode_utils/assets/shared.css')}/>
 				{stylesheets.map(name => <link rel="stylesheet" type="text/css" href={uri(name)}/>)}
@@ -146,10 +294,13 @@ export function webviewPage(webviewPanel: vscode.WebviewPanel, assets: webview.A
 	);
 }
 
-// the webview which displays an image; subclasses decide what to show in it
-export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
-
-	constructor(webviewPanel: vscode.WebviewPanel, assets: webview.Assets) {
+class BitmapViewer extends webview.Panel<MessageOut, MessageIn, MessageRpc> {
+	constructor(
+		webviewPanel: vscode.WebviewPanel,
+		assets: webview.Assets,
+		public document: BitmapDocument,
+		private onEdited: (label: string) => void,
+	) {
 		super(webviewPanel, assets);
 
 		webviewPanel.webview.options = {
@@ -170,6 +321,11 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 		], undefined, ['assets/pathedit.css']);
 	}
 
+	edited(label: string) {
+		this.onEdited(label);
+	}
+
+	// markup the page has made of the picture: written to a file of the user's choosing, and opened in the SVG editor
 	async command(message: MessageOut) {
 		switch (message.command) {
 			case 'getShaders': {
@@ -182,17 +338,25 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 			case 'installedFonts':
 				return installedFonts();
 
+			case 'model': {
+				const data = await modelBytes(message.name);
+				return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+			}
+
 			case 'glyphOutlines':
 				return glyphOutlines(message.runs);
+
+			case 'pickImage': {
+				const [uri] = await vscode.window.showOpenDialog({canSelectMany: false, title: 'A picture to take a style from', filters: {Pictures: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp']}}) ?? [];
+				if (uri) {
+					const data = await vscode.workspace.fs.readFile(uri);
+					return {name: path.posix.basename(uri.path, path.posix.extname(uri.path)), data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)};
+				}
+				return undefined;
+			}
 				
-			case 'simplifyPoints':
-				return simplifyPoints(message.points, message.tol, message.cubic);
-
-			case 'fitStroke':
-				return fitStroke(message.stroke, message.tol);
-
 			case 'ready':
-				this.loadImage();
+				this.upload();
 				break;
 
 			case 'edited':
@@ -202,212 +366,104 @@ export abstract class ViewerPanel extends webview.Panel<MessageOut, MessageIn, M
 			case 'error':
 				vscode.window.showErrorMessage(message.message);
 				break;
+			case 'saveSvg': {
+				// opened unsaved, so that Save As is what chooses the file
+				const base = this.document.uri;
+				await openSvg(path.posix.basename(base.path, path.posix.extname(base.path)) + '.svg', message.text);
+				break;
+			}
 		}
 	}
-	abstract loadImage(): Promise<void>;
-	edited(label: string) {}
-}
 
-class BitmapViewer extends ViewerPanel {
-	constructor(
-		webviewPanel: vscode.WebviewPanel,
-		assets: webview.Assets,
-		public document: BitmapDocument,
-		private onEdited: (label: string) => void,
-	) {
-		super(webviewPanel, assets);
-	}
-
-	edited(label: string) {
-		this.onEdited(label);
-	}
-
-	async loadImage() {
+	async upload() {
 		const toImage = (result: bitmap.Result): {width: number, height: number, data: Uint8ClampedArray<ArrayBuffer>, channels: 4} => ({width: result.width, height: result.height, data: result.pixels as Uint8ClampedArray<ArrayBuffer>, channels: 4});
-		const toBuffer = (data: bitmap.Result['pixels']) => new Uint8Array(data).buffer;
+		const image = this.document.image;
 
-		try {
-			const data		= this.document.data;
-			let image: bitmap.Image;
-			let layers: LayerData[] | undefined;
-
-			// a backup of unsaved edits is a PNG whatever the file is called
-			const ext = bitmap.PNG.check(data) ? '.png' : path.posix.extname(this.document.uri.path).toLowerCase();
-			switch (ext) {
-				case '.bmp':
-					image = bitmap.BMP.load(data);
-					break;
-
-				case '.png':
-					image = await bitmap.PNG.load(data);
-					break;
-
-				case '.jpg':
-				case '.jpeg':
-					image = bitmap.JPEG.load(data);
-					break;
-
-				case '.gif':
-					image = bitmap.GIF.load(data);
-					break;
-
-				case '.dds':
-					image = bitmap.DDS.load(data);
-					break;
-
-				case '.psd': {
-					const psd = await bitmap.PSD.load(data);
-					// layers can be edited and put back if they are plain 8-bit RGB
-					const count = psd.psd.layerAndMaskInfo?.layerInfo?.layers.length ?? 0;
-					const editable = psd.psd.depth === 8 && psd.psd.colorMode === 'RGB';
-					this.document.layersNotEditable = count > 0 && !editable;
-					if (count && editable) {
-						layers = [];
-						for (let i = 0, layer: bitmap.psd.PSDLayerImage | undefined; (layer = psd.getLayer(i)); i++) {
-							const {name, left, top, opacity, visible, blendMode, clipped, blocks} = layer;
-							layers.push({
-								name: name!, left: left!, top: top!, opacity: opacity!, visible: visible!, blend: blendMode!, clipped, blocks,
-								width: layer.width, height: layer.height,
-								data: toBuffer((await layer.getPixels({plane: 'RGBA'})).pixels),
-								mask: layer.mask && {...layer.mask, data: toBuffer(await layer.mask.getPixels())},
-								vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather,
-							});
-						}
-					}
-					image = psd;
-					break;
-				}
-				case '.tga':
-					image = bitmap.TGA.load(data);
-					break;
-
-				case '.tif':
-				case '.tiff':
-					image = bitmap.TIFF.load(data);
-					break;
-
-				default:
-					throw new Error(`Unsupported file type: ${ext}`);
+		switch (image?.type) {
+			case 'cube': {
+//				const faces = await Promise.all(Array.from({length: 6}, async (_, i) => image.getPixels({ planes: 'RGBA', layer: i })));
+				const result = await image.getPixels({ plane: 'RGBA' });
+				this.postMessage({
+					command: 'loadCube',
+					image: toImage(result)
+				});
+				break;
 			}
-
-			switch (image.type) {
-				case 'cube': {
-//					const faces = await Promise.all(Array.from({length: 6}, async (_, i) => image.getPixels({ planes: 'RGBA', layer: i })));
-					const result = await image.getPixels({ plane: 'RGBA' });
-					this.postMessage({
-						command: 'loadCube',
-						image: toImage(result)
-					});
-					break;
-				}
-				case '2d': {
-					const result = await image.getPixels({ plane: 'RGBA' });
-//					const result = await image.getPixels({ plane: 'R' });
-					this.postMessage({
-						command: 'load2d',
-						image: toImage(result),
-						layers,
-					});
-					break;
-				}
-				case '3d': {
-					const result = await image.getPixels({ plane: 'RGBA' });
-					const depth = image.depth!;
-					this.postMessage({
-						command: 'load3d',
-						image: toImage(result),
-						depth,
-					});
-					break;
-				}
-				case '2d-array': {
-					const result = await image.getPixels({ plane: 'RGBA' });
-					this.postMessage({
-						command: 'load2dArray',
-						image: toImage(result),
-						layers: image.depth!,
-					});
-					break;
-				}
+			case '2d': {
+				const result = await image.getPixels({ plane: 'RGBA' });
+//				const result = await image.getPixels({ plane: 'R' });
+				this.postMessage({
+					command: 'load2d',
+					image:	toImage(result),
+					layers:	this.document.layers,
+				});
+				break;
 			}
-		} catch (error: any) {
-			vscode.window.showErrorMessage(error.message);
+			case '3d': {
+				const result = await image.getPixels({ plane: 'RGBA' });
+				const depth = image.depth!;
+				this.postMessage({
+					command: 'load3d',
+					image: toImage(result),
+					depth,
+				});
+				break;
+			}
+			case '2d-array': {
+				const result = await image.getPixels({ plane: 'RGBA' });
+				this.postMessage({
+					command: 'load2dArray',
+					image: toImage(result),
+					layers: image.depth!,
+				});
+				break;
+			}
 		}
-
 	}
 }
 
 export class BitmapViewerProvider implements vscode.CustomEditorProvider {
-	private readonly editors = new Set<BitmapViewer>();
+	static provider: BitmapViewerProvider;
 	private readonly assets: webview.Assets;
 	private _onDidChangeCustomDocument = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<BitmapDocument>>();
+	pending = new Map<string, bitmap.Image>();
+	editors = new Set<BitmapViewer>();
 
 	get onDidChangeCustomDocument() {
 		return this._onDidChangeCustomDocument.event;
 	}
 
 	constructor(private readonly context: vscode.ExtensionContext) {
+		BitmapViewerProvider.provider = this;
 		this.assets = new webview.Assets(context.extensionUri);
+		setModelStorage(context.globalStorageUri);
 		context.subscriptions.push(
 			vscode.window.registerCustomEditorProvider('bitmap.viewer', this, { webviewOptions: { retainContextWhenHidden: true } }),
 		);
 	}
 
-	private getEditor(document: BitmapDocument) {
-		for (const editor of this.editors) {
-			if (editor.document === document)
-				return editor;
-		}
-	}
-
-	private async reloadDocument(document: BitmapDocument, force = false) {
+	private async reloadDocument(document: BitmapDocument) {
 		try {
-			const data = await vscode.workspace.fs.readFile(document.uri);
-			// our own save comes back through the file watcher: it is not a change, and reloading would lose the undo history
-			if (!force && data.length === document.data.length && data.every((b, i) => b === document.data[i]))
-				return;
-			document.data = data;
+			await document.load();
 			for (const editor of this.editors) {
 				if (editor.document === document)
-					editor.loadImage();
+					editor.upload();
 			}
 		} catch (error) {
 			console.error('Failed to reload bitmap document', error);
 		}
 	}
 
-	// the image as the webview has it, encoded as a file
-	private async encode(document: BitmapDocument, format: SaveFormat, cancellation: vscode.CancellationToken) {
-		const ed = this.getEditor(document);
-		const result = ed && await ed.RPC({ command: 'getTexture', type: format.type });
-		if (!result)
-			throw new Error('The image could not be read back from the editor.');
-		if ('data' in result)
-			return format.encode!(result, bitmap.Yielder(15, ()=>cancellation.isCancellationRequested));
-		return new Uint8Array(result);
-	}
-
-	private async write(document: BitmapDocument, destination: vscode.Uri, cancellation: vscode.CancellationToken) {
-		const format = saveFormats[extension(destination)];
-		if (!format)
-			throw new Error(`Bitmap Explorer can't save ${extension(destination) || 'this'} files; use Save As to choose another type.`);
-		if (extension(destination) === '.psd' && document.layersNotEditable)
-			throw new Error('The layers of this PSD cannot be edited (only 8-bit RGB layers can), so saving would flatten it; use Save As to write it under another name.');
-		const bytes = await this.encode(document, format, cancellation);
-		await vscode.workspace.fs.writeFile(destination, bytes);
-		return bytes;
-	}
-
 	async saveCustomDocument(document: BitmapDocument, cancellation: vscode.CancellationToken) {
-		document.data = await this.write(document, document.uri, cancellation);
+		await document.write(document.uri, cancellation);
 	}
 
 	async saveCustomDocumentAs(document: BitmapDocument, destination: vscode.Uri, cancellation: vscode.CancellationToken) {
-		await this.write(document, destination, cancellation);
+		await document.write(destination, cancellation);
 	}
 
 	async revertCustomDocument(document: BitmapDocument, cancellation: vscode.CancellationToken) {
-		await this.reloadDocument(document, true);
+		await this.reloadDocument(document);
 	}
 
 	async backupCustomDocument(document: BitmapDocument, context: vscode.CustomDocumentBackupContext, cancellation: vscode.CancellationToken) {
@@ -422,25 +478,28 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 			if (ext === '.psd' ? !document.layersNotEditable : structured)
 				format = own;
 		}
-		await vscode.workspace.fs.writeFile(context.destination, await this.encode(document, format, cancellation));
+		await vscode.workspace.fs.writeFile(context.destination, await document.encode(format, cancellation));
 		return {
 			id: context.destination.toString(),
-			delete: async () => {
-				try {
-					await vscode.workspace.fs.delete(context.destination);
-				} catch {}
-			}
+			delete: async () => { try { await vscode.workspace.fs.delete(context.destination); } catch {} }
 		}
 	}
 
 	async openCustomDocument(uri: vscode.Uri, openContext: vscode.CustomDocumentOpenContext): Promise<vscode.CustomDocument> {
-		// unsaved changes, if VS Code is restoring them
+		const doc = new BitmapDocument(uri, () => this.reloadDocument(doc));
+
+		// unsaved changes come first, if VS Code is restoring them (an untitled picture has nothing else after a restart)
 		if (openContext.backupId) {
-			try {
-				return new BitmapDocument(uri, await vscode.workspace.fs.readFile(vscode.Uri.parse(openContext.backupId)));
-			} catch {}
+			await doc.load(vscode.Uri.parse(openContext.backupId));
+		} else if (uri.scheme === 'untitled') {
+			const image = this.pending.get(uri.toString());
+			this.pending.delete(uri.toString());
+			if (image)
+				doc.init(image);
+		} else {
+			await doc.load(uri);
 		}
-		return new BitmapDocument(uri, await vscode.workspace.fs.readFile(uri));
+		return doc;
 	}
 
 	async resolveCustomEditor(document: BitmapDocument, webviewPanel: vscode.WebviewPanel): Promise<void> {
@@ -461,21 +520,35 @@ export class BitmapViewerProvider implements vscode.CustomEditorProvider {
 			if (event.webviewPanel.active)
 				setActiveViewer(editor);
 		});
+	}
 
-		if (!document.fileWatcher) {
-			// an image inside another document is changed by that document, which says so itself
-			if (document.uri.scheme === SCHEME) {
-				document.fileWatcher = embedded.onChange(document.uri, () => this.reloadDocument(document));
-			} else {
-				const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(document.uri.fsPath), path.basename(document.uri.fsPath)));
-				watcher.onDidChange(() => this.reloadDocument(document));
-				watcher.onDidCreate(() => this.reloadDocument(document));
-				watcher.onDidDelete(() => {
-					// If the file is deleted externally, keep the current view until reload or close.
-				});
-				document.fileWatcher = watcher;
-			}
+	getEditor(document: BitmapDocument) {
+		for (const editor of this.editors) {
+			if (editor.document === document)
+				return editor;
 		}
 	}
+	getEditorFor(uri: vscode.Uri) {
+		const key = uri.toString();
+		for (const editor of this.editors) {
+			if (editor.document.uri.toString() === key)
+				return editor;
+		}
+	}
+
+	static async open(name: string, image: bitmap.Image) {
+		const provider = this.provider;
+		const uri = vscode.Uri.from({scheme: 'untitled', path: '/'+ name}), key = uri.toString();
+		// already open from an earlier run: it shows the new one
+		const open = provider.getEditorFor(uri);
+		if (open) {
+			open.document.init(image);
+			await open.upload();
+		} else {
+			provider.pending.set(key, image);
+		}
+		await vscode.commands.executeCommand('vscode.openWith', uri, 'bitmap.viewer', {viewColumn: vscode.ViewColumn.Beside, preview: false});
+		provider.getEditorFor(uri)?.edited('New');
+	}
+
 }
-// x

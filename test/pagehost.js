@@ -46,7 +46,7 @@ function serve(script, width, height, bitmap, modules, programs) {
 				res.end(bitmap ? `<!DOCTYPE html><html><head>
 					<script type="importmap">${JSON.stringify({imports: {
 						'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/',
-						'@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/esm/browser.js', '@isopodlabs/binary': '/node_modules/@isopodlabs/binary/esm/index.js', '@isopodlabs/xml': '/node_modules/@isopodlabs/xml/esm/xml.js', '@isopodlabs/maths/linear': '/node_modules/@isopodlabs/maths/esm/linear.js',
+						'@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/esm/browser.js', '@isopodlabs/binary_fonts/curves': '/node_modules/@isopodlabs/binary_fonts/esm/curves.js', '@isopodlabs/binary': '/node_modules/@isopodlabs/binary/esm/index.js', '@isopodlabs/binary_ml/browser': '/node_modules/@isopodlabs/binary_ml/esm/browser.js', '@isopodlabs/xml': '/node_modules/@isopodlabs/xml/esm/xml.js', '@isopodlabs/maths/linear': '/node_modules/@isopodlabs/maths/esm/linear.js',
 						'@isopodlabs/maths/quaternion': '/node_modules/@isopodlabs/maths/esm/quaternion.js',
 					}})}</script>
 					<link rel="stylesheet" href="/node_modules/@isopodlabs/vscode_utils/assets/shared.css">
@@ -63,7 +63,7 @@ function serve(script, width, height, bitmap, modules, programs) {
 					${entry(script, modules, programs)}</body></html>` : `<!DOCTYPE html><html><head>
 					<script type="importmap">${JSON.stringify({imports: {
 						'@isopodlabs/vscode_utils/webview/': '/node_modules/@isopodlabs/vscode_utils/dist/webview/',
-						'@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/esm/browser.js', '@isopodlabs/binary': '/node_modules/@isopodlabs/binary/esm/index.js', '@isopodlabs/xml': '/node_modules/@isopodlabs/xml/esm/xml.js', '@isopodlabs/maths/linear': '/node_modules/@isopodlabs/maths/esm/linear.js',
+						'@isopodlabs/maths/vector': '/node_modules/@isopodlabs/maths/esm/vector.js', '@isopodlabs/maths/geometry': '/node_modules/@isopodlabs/maths/esm/geometry.js', '@isopodlabs/binary_fonts': '/node_modules/@isopodlabs/binary_fonts/esm/browser.js', '@isopodlabs/binary_fonts/curves': '/node_modules/@isopodlabs/binary_fonts/esm/curves.js', '@isopodlabs/binary': '/node_modules/@isopodlabs/binary/esm/index.js', '@isopodlabs/binary_ml/browser': '/node_modules/@isopodlabs/binary_ml/esm/browser.js', '@isopodlabs/xml': '/node_modules/@isopodlabs/xml/esm/xml.js', '@isopodlabs/maths/linear': '/node_modules/@isopodlabs/maths/esm/linear.js',
 						'@isopodlabs/maths/quaternion': '/node_modules/@isopodlabs/maths/esm/quaternion.js',
 					}})}</script>
 					<link rel="stylesheet" href="/assets/scad.css">
@@ -72,6 +72,11 @@ function serve(script, width, height, bitmap, modules, programs) {
 					<script>window.acquireVsCodeApi = () => ({postMessage: m => window.toHost(m)});</script>
 				</head><body><div id="main"><canvas id="viewport"></canvas><div id="scad-tooltip" class="hidden"></div><div id="scad-info"></div><pre id="scad-error" class="hidden"></pre></div>
 				<script type="module" src="/out/webview/${script}"></script></body></html>`);
+				return;
+			}
+			if (served.has(url)) {
+				res.writeHead(200, {'content-type': 'application/octet-stream'});
+				fs.createReadStream(served.get(url)).pipe(res);
 				return;
 			}
 			const file = path.join(ROOT, url);
@@ -96,6 +101,10 @@ function unpack(v) {
 	return un(v);
 }
 const unpackInPage = new Function('v', `window.postMessage((${unpack})(v), '*');`);
+
+// files too big to cross as the page's messages do (a neural network's weights), served at a path of their own: serveFile(path, file)
+const served = new Map();
+const serveFile = (url, file) => served.set(url, file);
 
 const pause = ms => new Promise(r => setTimeout(r, ms));
 
@@ -165,4 +174,4 @@ async function openPage({script, width = 400, height = 300, host = () => {}, pro
 	};
 }
 
-module.exports = { openPage, asset, pause };
+module.exports = { openPage, asset, pause, serveFile };

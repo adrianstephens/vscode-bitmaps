@@ -427,7 +427,10 @@ async function setModel(code: string, data: Float32Array) {
 	const padded	= new Float32Array(rows * 1024 * 4);
 	padded.set(data);
 
-	batchTexture ??= canvas3d.createTexture(1024, rows, padded, {format: 'rgba32f', min: 'nearest', mag: 'nearest'});
+	// (the last model's is no use to this one, whatever its size: the data is what the shader walks)
+	if (batchTexture)
+		canvas3d.deleteTexture(batchTexture);
+	batchTexture = canvas3d.createTexture(1024, rows, padded, {format: 'rgba32f', min: 'nearest', mag: 'nearest'});
 }
 
 //--- messages ----------------------------------------------------------------

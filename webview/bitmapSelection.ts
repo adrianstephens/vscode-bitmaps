@@ -3,10 +3,12 @@
 // finds -- with soft (antialiased) edges, and can be added to, taken from, intersected and inverted.
 // Nothing here touches the DOM, so it can be run (and tested) outside a webview.
 
-import { float2 } from '@isopodlabs/maths/vector';
-import { curveVertex, curveFlatten, ON_BEGIN, ON_CURVE, OFF_ARC, ON_ARC } from '@isopodlabs/binary_fonts';
-import { type RGBAPixels } from './opengl.ts';
-import { signedDistance } from './raster.ts';
+import { float2, float3x3 } from '@isopodlabs/maths/vector';
+import { curveFlatten, curveVertex } from '@isopodlabs/binary_fonts/curves';
+
+import { Pixels } from './opengl.ts';
+import { Shape, signedDistance, roundOut } from './raster.ts';
+import { Mode } from './modes.ts'
 import { clamp01 } from './colour.ts';
 
 // how a mask is blurred in place (width, height and sigma given), which the caller does (on the GPU: see Painter.maskBlur)
@@ -17,12 +19,12 @@ export type SelectMode = 'replace' | 'add' | 'subtract' | 'intersect';
 
 const SUB = 4;	// sub-scanlines a pixel row is sampled at, for antialiasing
 
-export class Selection extends float2.extent {
+export class Selection extends Shape {
 	private loops?: number[][];
 
 	// `mask` is the coverage of each pixel of the box, row by row; without one the whole box is selected
-	constructor(area: float2.extent, readonly mask?: Uint8Array) {
-		super(area.min, area.max);
+	constructor(area: float2.extent, mask?: Uint8ClampedArray<ArrayBuffer>) {
+		super(area, mask);
 	}
 
 	get width()		{ return this.max.x - this.min.x; }
@@ -76,7 +78,7 @@ export class Selection extends float2.extent {
 			return undefined;
 
 		edges.sort((p, q) => p.y0 - q.y0);
-		const w = r - l, mask = new Uint8Array(w * (b - t));
+		const w = r - l, mask = new Uint8ClampedArray(w * (b - t));
 		const acc = new Float32Array(w + 2), diff = new Float32Array(w + 2);
 		let next = 0, active: Edge[] = [];
 
@@ -124,17 +126,13 @@ export class Selection extends float2.extent {
 		return new Selection(new float2.extent(float2(l, t), float2(r, b)), mask).trimmed();
 	}
 
-	static ellipse(area: float2.extent, size: float2) {
-		return Selection.fromPolygons([ellipsePoints(area)], size);
-	}
-
 	// a closed curve (each contour of it), as curve vertices; arcs and beziers are flattened to within `tolerance` pixels
 	static curve(curve: curveVertex[], size: float2, tolerance = 0.1) {
 		return Selection.fromPolygons(curveFlatten(curve, tolerance), size);
 	}
 
 	// the pixels within `tolerance` of the one at (sx, sy) in each channel: those connected to it, or all of them
-	static wand(image: RGBAPixels, sx: number, sy: number, tolerance: number, contiguous: boolean) {
+	static wand(image: Pixels<4>, sx: number, sy: number, tolerance: number, contiguous: boolean) {
 		const {data: data, width, height} = image;
 		if (sx < 0 || sy < 0 || sx >= width || sy >= height)
 			return undefined;
@@ -188,7 +186,7 @@ export class Selection extends float2.extent {
 		}
 		if (r <= l)
 			return undefined;
-		const w = r - l, mask = new Uint8Array(w * (b - t));
+		const w = r - l, mask = new Uint8ClampedArray(w * (b - t));
 		for (let y = t; y < b; y++)
 			mask.set(found.subarray(y * width + l, y * width + r), (y - t) * w);
 		return new Selection(new float2.extent(float2(l, t), float2(r, b)), mask);
@@ -210,7 +208,7 @@ export class Selection extends float2.extent {
 			return undefined;
 
 		const {x: w, y: h} = ext.size();
-		const mask = new Uint8Array(w * h);
+		const mask = new Uint8ClampedArray(w * h);
 		for (let y = 0; y < h; y++) {
 			const y1 = y + ext.min.y;
 			for (let x = 0; x < w; x++) {
@@ -225,7 +223,7 @@ export class Selection extends float2.extent {
 	// everything in a width x height image that this is not
 	invert(size: float2) {
 		const {x: width, y: height} = size;
-		const mask = new Uint8Array(width * height);
+		const mask = new Uint8ClampedArray(width * height);
 		for (let y = 0; y < height; y++)
 			for (let x = 0; x < width; x++)
 				mask[y * width + x] = 255 - this.at(x, y);
@@ -278,7 +276,7 @@ export class Selection extends float2.extent {
 			for (let x = l; x < r; x++)
 				mask[(y - t) * w + (x - l)] = this.at(x, y);
 		return {l, t, w, h, mask, make: (f: Float32Array, fn: (v: number) => number) => {
-			const out = new Uint8Array(w * h);
+			const out = new Uint8ClampedArray(w * h);
 			for (let i = 0; i < out.length; i++)
 				out[i] = Math.round(Math.min(255, Math.max(0, fn(f[i]))));
 			return new Selection(new float2.extent(float2(l, t), float2(r, b)), out).trimmed();
@@ -313,7 +311,7 @@ export class Selection extends float2.extent {
 			return undefined;
 		if (x0 === 0 && y0 === 0 && x1 === w && y1 === h)
 			return this;
-		const nw = x1 - x0, out = new Uint8Array(nw * (y1 - y0));
+		const nw = x1 - x0, out = new Uint8ClampedArray(nw * (y1 - y0));
 		for (let y = y0; y < y1; y++)
 			out.set(mask.subarray(y * w + x0, y * w + x1), (y - y0) * nw);
 		return new Selection(new float2.extent(this.min.add(float2(x0, y0)), this.min.add(float2(x1, y1))), out);
@@ -322,6 +320,17 @@ export class Selection extends float2.extent {
 	// A selection that is a whole box (no pixel of it partly selected)
 	get isRect() {
 		return !this.mask || this.mask.every(v => v === 255);
+	}
+
+	// The selection with what it selects carried by `m` (from the image's coordinates)
+	transform(m: float3x3) {
+		const box	= m.transformExtent(this);
+		if (box) {
+			const ext		= roundOut(box, 1e-6);
+			const coverage	= this.mask ?? new Uint8ClampedArray(this.width * this.height).fill(255);
+			const warped	= Mode.warpPixels(Pixels(coverage, this.width, this.height, 1), m.matmul(float3x3.translate(this.min)), ext);	// (the coverage's own coordinates start at the box's corner)
+			return new Selection(ext, warped.data as Uint8ClampedArray<ArrayBuffer>).trimmed();
+		}
 	}
 
 	// The edge between what is more than half selected and what is not, as closed loops of pixel corners: [x0, y0, x1, y1, ...]
@@ -373,34 +382,3 @@ export class Selection extends float2.extent {
 		return this.loops = loops;
 	}
 }
-
-//-----------------------------------------------------------------------------
-// shapes
-//-----------------------------------------------------------------------------
-/*
-export function ellipsePoints(area: float2.extent) {
-	const {x: cx, y: cy} = area.centre(), {x: rx, y: ry} = area.size().scale(0.5);
-	const n = Math.min(720, Math.max(24, Math.ceil(Math.PI * Math.max(rx, ry))));
-	return Array.from({length: n}, (_, i) => float2(cx + rx * Math.cos(2 * Math.PI * i / n), cy + ry * Math.sin(2 * Math.PI * i / n)));
-}
-*/
-
-export function ellipsePoints(area: float2.extent) {
-	const c = area.centre(), ry = area.max.y - c.y, x0 = area.min.x, x1 = area.max.x;
-
-	const ellipse: curveVertex[] = [
-		curveVertex(x0, c.y, ON_BEGIN),
-		curveVertex(x0, c.y - ry * 2, OFF_ARC),   // on the tangent line at the start, 2*ry away
-		curveVertex(x1, c.y - ry * 2, OFF_ARC),   // on the tangent line at the end,area.max.y away
-		curveVertex(x1, c.y, ON_CURVE),
-		curveVertex(x1, c.y + ry * 2, OFF_ARC),
-		curveVertex(x0, c.y + ry * 2, OFF_ARC),
-	];
-	return curveFlatten(ellipse, 0.1)[0];
-}
-
-//-----------------------------------------------------------------------------
-// image processing for the modifiers
-//-----------------------------------------------------------------------------
-
-

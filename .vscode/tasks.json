@@ -34,6 +34,15 @@
 			"isBackground": true,
 		},
 		{
+			// what the web pages' launch configurations wait for (web/start.js): the scripts built, the evaluators bundled, and the server there.
+			// An ordinary task that finishes, not background ones that must each say they are ready.
+			"label": "web: start",
+			"type": "shell",
+			"command": "node web/start.js",
+			"problemMatcher": [],
+			"presentation": {"reveal": "silent", "panel": "shared", "clear": true}
+		},
+		{
 			"label": "Open Extension Dev Window",
 			"type": "shell",
 			"command": "NODE_PRESERVE_SYMLINKS=1 code --extensionDevelopmentPath=${workspaceFolder} --inspect-brk-extensions=9230 /Volumes/DevSSD/dev/github/openscad",

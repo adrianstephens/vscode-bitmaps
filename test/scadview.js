@@ -59,6 +59,14 @@ function sdfMessage(source) {
 		const samples = [...Array(15)].flatMap((_, i) => [...Array(12)].map((_, j) => [Math.round(W * (i + 0.5) / 15), Math.round(H * (j + 0.5) / 12)]));
 		const moved = samples.filter(([x, y]) => red(zoomed.at(x, y)) !== red(turned.at(x, y))).length;
 		check(moved > 5, `turning should change the picture: ${moved} of ${samples.length} samples changed`);
+		// a second model with a big union draws from its own data: the batch texture was once made only for the first, which a model after it then walked
+		await view.send(sdfMessage('for (i = [0:19]) color("green") translate([i * 5, 0, 0]) sphere(2);'));
+		await pause(600);
+		await view.send(sdfMessage('for (i = [0:19]) color("red") translate([i * 5, 0, 0]) cube(5.5, center = true);'));
+		await pause(600);
+		const second = await view.shot('scad-second-batch');
+		check(red(second.at(W >> 1, H >> 1)), `a second batched model should draw its own boxes: the middle is ${second.at(W >> 1, H >> 1)}`);
+		check(second.count(red) > 1500, `and as red as they are: ${second.count(red)} red pixels`);
 		console.log(`scad cube: tooltip ${JSON.stringify(tip.split('\n')[0])}; zoom ${before} -> ${zoomed.count(red)} red pixels, turn changed ${moved} samples`);
 	} finally {
 		await view.close();

@@ -12,7 +12,7 @@ import { Input, type InputLayer, type Drag } from './navigate.js';
 import { TransformMode, BoxTransform, modeChoices, transformIcons, HANDLE, carryPoint } from './transformbox.js';
 import { float2, float2x3, float3x3, lerp, mid } from '@isopodlabs/maths/vector';
 import { bezier2, bezier3, bezierClosest } from '@isopodlabs/maths/geometry';
-import { parseCurve, curveVertex, ON_BEGIN, ON_CURVE, ON_END, OFF_BEZ2, OFF_BEZ3 } from '@isopodlabs/binary_fonts';
+import { parseCurve, curveVertex, curveSimplify, ON_BEGIN, ON_CURVE, ON_END, OFF_BEZ2, OFF_BEZ3 } from '@isopodlabs/binary_fonts/curves';
 
 
 export type ShapeKind = 'rect' | 'ellipse' | 'line';
@@ -48,6 +48,38 @@ export function svgPath(p: Iterable<curveVertex>) {
 		End:	open => { d += open ? '' : 'Z'; },
 	});
 	return d;
+}
+
+// Fitting curves to what the pen and brush tools draw. (Async for the callers that wait on them, as they once waited on the extension.)
+
+// points as the editor has them with fewer of them, the outline kept within tol; quadratics only unless cubic curves are allowed
+export async function simplifyPoints(points: curveVertex[], tol: number, cubic: boolean) {
+	return curveSimplify(points, tol, {quadratic: !cubic});
+}
+
+// a stroke (x, y in pairs) as the points of an open path of cubics that follows it to within tol
+export async function fitStroke(stroke: number[], tol: number) {
+	// samples closer together than tol are only noise
+	const kept: float2[] = [];
+	for (let i = 0; i < stroke.length; i += 2) {
+		const p = float2(stroke[i], stroke[i + 1]);
+		if (!kept.length || p.sub(kept[kept.length - 1]).len() >= tol)
+			kept.push(p);
+		else if (i === stroke.length - 2)
+			kept[kept.length - 1] = p;
+	}
+	return kept.length < 2 ? [] : curveSimplify(kept.map((p, i) => curveVertex(p.x, p.y, i ? i === kept.length - 1 ? ON_END : ON_CURVE : ON_BEGIN)), tol, {corner: Math.PI / 3, noisy: true});
+}
+
+// runs of points (x, y in pairs), each closed or not, as curves that follow them to within tol, each one contour; the ends of a run that is
+// not closed are kept
+export async function fitRuns(runs: Float32Array[], closed: boolean[], tol: number) {
+	return runs.map((run, r) => {
+		const points: curveVertex[] = [], n = run.length / 2;
+		for (let i = 0; i < n; i++)
+			points.push(curveVertex(run[i * 2], run[i * 2 + 1], i === 0 ? ON_BEGIN : i === n - 1 && !closed[r] ? ON_END : ON_CURVE));
+		return n > 2 ? curveSimplify(points, tol, {corner: Math.PI / 3}) : points;
+	});
 }
 
 // where the contour of point i begins and ends (exclusive)
@@ -157,13 +189,36 @@ const curveOf = ({points}: Piece) => points.length === 4 ? new bezier3(points[0]
 
 // what is drawn and how points land, which a page may share between the editors it has over the same place
 // (the grid is one only if it is given: an editor over a picture that has its own has none)
-export class ViewOptions {
-	constructor(private values: Record<string, boolean> = {}) {}
-	has(name: string) { return name in this.values || name !== 'grid'; }
-	get(name: string) { return this.values[name] ?? DEFAULT_OPTIONS[name] ?? true; }
-	set(name: string, on: boolean) { this.values[name] = on; }
+
+interface ViewOption {
+	label:		string,
+	value:		boolean,
+	icon?:		string,
 }
-const DEFAULT_OPTIONS: Record<string, boolean> = {numbers: false, snap: false};
+export class ViewOptions {
+	private values: Record<string, ViewOption> = {};
+	constructor(values: Record<string, ViewOption | boolean>) {
+		for (const i in values) {
+			let v = values[i];
+			if (typeof v === 'boolean')
+				v = { value: v, label: i, icon: (cascadeIcons as any)[i]}
+			this.values[i] = {label: v.label, value: v.value, icon: v.icon ?? (cascadeIcons as any)[i]};
+		}
+	}
+	get keys()			{ return Object.keys(this.values); }
+	get(name: string)	{ return this.values[name]?.value ?? false; }
+	set(name: string, on: boolean) { this.values[name].value = on; }
+	label(name: string)	{ return this.values[name].label; }
+	icon(name: string)	{ return svgFace(this.values[name].icon ?? (cascadeIcons as any)[name]); }
+}
+
+export const DEFAULT_OPTIONS: Record<string, ViewOption> = {
+	outline:	{label: 'Outline', 			value: true,	icon: '<path d="M3 13C3 4 8 2 13 3C14 8 12 13 3 13Z"/>'},
+	polygon:	{label: 'Polygon', 			value: true,	icon: '<path d="M3 13L5 3L13 5L12 13Z" stroke-dasharray="2 1.5"/>'},
+	points:		{label: 'Points',			value: true,	icon: '<rect x="2" y="9" width="4" height="4"/><circle cx="11" cy="4.5" r="2"/><rect x="10" y="10" width="4" height="4"/>'},
+	numbers:	{label: 'Point numbers', 	value: false,	icon: '<path d="M4 3V13M2.5 4.5L4 3M8 5C8 2 13 2 13 5C13 8 8 9 8 13H13"/>'},
+	snap:		{label: 'Snap to the grid', value: false,	icon: '<path d="M2 14H14M2 14V2M5 14V11M8 14V11M11 14V11"/><circle cx="8" cy="6" r="2"/>'},
+};
 
 /** The grid's spacing at a scale (screen pixels to a unit): round numbers, 1, 2, 5 or 10 of a power of ten, at least `gap` pixels apart
  *  (and no finer than `least`), with every `every`th line major. */
@@ -173,8 +228,31 @@ export function gridSpacing(scale: number, gap = 12, least = 0) {
 	return {step, every: Math.round(step / 10 ** Math.floor(Math.log10(step))) === 5 ? 2 : 5};
 }
 
+export function gridDraw(view: View, w: number, h: number, {step, every} : {step: number, every: number}, yUp = false) {
+	const {t, s} = view;
+	let minor = '', major = '', labels = '';
+	const lines = (from: number, to: number, vertical: boolean, flip: number) => {
+		for (let k = Math.ceil(from / step); k <= Math.floor(to / step); k++) {
+			const v = clean(k * step), at = vertical ? v * s + t.x : v * flip * s + t.y;
+			const d = vertical ? `M${num(at)},0V${h}` : `M0,${num(at)}H${w}`;
+			if (k % every === 0) {
+				major += d;
+				labels += vertical ? `<text x="${num(at) + 3}" y="11">${v}</text>` : `<text class="right" x="${w - 3}" y="${num(at) - 3}">${v}</text>`;
+			} else
+				minor += d;
+		}
+	};
+	lines(-t.x / s, (w - t.x) / s, true, 1);
+	if (yUp)
+		lines(-(h - t.y) / s, t.y / s, false, -1);
+	else
+		lines(-t.y / s, (h - t.y) / s, false, 1);
+	return `<path class="insp-minor" d="${minor}"/><path class="insp-major" d="${major}"/><g class="insp-labels">${labels}</g>`;
+}
+
+
 export const icons = {
-	...transformIcons,
+//	...transformIcons,
 	transform:	'<path d="M4 4.5h8v7H4z"/><rect x="2.5" y="3" width="3" height="3"/><rect x="10.5" y="3" width="3" height="3"/><rect x="10.5" y="10" width="3" height="3"/><rect x="2.5" y="10" width="3" height="3"/>',
 	editPoints:	'<path d="M2 12 C5 2 11 2 14 12"/><rect x="1" y="11" width="3" height="3"/><rect x="12" y="11" width="3" height="3"/><circle cx="8" cy="4.5" r="1.3"/>',
 	view:		'<path d="M1 8 C4 3 12 3 15 8 C12 13 4 13 1 8Z"/><circle cx="8" cy="8" r="2"/>',
@@ -187,32 +265,16 @@ export const icons = {
 	align:		'<path d="M2 13L14 3"/><rect x="6" y="6" width="4" height="4"/><circle cx="3" cy="12" r="1.5"/><circle cx="13" cy="4" r="1.5"/>',
 	insertControl:'<path d="M2 13C2 5 8 3 14 3"/><circle cx="8" cy="4.5" r="1.6"/><rect x="1" y="12" width="3" height="3"/><rect x="12" y="1" width="3" height="3"/>',
 	fit:		'<path d="M2 6V2H6M10 2H14V6M14 10V14H10M6 14H2V10"/>',
-	grid:		cascadeIcons.grid,
-	outline:	'<path d="M3 13C3 4 8 2 13 3C14 8 12 13 3 13Z"/>',
-	polygon:	'<path d="M3 13L5 3L13 5L12 13Z" stroke-dasharray="2 1.5"/>',
-	points:		'<rect x="2" y="9" width="4" height="4"/><circle cx="11" cy="4.5" r="2"/><rect x="10" y="10" width="4" height="4"/>',
-	numbers:	'<path d="M4 3V13M2.5 4.5L4 3M8 5C8 2 13 2 13 5C13 8 8 9 8 13H13"/>',
-	snap:		'<path d="M2 14H14M2 14V2M5 14V11M8 14V11M11 14V11"/><circle cx="8" cy="6" r="2"/>',
-	metrics:	'<path d="M1 4H15M1 8H15M1 12H15" stroke-dasharray="3 2"/>',
-	fill:		'<path d="M3 13C3 4 8 2 13 3C14 8 12 13 3 13Z" fill="currentColor" fill-opacity="0.45"/>',
 };
 
-const VIEW_TOGGLES: Record<string, string> = {
-	outline:	'Outline', 
-	polygon:	'Polygon', 
-	points:		'Points',
-	numbers:	'Point numbers', 
-	grid:		'Grid',
-	snap:		'Snap to the grid', 
-	metrics:	'Metrics', 
-	fill:		'Fill',
-};
 
 // a transform under way: the box, and what it carries (the points from s on, as they were, or the element by a transform of its own);
 // for a warp, the points were cut finer first, and `before` is what they were
 interface TransformSet {box: BoxTransform, s: number, orig: curveVertex[], before?: curveVertex[], element?: ElementTransform};
 
 const WARP_CUTS = 4;	// what each piece of an outline is cut into for a warp, so that it bends as the warp does
+
+export interface View {t: float2, s: number};
 
 export abstract class PathEditor {
 	readonly svg	= createSVGElement('svg');
@@ -234,7 +296,6 @@ export abstract class PathEditor {
 	protected cubic		= false;			// whether cubic controls may be made
 	protected dragged?: {kind: ShapeKind, corners: [float2, float2]};	// the shape being dragged out, from corner to corner in world units
 	protected drag?: {at: float2, moved: boolean, point?: number, link?: {anchor: number, other: number, length: number}, custom?: DragHandler & {w: float2}, contour?: {s: number, e: number, orig: curveVertex[], w: float2, last?: float2, t?: float2, angle?: number}, rotated?: boolean};
-	protected extraViews: string[] = [];		// view options beyond the common ones
 	protected readonly cascade: Cascade;
 
 	private noticeTimer = 0;
@@ -255,7 +316,7 @@ export abstract class PathEditor {
 	get dragging() { return !!this.drag; }
 
 	// (own: the editor has the pointer over its drawing to itself; or the page puts it in the stack over something else)
-	constructor(readonly host: HTMLElement, readonly options = new ViewOptions({grid: true}), own = true) {
+	constructor(readonly host: HTMLElement, readonly options = new ViewOptions(DEFAULT_OPTIONS), own = true) {
 		this.cascade = new Cascade(host, () => this.only() ?? this.items());
 		this.svg.append(this.back, this.content, this.front);
 		host.appendChild(this.svg);
@@ -287,9 +348,7 @@ export abstract class PathEditor {
 	/** Draws what lies under the outline into the content group, which is in world units. */
 	protected updateContent(_g: SVGGElement) {}
 	/** Markup in screen units, drawn first: what the grid lies over. */
-	protected paper(_X: (x: number) => number, _Y: (y: number) => number, _w: number, _h: number): string { return ''; }
-	/** Markup in screen units, drawn over the grid and under the content. */
-	protected guides(_X: (x: number) => number, _Y: (y: number) => number, _w: number, _h: number): string { return ''; }
+	protected paper(_view: View, _w: number, _h: number): string { return ''; }
 	/** The outline drawn over the content, as path data in the points' own space. */
 	//protected outline(): string { return svgPath(this.points() ?? []); }
 	/** Markup drawn over everything, in screen units. */
@@ -446,41 +505,13 @@ export abstract class PathEditor {
 		if (this.xf && (!editable || !points || points.length < this.xf.s + this.xf.orig.length))
 			this.xf = undefined;
 		
-		const X = (x: number) => x * s + t.x, Y = (y: number) => y * s + t.y;
 		if (!this.lastBounds || this.lastBounds.w !== w || this.lastBounds.h !== h) {
 			this.svg.setAttribute('width', String(w));
 			this.svg.setAttribute('height', String(h));
 			this.lastBounds = {w, h};
 		}
 
-		let back = this.paper(X, Y, w, h);
-
-		// a grid of round numbers of the page's units, which points snap to
-		if (this.options.has('grid') && this.option('grid')) {
-			const {step, every} = this.gridStep = gridSpacing(s);
-			let minor = '', major = '', labels = '';
-			const lines = (from: number, to: number, vertical: boolean, flip: number) => {
-				for (let k = Math.ceil(from / step); k <= Math.floor(to / step); k++) {
-					const v = clean(k * step), at = vertical ? X(v) : Y(v * flip);
-					const d = vertical ? `M${num(at)},0V${h}` : `M0,${num(at)}H${w}`;
-					if (k % every === 0) {
-						major += d;
-						labels += vertical ? `<text x="${num(at) + 3}" y="11">${v}</text>` : `<text class="right" x="${w - 3}" y="${num(at) - 3}">${v}</text>`;
-					} else
-						minor += d;
-				}
-			};
-			lines(-t.x / s, (w - t.x) / s, true, 1);
-			if (this.yUp)
-				lines(-(h - t.y) / s, t.y / s, false, -1);
-			else
-				lines(-t.y / s, (h - t.y) / s, false, 1);
-			back += `<path class="insp-minor" d="${minor}"/><path class="insp-major" d="${major}"/><g class="insp-labels">${labels}</g>`;
-		}
-
-		if (this.option('metrics'))
-			back += this.guides(X, Y, w, h);
-		this.back.innerHTML = back;
+		this.back.innerHTML = this.paper(this.view, w, h);
 
 		this.content.setAttribute('transform', `translate(${num(t.x)} ${num(t.y)}) scale(${s})`);
 		this.updateContent(this.content);
@@ -1544,11 +1575,11 @@ export abstract class PathEditor {
 				face:		() => svgFace(icons.transform),
 				caption:	() => this.menuScope === 'element' && this.beginElementTransform() ? 'Transform shape' : this.pickedContour >= 0 ? 'Transform contour' : 'Transform outline',
 				children:	() => [
-					{...op('transform-free', icons.free, 'Free Transform (Enter applies, Esc cancels)', () => this.startTransform()), children: () => [this.modeItem()]},
-					op('flip-h', icons.flipH, 'Flip Horizontal', () => this.quickTransform('Flip horizontal', (c, p) => float2(2 * c.x - p.x, p.y))),
-					op('flip-v', icons.flipV, 'Flip Vertical', () => this.quickTransform('Flip vertical', (c, p) => float2(p.x, 2 * c.y - p.y))),
-					op('rotate-cw', icons.rotateCW, 'Rotate 90° Clockwise', () => this.quickTransform('Rotate clockwise', (c, p) => float2(c.x - (p.y - c.y), c.y + (p.x - c.x)))),
-					op('rotate-acw', icons.rotateACW, 'Rotate 90° Anticlockwise', () => this.quickTransform('Rotate anticlockwise', (c, p) => float2(c.x + (p.y - c.y), c.y - (p.x - c.x)))),
+					{...op('transform-free', transformIcons.free, 'Free Transform (Enter applies, Esc cancels)', () => this.startTransform()), children: () => [this.modeItem()]},
+					op('flip-h', transformIcons.flipH, 'Flip Horizontal', () => this.quickTransform('Flip horizontal', (c, p) => float2(2 * c.x - p.x, p.y))),
+					op('flip-v', transformIcons.flipV, 'Flip Vertical', () => this.quickTransform('Flip vertical', (c, p) => float2(p.x, 2 * c.y - p.y))),
+					op('rotate-cw', transformIcons.rotateCW, 'Rotate 90° Clockwise', () => this.quickTransform('Rotate clockwise', (c, p) => float2(c.x - (p.y - c.y), c.y + (p.x - c.x)))),
+					op('rotate-acw', transformIcons.rotateACW, 'Rotate 90° Anticlockwise', () => this.quickTransform('Rotate anticlockwise', (c, p) => float2(c.x + (p.y - c.y), c.y - (p.x - c.x)))),
 				],
 			});
 
@@ -1588,15 +1619,11 @@ export abstract class PathEditor {
 	private viewItem(): CascadeItem {
 		return {id: 'view', face: () => svgFace(icons.view), caption: () => 'View', children: () => [
 			this.op('fit', icons.fit, 'Fit (0)', () => this.fit()),
-			...this.viewNames().map(n => ({
-				...toggleItem(VIEW_TOGGLES[n], svgFace((icons as any)[n]), () => this.option(n), v => { this.options.set(n, v); this.draw(); }),
+			...this.options.keys.map(n => ({
+				...toggleItem(this.options.label(n), this.options.icon(n), () => this.option(n), v => { this.options.set(n, v); this.draw(); }),
 				id: 'view-' + n,
 			})),
 		]};
-	}
-
-	private viewNames() {
-		return [...(this.options.has('grid') ? ['grid'] : []), 'outline', 'polygon', 'points', 'numbers', 'snap', ...this.extraViews];
 	}
 
 	//--- the keyboard ---------------------------------------------------------------

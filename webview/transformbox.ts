@@ -39,8 +39,6 @@ export const rotateCursor = (() => {
 	return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 12 12, alias`;
 })();
 
-
-
 // where a point goes, and whether it goes anywhere (behind the horizon it does not)
 export function applyH(m: float3x3, x: number, y: number): float3 {
 	const p = m.mul(float3(x, y, 1));
