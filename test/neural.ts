@@ -10,7 +10,7 @@ import * as path from 'path';
 let bad = 0;
 const check = (ok: boolean, msg: string) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${msg}`); if (!ok) bad++; };
 
-const models = path.join(__dirname, '../../../packages/binary-ml/assistant/models');
+const models = path.join(__dirname, '../../../packages/binary_ml/assistant/models');
 const files: Record<string, string> = {'sam-encoder': 'mobile_sam_image_encoder.onnx', 'sam-decoder': 'sam_mask_decoder_single.onnx', 'lama': 'lama_fp32.onnx', 'esrgan': 'realesr_x4v3.onnx'};
 const file = (name: string) => name.startsWith('style-') ? `${name.slice(6)}-9.onnx` : files[name];
 

@@ -4,18 +4,18 @@ export type PixelStorage = Uint8ClampedArray<ArrayBuffer> | Float32Array<ArrayBu
 
 // N is the number of values a pixel holds, checked statically: Pixels<4> is a picture (rgba, the default
 // when channels is absent, so an ImageData or a bare {data, width, height} fits), Pixels<1> is a mask or a field
-export type Pixels<N extends number = 1 | 4> = {
-	data:	PixelStorage;
+export type Pixels<N extends number = 1 | 4, T = PixelStorage> = {
+	data:	T;
 	width:	number;
 	height: number;
 } & (N extends 4 ? {channels?: 4} : {channels: N});
 
-export type PixelsN<N extends number> = Pixels<N>;
+export type PixelsN<N extends number, T = PixelStorage> = Pixels<N, T>;
 
-export function Pixels<N extends 4 = 4>(data: PixelStorage, width: number, height: number, channels?: N): Pixels<N>;
-export function Pixels<N extends 1 | 4>(data: PixelStorage, width: number, height: number, channels: N): Pixels<N>;
+export function Pixels<N extends 4 = 4, T=PixelStorage>(data: T, width: number, height: number, channels?: N): Pixels<N, T>;
+export function Pixels<N extends 1 | 4, T=PixelStorage>(data: T, width: number, height: number, channels: N): Pixels<N, T>;
 export function Pixels(data: PixelStorage, width: number, height: number, channels?: 1 | 4) {
-	return {data, width, height, channels} as Pixels<any>;
+	return {data, width, height, channels};
 }
 //export function Pixels<N extends 1 | 4>(data: PixelStorage, width: number, height: number, channels?: N): Pixels<N> {
 //	return {data, width, height, channels} as Pixels<N>;
@@ -26,12 +26,12 @@ export const imageSize = (p: {width: number, height: number}) => float2(p.width,
 export const imageRect = (p: {width: number, height: number}) => float2.extent.fromSize(float2(0, 0), imageSize(p));
 export const unionRect = (a: float2.extent | undefined, b: float2.extent | undefined) => !a ? b : !b ? a : a.union(b);
 
-export function getPixel(image: Pixels, x: number, y: number): PixelStorage | undefined {
+export function getPixel<T extends PixelStorage>(image: Pixels<any, T>, x: number, y: number): T | undefined {
 	if (x < 0 || y < 0 || x >= image.width || y >= image.height)
 		return;
 	const channels	= image.channels ?? 4;
 	const offset	= (y * image.width + x) * channels;
-	return image.data.subarray(offset, offset + channels);
+	return image.data.subarray(offset, offset + channels) as T;
 }
 
 export function setPixel(image: Pixels<4>, x: number, y: number, colour: number[]) {
@@ -40,10 +40,10 @@ export function setPixel(image: Pixels<4>, x: number, y: number, colour: number[
 }
 
 // the pixels of a rectangle, packed
-export function readRect(image: Pixels, r: float2.extent) {
+export function readRect<T extends PixelStorage>(image: Pixels<any, T>, r: float2.extent): T {
 	const {x, y} = r.min, {x: w, y: h} = r.size();
 	const channels	= image.channels ?? 4;
-	const out = new Uint8ClampedArray(w * h * channels);
+	const out		= new (image.data.constructor as new (n: number) => T)(w * h * channels);
 	for (let j = 0; j < h; j++) {
 		const s = ((y + j) * image.width + x) * channels;
 		out.set(image.data.subarray(s, s + w * channels), j * w * channels);
@@ -51,7 +51,7 @@ export function readRect(image: Pixels, r: float2.extent) {
 	return out;
 }
 
-export function writeRect(image: Pixels, r: float2.extent, src: Uint8ClampedArray) {
+export function writeRect<T extends PixelStorage>(image: Pixels<any, T>, r: float2.extent, src: T) {
 	const {x, y} = r.min, {x: w, y: h} = r.size();
 	const channels	= image.channels ?? 4;
 	for (let j = 0; j < h; j++)
@@ -59,12 +59,12 @@ export function writeRect(image: Pixels, r: float2.extent, src: Uint8ClampedArra
 }
 
 
-export function resizePixels(image: Pixels, left: number, top: number, width: number, height: number): Pixels {
+export function resizePixels<N extends 1 | 4, T extends PixelStorage>(image: Pixels<N, T>, left: number, top: number, width: number, height: number): Pixels<N, T> {
 	if (left === 0 && top === 0 && image.width === width && image.height === height)
 		return image;
 
 	const channels = image.channels ?? 4;
-	const data = new Uint8ClampedArray(width * height * channels);
+	const data = new (image.data.constructor as new (n: number) => T)(width * height * channels);
 	const x0 = Math.max(0, left),	x1 = Math.min(width, left + image.width);
 	const y0 = Math.max(0, top),	y1 = Math.min(height, top + image.height);
 	for (let y = y0; y < y1; y++) {
@@ -72,7 +72,7 @@ export function resizePixels(image: Pixels, left: number, top: number, width: nu
 		if (x1 > x0)
 			data.set(image.data.subarray(s, s + (x1 - x0) * channels), (y * width + x0) * channels);
 	}
-	return {data: data, width, height};
+	return Pixels<N, T>(data, width, height, channels as N);
 }
 
 //-----------------------------------------------------------------------------

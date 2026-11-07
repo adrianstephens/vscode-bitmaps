@@ -79,11 +79,12 @@ export class Transformer {
 	// the transform unless it is already under way (a text layer's own transform cannot distort or warp: those modes are not offered it,
 	// which needs it made into pixels); a warp that has been bent is applied before another mode is begun
 	item(id: string, icon: string, caption: string, begin: () => TransformSession | undefined, affine = false): CascadeItem {
-		const mode = choiceItem('Mode', modeChoices(affine), () => this.mode, v => {
+		const mode = choiceItem({caption: 'Mode', get: () => this.mode, set: v => {
 			this.mode = v;
 			if (this.xf?.id !== id || !this.xf.box.setMode(v))
 				this.start(id, begin, affine);
-		}, true);
+			return false;
+		}}, modeChoices(affine));
 		return {
 			id,
 			face:		() => svgFace(icon),

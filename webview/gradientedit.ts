@@ -235,11 +235,15 @@ export abstract class GradientEditor {
 				id:			`${idp}-opacity`,
 			},
 			// what a gradient does beyond its last stop (and before its first)
-			...(this.spreads && index === g().p.stops.length - 1 ? [choiceItem('Spread', (['pad', 'reflect', 'repeat'] as const).map(v => ({
+			...(this.spreads && index === g().p.stops.length - 1 ? [choiceItem({
+				caption: 'Spread',
+				get: () => { const q = now(); return 'stops' in q ? q.spread : 'pad'; },
+				set: v => { const q = now(); if ('stops' in q) options.set({...q, spread: v}, true); }
+			}, (['pad', 'reflect', 'repeat'] as const).map(v => ({
 				value:		v,
 				face:		svgFace(`<rect x="2" y="3" width="12" height="10" fill="none"/><path d="${{pad: 'M6 8H2M10 8H14M6 5V11M10 5V11', reflect: 'M2 6L6 10L10 6L14 10', repeat: 'M2 10L6 6V10L10 6V10L14 6'}[v]}"/>`),
 				caption:	v,
-			})), () => { const q = now(); return 'stops' in q ? q.spread : 'pad'; }, v => { const q = now(); if ('stops' in q) options.set({...q, spread: v}, true); })] : []),
+			})))] : []),
 			// the ends are the gradient's own, so only the stops between them can go
 			...(index > 0 && index < g().p.stops.length - 1 ? [op(`${idp}-remove`, '<circle cx="8" cy="8" r="5"/><path d="M5.5 8H10.5"/>', 'Remove this stop', () => {
 				const q = g().p, i = g().i;

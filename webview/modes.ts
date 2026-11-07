@@ -45,7 +45,7 @@ export function shader(type: shaderType, geometry = rectGeometry) {
 export async function loadPrograms() {
 	programBG		= await shader('bg');
 	programWarp		= await shader('warp');
-	for (const name of ['blur', 'levels', 'convolve', 'gradient', 'flatten', 'ink'] as const)
+	for (const name of ['blur', 'levels', 'convolve', 'gradient', 'mix', 'flatten', 'ink'] as const)
 		filterPrograms[name] = await shader(name);
 	programLayer	= await shader('layer', gridGeometry(32));
 	programLayer.use({u_span: [0, 0, 1, 1]});	// (all of each layer, unless a warp says otherwise)
@@ -304,10 +304,8 @@ export abstract class Mode implements PaintHost {
 		return mergeItems([...painter.menuItems()]);
 	}
 	cloneSource(at: float2, all: boolean): CloneSource | undefined {	// what the clone stamp copies from: what the tools draw on, as it is then
-		return {
-			from:	this.target(),
-			at
-		};
+		const from = this.target();
+		return from && {at, from};
 	}
 	changed(changed: Pixels<4>, rect?: float2.extent) {	// pixels of an image have changed
 		this.redraw();
@@ -539,12 +537,9 @@ export abstract class AtlasMode extends PanMode {
 		return this.layer ? asRGBA(getPixel(this.layer, x, y)) : undefined;
 	}
 	// the slice it was pointed at on, whichever is drawn on
-	override cloneSource(at: float2, all: boolean) {
+	override cloneSource(at: float2, all: boolean): CloneSource | undefined {
 		const i = this.layer ? this.layers.indexOf(this.layer) : -1;
-		return i < 0 ? undefined : {
-			from: this.layers[i],
-			at
-		};
+		return i < 0 ? undefined : {at, from: this.layers[i]};
 	}
 
 	// the slice (or face) `i` has these pixels on the GPU
@@ -638,7 +633,8 @@ export abstract class AtlasMode extends PanMode {
 
 // A layer or slice is chosen from a strip of them all as thumbnails (the top first), each coming out with more to be done
 // to it, and a layer dragged to another place in the strip is moved there; or by the wheel on the icon, which shows the
-// one chosen
+// one chosen. A key with others `inside` it (a group of layers) has their strip come out of it, before what is done to it; the
+// wheel goes through them all, each group after what is in it.
 export function layerChooser<K>(caption: string,
 	keys:		()					=> K[],
 	current:	()					=> K,
@@ -649,36 +645,36 @@ export function layerChooser<K>(caption: string,
 	highlight:	(k: K | undefined)	=> void,
 	drag?:		(k: K)				=> CascadeItem['drag'],
 	extra:		CascadeItem[] = [],
-	topFirst = true
+	topFirst = true,
+	inside?:	(k: K)				=> K[] | undefined,
 ): CascadeItem {
 	const id = caption.toLowerCase();
+	const all = (ks: K[]): K[] => ks.flatMap(k => [...all(inside?.(k) ?? []), k]);
+	const strip = (ks: K[]): CascadeItem[] => (topFirst ? ks.slice().reverse() : ks).map(k => {
+		const children = more(k), within = inside?.(k);
+		return {
+			id:			`${id}-${ks.indexOf(k)}`,		// (by its place in its strip, the bottom one 0)
+			face:		() => face(k),
+			caption:	() => name(k),
+			active:		() => all([k]).includes(current()),
+			select:		() => { set(k); },
+			children:	(children || within) && (() => [...within ? strip(within) : [], ...children ?? []]),
+			drag:		drag?.(k),
+			hover:		(on: boolean) => highlight(on ? k : undefined),
+		};
+	});
 	return {
 		id,
 		face:		() => face(current()),
 		caption:	() => `${caption}: ${name(current())} (scroll)`,
 		wheel:		steps => {
-			const all = keys(), was = all.indexOf(current()), delta = Math.round(steps);
-			const now = Math.min(all.length - 1, Math.max(0, was + delta));
+			const ks = all(keys()), was = ks.indexOf(current()), delta = Math.round(steps);
+			const now = Math.min(ks.length - 1, Math.max(0, was + delta));
 			if (now !== was)
-				set(all[now]);
+				set(ks[now]);
 			return now === was + delta ? delta : steps;
 		},
-		children:	() => [
-			...(topFirst ? keys().slice().reverse() : keys()).map(k => {
-				const children = more(k);
-				return {
-					id:			`${id}-${keys().indexOf(k)}`,		// (by its place, the bottom one 0)
-					face:		() => face(k),
-					caption:	() => name(k),
-					active:		() => current() === k,
-					select:		() => { set(k); },
-					children:	children && (() => children),
-					drag:		drag?.(k),
-					hover:		(on: boolean) => highlight(on ? k : undefined),
-				};
-			}),
-			...extra,
-		],
+		children:	() => [...strip(keys()), ...extra],
 	};
 }
 

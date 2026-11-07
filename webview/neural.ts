@@ -13,8 +13,15 @@ import { Mode, working } from './modes.js';
 import { Pixels } from './opengl.js';
 import { svgFace, type CascadeItem } from './cascade.js';
 
-export const styles = ['mosaic', 'candy', 'rain-princess', 'udnie', 'pointilism'] as const;
-export type Style = typeof styles[number];
+export const styles = {
+	mosaic:				'Mosaic',
+	candy:				'Candy',
+	'rain-princess':	'Rain Princess',
+	udnie:				'Udnie',
+	pointilism:			'Pointillism'
+}  as const;
+
+export type Style = keyof typeof styles;
 
 // A part of a picture (x, y, w, h) carried to be toW x toH, by the same warp as any other scaling: bilinear, and filtered where it is shrunk
 function scaled(image: Pixels<4>, x: number, y: number, w: number, h: number, toW: number, toH: number) {
@@ -143,7 +150,12 @@ async function mask(image: Pixels<4>, x: number, y: number) {
 function queued<T>(label: string, work: () => Promise<T>): Promise<T | undefined> {
 	const result = queue.then(() => working(label, progress => {
 		report = progress;
-		return work().finally(() => report = undefined);
+		return work().finally(() => {
+			report = undefined;
+			// (what the networks' runs kept for reuse is given back: on a Mac, the GPU's memory is the machine's)
+			for (const s of sessions.values())
+				s.then(s => s.trim(), () => {});
+		});
 	}));
 	queue = result.catch(() => {});
 	return result.catch(e => {
@@ -337,11 +349,11 @@ const STYLE_SIZE = 1024;	// the longest side the picture is given to the network
 // The picture painted in a style. The network takes colours 0..255, and sizes which are
 // multiples of 4 (it halves twice and doubles twice), so the picture is resampled to that and back.
 async function painted(image: Pixels<4>, style: Style) {
-	const net = await session(`style-${style}`);
+	const net	= await session(`style-${style}`);
 	const {width: W, height: H} = image, scale = Math.min(1, STYLE_SIZE / Math.max(W, H));
-	const w = Math.max(4, Math.round(W * scale / 4) * 4), h = Math.max(4, Math.round(H * scale / 4) * 4);
-	const src = image.data instanceof Uint8ClampedArray ? image.data : Uint8ClampedArray.from(image.data, v => v * 255);
-	const rgba = scaled(Pixels(src, W, H, 4), 0, 0, W, H, w, h).data, wh = w * h, plane = new Float32Array(3 * wh);
+	const w		= Math.max(4, Math.round(W * scale / 4) * 4), h = Math.max(4, Math.round(H * scale / 4) * 4);
+	const src	= image.data instanceof Uint8ClampedArray ? image.data : Uint8ClampedArray.from(image.data, v => v * 255);
+	const rgba	= scaled(Pixels(src, W, H, 4), 0, 0, W, H, w, h).data, wh = w * h, plane = new Float32Array(3 * wh);
 	for (let i = 0; i < wh; i++) {
 		plane[i]			= rgba[i * 4];
 		plane[wh + i]		= rgba[i * 4 + 1];
@@ -416,72 +428,113 @@ function planes(image: Pixels<4>, size: number) {
 	return {data: out, w, h};
 }
 
-// a picture's features (512 planes at an eighth of its size)
-async function features(image: {data: Float32Array, w: number, h: number}, progress: ReturnType<typeof stage>) {
-	const out = await (await encoder()).run({in: new onnx_run.Tensor('f32', [1, 3, image.h, image.w], image.data)}, ['out'], progress).then(r => r.out);
-	const f = (('read' in out ? await out.read() : out) as InstanceType<typeof onnx_run.Tensor>).data as Float32Array;
-	if ('free' in out)
-		out.free();
-	return f;
+// Both networks are the same everywhere (what each makes depends only on what is near it, as far as the network reaches), so each is given
+// a picture a tile at a time, with a margin of what is round it: what it needs at once is then the same, whatever the picture's size. The
+// margin is more than either reaches (the encoder sees 34 pixels each way, the decoder 30), and is whole eighths, so that its pools and
+// resamplings fall as they would for the picture.
+const ADAIN_TILE = 256, ADAIN_MARGIN = 40;	// (a tile of 256 needs 0.7 GB of the GPU at once)
+
+// A network run on C planes of W x H a tile at a time, its output `ratio` times the size (an eighth, or 8 times): `core` is given each tile's
+// output (ow x oh) with where in it the tile is (left, top, w x h), and where in the whole output that goes (x0, y0).
+async function tiled(net: onnx_gpu.GpuSession, x: Float32Array, C: number, W: number, H: number, ratio: number, from: number, to: number,
+	core: (out: Float32Array, ow: number, oh: number, left: number, top: number, w: number, h: number, x0: number, y0: number) => void) {
+	const size = ADAIN_TILE * Math.min(1, 1 / ratio), margin = ADAIN_MARGIN * Math.min(1, 1 / ratio), span = size + 2 * margin;	// (in pixels of the picture)
+	const n = Math.ceil(W / size) * Math.ceil(H / size);
+	let k = 0;
+	for (let y0 = 0; y0 < H; y0 += size) {
+		for (let x0 = 0; x0 < W; x0 += size, k++) {
+			const x1 = Math.min(W, x0 + size), y1 = Math.min(H, y0 + size);
+			const ex0 = Math.max(0, Math.min(x0 - margin, W - span)), ex1 = Math.min(W, ex0 + span), ey0 = Math.max(0, Math.min(y0 - margin, H - span)), ey1 = Math.min(H, ey0 + span);
+			const w = ex1 - ex0, h = ey1 - ey0, piece = new Float32Array(C * w * h);
+			for (let c = 0; c < C; c++)
+				for (let y = 0; y < h; y++)
+					piece.set(x.subarray(c * W * H + (ey0 + y) * W + ex0, c * W * H + (ey0 + y) * W + ex1), (c * h + y) * w);
+			const out = await net.run({in: new onnx_run.Tensor('f32', [1, C, h, w], piece)}, ['out'], stage(from + (to - from) * k / n, from + (to - from) * (k + 1) / n)).then(r => r.out);
+			const data = (('read' in out ? await out.read() : out) as InstanceType<typeof onnx_run.Tensor>).data as Float32Array;
+			if ('free' in out)
+				out.free();
+			core(data, w * ratio, h * ratio, (x0 - ex0) * ratio, (y0 - ey0) * ratio, (x1 - x0) * ratio, (y1 - y0) * ratio, x0 * ratio, y0 * ratio);
+		}
+	}
 }
 
-// each feature's mean and spread (with the 1e-5 the network was trained with)
-function moments(f: Float32Array, channels: number) {
-	const n = f.length / channels, mean = new Float32Array(channels), std = new Float32Array(channels);
-	for (let c = 0; c < channels; c++) {
-		let s = 0, ss = 0;
-		for (let i = c * n; i < (c + 1) * n; i++)
-			s += f[i];
-		const m = s / n;
-		for (let i = c * n; i < (c + 1) * n; i++)
-			ss += (f[i] - m) ** 2;
-		mean[c] = m;
-		std[c] = Math.sqrt(ss / Math.max(1, n - 1) + 1e-5);
+const CHANNELS = 512;
+
+// each feature's mean and spread (with the 1e-5 the network was trained with), from its sums
+type Sums = {s: Float64Array, ss: Float64Array, n: number};
+const sums = (): Sums => ({s: new Float64Array(CHANNELS), ss: new Float64Array(CHANNELS), n: 0});
+function moments({s, ss, n}: Sums) {
+	const mean = new Float32Array(CHANNELS), std = new Float32Array(CHANNELS);
+	for (let c = 0; c < CHANNELS; c++) {
+		mean[c] = s[c] / n;
+		std[c] = Math.sqrt(Math.max(0, ss[c] - s[c] * s[c] / n) / Math.max(1, n - 1) + 1e-5);
 	}
 	return {mean, std};
 }
 
+// a picture's features (512 planes at an eighth of its size), added to `into`'s sums, and kept if `keep`
+async function features(image: {data: Float32Array, w: number, h: number}, into: Sums, keep: boolean, from: number, to: number) {
+	const fw = image.w / 8, fh = image.h / 8, f = keep ? new Float32Array(CHANNELS * fw * fh) : undefined;
+	await tiled(await encoder(), image.data, 3, image.w, image.h, 1 / 8, from, to, (out, ow, oh, left, top, w, h, x0, y0) => {
+		for (let c = 0; c < CHANNELS; c++) {
+			let s = 0, ss = 0;
+			for (let y = 0; y < h; y++) {
+				const row = out.subarray((c * oh + top + y) * ow + left, (c * oh + top + y) * ow + left + w);
+				for (const v of row) {
+					s += v;
+					ss += v * v;
+				}
+				f?.set(row, (c * fh + y0 + y) * fw + x0);
+			}
+			into.s[c] += s;
+			into.ss[c] += ss;
+		}
+		into.n += w * h;
+	});
+	return f;
+}
+
 // what is kept of the last pictures encoded: a style's moments at each scale, and the features of the picture last painted
 const styleMoments = new WeakMap<Pixels<4>, Map<number, ReturnType<typeof moments>>>();
-let lastContent: {image: Pixels<4>, w: number, h: number, f: Float32Array} | undefined;
-
-const CHANNELS = 512;
+let lastContent: {image: Pixels<4>, w: number, h: number, f: Float32Array, moments: ReturnType<typeof moments>} | undefined;
 
 // The picture painted in the manner of another, whose marks are as big as they are when it is `scale` times the size of the picture
 async function adain(image: Pixels<4>, style: Pixels<4>, scale: number) {
 	const {width: W, height: H} = image, size = Math.min(STYLE_SIZE, Math.max(W, H));
-	const content = lastContent?.image === image ? lastContent : (() => {
-		const p = planes(image, size);
-		return {image, w: p.w, h: p.h, p};
-	})();
-	const f = 'f' in content ? content.f : await features(content.p, stage(0, 0.45));
-	lastContent = {image, w: content.w, h: content.h, f};
+	if (lastContent?.image !== image) {
+		const p = planes(image, size), into = sums();
+		const f = (await features(p, into, true, 0, 0.45))!;
+		lastContent = {image, w: p.w, h: p.h, f, moments: moments(into)};
+	}
+	const {w, h, f, moments: c} = lastContent;
 
 	let byScale = styleMoments.get(style);
 	if (!byScale)
 		styleMoments.set(style, byScale = new Map());
 	let s = byScale.get(scale);
 	if (!s) {
-		const p = planes(style, Math.max(64, Math.min(2048, Math.round(size * scale))));
-		byScale.set(scale, s = moments(await features(p, stage(0.45, 0.6)), CHANNELS));
+		const into = sums();
+		await features(planes(style, Math.max(64, Math.min(2048, Math.round(size * scale)))), into, false, 0.45, 0.6);
+		byScale.set(scale, s = moments(into));
 	}
 
 	// the picture's features with the style's moments
-	const c = moments(f, CHANNELS), n = f.length / CHANNELS, t = new Float32Array(f.length);
+	const n = f.length / CHANNELS, t = new Float32Array(f.length);
 	for (let k = 0; k < CHANNELS; k++) {
 		const a = s.std[k] / c.std[k], b = s.mean[k] - c.mean[k] * a;
 		for (let i = k * n; i < (k + 1) * n; i++)
 			t[i] = f[i] * a + b;
 	}
-	const {w, h} = lastContent;
-	const out = await (await decoder()).run({in: new onnx_run.Tensor('f32', [1, CHANNELS, h / 8, w / 8], t)}, ['out'], stage(0.6, 1)).then(r => r.out);
-	const result = (('read' in out ? await out.read() : out) as InstanceType<typeof onnx_run.Tensor>).data as Float32Array;
-	if ('free' in out)
-		out.free();
+	const art = new Uint8ClampedArray(w * h * 4);
+	await tiled(await decoder(), t, CHANNELS, w / 8, h / 8, 8, 0.6, 1, (out, ow, oh, left, top, tw, th, x0, y0) => {
+		const plane = ow * oh;
+		for (let y = 0; y < th; y++)
+			for (let x = 0; x < tw; x++) {
+				const i = (top + y) * ow + left + x;
+				art.set([out[i] * 255 + 0.5, out[plane + i] * 255 + 0.5, out[2 * plane + i] * 255 + 0.5, 255], ((y0 + y) * w + x0 + x) * 4);
+			}
+	});
 
-	const wh = w * h, art = new Uint8ClampedArray(wh * 4);
-	for (let i = 0; i < wh; i++)
-		art.set([result[i] * 255 + 0.5, result[wh + i] * 255 + 0.5, result[2 * wh + i] * 255 + 0.5, 255], i * 4);
 	const src = image.data as Uint8ClampedArray;
 	const big = w === W && h === H ? art : scaled(Pixels(art, w, h, 4), 0, 0, w, h, W, H).data;
 	for (let i = 0; i < W * H; i++)

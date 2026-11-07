@@ -20,6 +20,7 @@ const shaders = {
 	'blur':		['bitmap.vert',		'blur.frag'],
 	'levels':	['bitmap.vert',		'levels.frag'],
 	'gradient':	['bitmap.vert',		'gradient.frag'],
+	'mix':		['bitmap.vert',		'mix.frag'],
 	'convolve':	['bitmap.vert',		'convolve.frag'],
 	'flatten':	['bitmap.vert',		'flatten.frag'],
 	'ink':		['bitmap.vert',		'ink.frag'],
@@ -33,6 +34,12 @@ const models = {
 	'sam-decoder':	'https://huggingface.co/Acly/MobileSAM/resolve/main/sam_mask_decoder_single.onnx',
 	'lama':			'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx',
 	'esrgan':		'https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx',
+	// (github.com/.../raw redirects here, but sends an empty Access-Control-Allow-Origin on the way, which a page rejects)
+	...Object.fromEntries(['mosaic', 'candy', 'rain-princess', 'udnie', 'pointilism'].map(style =>
+		[`style-${style}`, `https://media.githubusercontent.com/media/onnx/models/main/validated/vision/style_transfer/fast_neural_style/model/${style}-9.onnx`])),
+	// GitHub's release downloads send no CORS headers, so a page can't fetch them: web/serve.js fetches them for it
+	'adain-vgg':	'/models/vgg_normalised.pth',
+	'adain-decoder':	'/models/decoder.pth',
 };
 
 const text	= async name => { const r = await fetch(`../assets/${name}`); if (!r.ok) throw new Error(`${name}: ${r.status}`); return r.text(); };

@@ -15,12 +15,13 @@ import { isText, TextEditor, textIcon, newTextLayer, carryText } from './textedi
 
 import { Pixels, PixelStorage, imageRect, imageSize, getPixel, resizePixels, Canvas3D, ShaderProgram, Offscreen } from './opengl.js';
 import { Selection } from './bitmapSelection.js';
-import { Transformer, type TransformSession } from './transform.js';
+import { type TransformSession } from './transform.js';
 import { SheetFan, type SheetFanHost, type Placement } from './sheetfan.js';
 import { type CascadeItem, type CascadeDrag, opItem, valueItem, sliderItem, toggleItem, svgFace, swatchFace, icons as cascadeIcons, reversed } from './cascade.js';
 import { Dropped, canvas3d, programBG, programLayer, blank, shader, planeMvp, flatView, menuIcon, viewToggle, PictureMode, layerChooser, mode, history } from './modes.js';
 import type { LayerData } from './bitmap.js';
-import { upscale, upscaleItem } from './neural.js';
+import type { CloneSource } from './paint.js';
+import { upscale } from './neural.js';
 
 // what an editor over the picture makes of a layer: its blocks, and its pixels if it makes them (a shape's or text's, not a vector mask's)
 export type ShapeState = Pick<Layer, 'blocks'> & Partial<Pick<PixelLayer, 'image' | 'left' | 'top'>>;
@@ -67,7 +68,7 @@ interface LayerBase {
 	name:		string;
 	opacity:	number;		// 0..1
 	visible:	boolean;
-	blend:		BLEND_MODE;		// the file's blend mode: a key of BLEND_MODES, or any other, which is normal
+	blend:		BLEND_MODE;		// the file's blend mode: a key of BLEND_MODES, or any other, which is normal (or a group's 'pass')
 	mask?:		LayerMask;
 	vectorMaskDensity?:	number;		// and the vector mask's (which is in its blocks), likewise
 	vectorMaskFeather?:	number;
@@ -89,34 +90,90 @@ interface AdjustmentLayer extends LayerBase {
 	adjust?:	Adjustment;
 }
 
-export type Layer = PixelLayer | AdjustmentLayer;
+// Layers made one: they are composed on their own, and that goes over what is below with the group's blend mode, opacity and masks;
+// or, passing through (blend 'pass'), they go straight over what is below as if they were not grouped, and the group's opacity and
+// masks say how much of what they made shows. (Its blocks have the file's section block, which is written again from `blend` and `open`.)
+export interface GroupLayer extends LayerBase {
+	kind:		'group';
+	layers:		Layer[];		// bottom first
+	open:		boolean;		// as the file had it: open in Photoshop's layers panel
+}
+
+export type Layer = PixelLayer | AdjustmentLayer | GroupLayer;
 
 // the layer if it has pixels
-const pixelLayer = (layer: Layer | undefined) => layer?.kind === 'adjustment' ? undefined : layer;
+const pixelLayer = (layer: Layer | undefined) => layer?.kind === 'adjustment' || layer?.kind === 'group' ? undefined : layer;
 
-/** What kind of layer a file's blocks make. */
-function layerKind(blocks: psd.LayerBlocks | undefined): Layer['kind'] {
-	const key = adjustmentKey(blocks);
-	return key ? 'adjustment' : isText(blocks) ? 'text' : isShape(blocks) ? 'shape' : 'image';
+/** What kind of layer a file's blocks make (a group's end is not a layer, but where the layers of one begin). */
+function layerKind(blocks: psd.LayerBlocks | undefined): Layer['kind'] | 'end' {
+	const section = (blocks?.lsct ?? blocks?.lsdk)?.type;
+	return section === 1 || section === 2 ? 'group' : section === 3 ? 'end' : adjustmentKey(blocks) ? 'adjustment' : isText(blocks) ? 'text' : isShape(blocks) ? 'shape' : 'image';
 }
+
+// The layers, and in each group its layers, each as `f` makes it, numbered as LayerStack.all has them (a group is given its layers
+// as they are made, and is the same group if they are the same)
+function mapLayers(layers: Layer[], f: (layer: Layer, i: number) => Layer): Layer[] {
+	let i = 0;
+	const map = (list: Layer[]): Layer[] => list.map(l => {
+		if (l.kind !== 'group')
+			return f(l, i++);
+		const inner = map(l.layers);
+		return f(inner.some((x, j) => x !== l.layers[j]) ? {...l, layers: inner} : l, i++);
+	});
+	return map(layers);
+}
+
+// every layer, bottom first, each group after its layers (as a file has them)
+function allLayers(layers: Layer[]): Layer[] {
+	return layers.flatMap(l => l.kind === 'group' ? [...allLayers(l.layers), l] : [l]);
+}
+
+// how the layers are arranged: the stack's list (undefined) and each group's
+type Arrangement = Map<GroupLayer | undefined, Layer[]>;
 
 interface Snapshot {
 	width:		number;
 	height:		number;
 	layers:		Layer[];
-	current:	number;
+	current:	number;		// in all of them, as LayerStack.all has them
 }
 
 class LayerStack {
 	constructor(public width: number, public height: number, public layers: Layer[]) {}
 
-	index(layer?: Layer) {
-		return layer ? this.layers.indexOf(layer) : -1;
+	all()		{ return allLayers(this.layers); }
+	// the layers that are not groups, which are the sheets of the fan
+	leaves()	{ return this.all().filter(l => l.kind !== 'group'); }
+	// the layer these are the pixels of
+	holding(image: Pixels) { return this.all().map(pixelLayer).find(l => l?.image === image); }
+
+	// the list a layer is in, and the group that is (undefined: the stack's own)
+	parent(layer: Layer): {list: Layer[], group?: GroupLayer} {
+		const group = this.all().find((g): g is GroupLayer => g.kind === 'group' && g.layers.includes(layer));
+		return {list: group?.layers ?? this.layers, group};
+	}
+	// whether it is shown: it and the groups it is in
+	shown(layer: Layer): boolean {
+		const {group} = this.parent(layer);
+		return layer.visible && (!group || this.shown(group));
+	}
+
+	arrangement(): Arrangement {
+		return new Map([[undefined, this.layers.slice()], ...this.all().flatMap(g => g.kind === 'group' ? [[g, g.layers.slice()] as const] : [])]);
+	}
+	// (changes the groups themselves)
+	arrange(a: Arrangement) {
+		for (const [group, list] of a) {
+			if (group)
+				group.layers = list.slice();
+			else
+				this.layers = list.slice();
+		}
 	}
 
 	// (which layer is current is the painter's; a snapshot is given the index of it, to hand back to whatever restores it)
-	snapshot(current: number): Snapshot {
-		return {width: this.width, height: this.height, layers: this.layers.slice(), current};
+	snapshot(current: Layer | undefined): Snapshot {
+		return {width: this.width, height: this.height, layers: this.layers.slice(), current: current ? this.all().indexOf(current) : -1};
 	}
 
 	restore(s: Snapshot) {
@@ -124,6 +181,22 @@ class LayerStack {
 		this.height	= s.height;
 		this.layers	= s.layers.slice();
 	}
+}
+
+// A file's layers, bottom first, as a stack whose groups have theirs in them (it fills in the groups' lists): a group's layers are between
+// its end, below them, and it. A group with no end has all the layers below it; an end with no group leaves its layers in none.
+function grouped(layers: (Layer | 'end')[]): Layer[] {
+	const lists: Layer[][] = [[]];
+	for (const layer of layers) {
+		if (layer === 'end') {
+			lists.push([]);
+		} else {
+			if (layer.kind === 'group')
+				layer.layers = lists.length > 1 ? lists.pop()! : lists[0].splice(0);
+			lists[lists.length - 1].push(layer);
+		}
+	}
+	return lists.flat();
 }
 
 //-----------------------------------------------------------------------------
@@ -237,7 +310,8 @@ function appliedMask(layer: PixelLayer, mask: LayerMask): Pixels<4> {
 // blend modes
 //-----------------------------------------------------------------------------
 
-// PSD's blend mode keys, and the numbers composite.frag knows them by. A group's pass through, and any key not here, is normal.
+// PSD's blend mode keys, and the numbers composite.frag knows them by. Any key not here is normal; a group's pass through ('pass') is the
+// compositor's (to the shader it is normal).
 export const BLEND_MODES = {
 	'norm':	0,		// normal
 	'diss':	1,		// dissolve
@@ -267,12 +341,19 @@ export const BLEND_MODES = {
 	'colr':	25,		// colour
 	'lum':	26,		// luminosity
 };
-export type BLEND_MODE = keyof typeof BLEND_MODES;
+export type BLEND_MODE = keyof typeof BLEND_MODES | 'pass';
 
 
 //-----------------------------------------------------------------------------
 // LayeredMode
 //-----------------------------------------------------------------------------
+
+// a group of layers (a folder, as Photoshop has it), and a layer put into one, or a group's layers taken out of it
+const groupIcons = {
+	group:		'<path d="M1.5 4v8.5h13V5.5H8L6.5 4z"/>',
+	add:		'<path d="M1.5 4v8.5h13V5.5H8L6.5 4z"/><path d="M8 7.5v3.5M6.25 9.25h3.5"/>',
+	ungroup:	'<path d="M1.5 4v8.5h13V5.5H8L6.5 4z" stroke-dasharray="2 1.5"/><path d="M8 11V7.5M6.5 9L8 7.5 9.5 9"/>',
+};
 
 // The editor of shape layers' paths (shapeedit.ts), which is over the picture when the current layer is one, in place of the tools:
 // made when it is first wanted, for the page as the tools are
@@ -327,26 +408,43 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	}
 	get width()		{ return this.stack.width; }
 	get height()	{ return this.stack.height; }
-	get count()		{ return this.stack.layers.length; }
-	get current()	{ return this.layer ? this.stack.layers.indexOf(this.layer) : -1; }
+	// (the sheets are the layers that are not groups, as LayerStack.leaves has them)
+	get count()		{ return this.stack.leaves().length; }
+	get current()	{ return this.stack.leaves().findIndex(l => l === this.layer); }
 	flatView()		{ return flatView(this.pictureMatrix(), Math.max(this.stack.width, this.stack.height)); }
 	bounds(i: number) {
-		const layer = this.stack.layers[i];
-		return layer.kind === 'adjustment' ? new float2.extent(float2(0, 0), float2(this.stack.width, this.stack.height)) : placedRect(layer);
+		const layer = pixelLayer(this.stack.leaves()[i]);
+		return layer ? placedRect(layer) : new float2.extent(float2(0, 0), float2(this.stack.width, this.stack.height));
 	}
-	sheetName(i: number)	{ return this.stack.layers[i].name; }
-	choose(i: number)		{ 
-		const layer = this.stack.layers[i];
+	sheetName(i: number)	{ return this.stack.leaves()[i].name; }
+	choose(i: number)		{ this.makeCurrent(this.stack.leaves()[i]); }
+	// what the tools draw on, and what of it (its pixels, shape or text)
+	makeCurrent(layer: Layer) {
 		this.live.layer = layer;
 		this.live.editing = undefined;
 		this.live.viewMask = undefined;
-		if (layer.kind !== 'adjustment')
-			expand(layer, this.stack.width, this.stack.height);
+		const pixels = pixelLayer(layer);
+		if (pixels)
+			expand(pixels, this.stack.width, this.stack.height);	// what the tools draw on covers the canvas
 		this.live.recompose();
 	}
-	reorderer(i: number)	{ return this.dragger(this.stack.layers[i]); }
+	// A sheet dragged to another place among them, which may be in another group: it goes where the sheet that is there was, below it
+	// if it is taken down, above it if up
+	reorderer(i: number) {
+		const stack = this.stack, layer = stack.leaves()[i];
+		return this.dragger(place => {
+			const now = stack.leaves(), from = now.indexOf(layer), others = now.filter(l => l !== layer);
+			const there = others[place < from ? place : place - 1];
+			if (place === from || !there)
+				return;
+			const {list} = stack.parent(layer);
+			list.splice(list.indexOf(layer), 1);
+			const to = stack.parent(there).list;
+			to.splice(to.indexOf(there) + (place < from ? 0 : 1), 0, layer);
+		});
+	}
 	sheetMenu(i: number | undefined, clientX: number, clientY: number) {
-		LayeredMode.openMenu(clientX, clientY, i === undefined ? undefined : this.layerItems(this.stack.layers[i]));
+		LayeredMode.openMenu(clientX, clientY, i === undefined ? undefined : this.layerItems(this.stack.leaves()[i]));
 	}
 	// the masks a layer is drawn through on its own (as the fan and a transform draw it), their textures made now
 	private masksOf(layer: Layer): {mask?: QuadMask, vmask?: QuadMask} {
@@ -354,21 +452,23 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	}
 
 	drawSheet(i: number, at: Placement) {
-		const layers = this.stack.layers, layer = layers[i];
+		const layer = this.stack.leaves()[i], layers = this.stack.parent(layer).list;
 		const rect0 = this.bounds(i);
 		const rect = new float2.extent(rect0.min.scale(1 / at.longest), rect0.max.scale(1 / at.longest));
 
 		// What of the layer the picture shows, which is drawn, but not down to nothing. A layer clipped to another has
-		// that one's pixels to be clipped by (the first below it which is not clipped itself); if that one is hidden so is it.
+		// that one's pixels to be clipped by (the first below it in its group which is not clipped itself); if that one is hidden so is it.
+		// (One clipped to a group is drawn as it is.)
 		let base: Layer | undefined;
 		if (layer.clipped) {
-			for (let j = i - 1; j >= 0 && !base; j--)
+			for (let j = layers.indexOf(layer) - 1; j >= 0 && !base; j--)
 				if (!layers[j].clipped)
 					base = layers[j];
 		}
 
-		const shown			= layer.visible && (!base || base.visible) ? layer.opacity : 0;
-		const clip			= base?.kind !== 'adjustment' && base?.image.width && base.image.height ? base : undefined;
+		const shown			= this.stack.shown(layer) && (!base || base.visible) ? layer.opacity : 0;
+		const clipBase		= pixelLayer(base);
+		const clip			= clipBase?.image.width && clipBase.image.height ? clipBase : undefined;
 		const flatUniforms	= {u_floor: LayeredMode.FLOOR};
 
 		// (the textures are made before any is bound: making one binds it, on the unit which is active)
@@ -421,18 +521,22 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	constructor(image: ImageData, layers: Layer[], program2D: ShaderProgram, programComposite: ShaderProgram, programEffect?: ShaderProgram, programBlur?: ShaderProgram) {
 		super(image, program2D);
 		this.stack		= new LayerStack(image.width, image.height, layers);
-		this.layer		= layers[layers.length - 1];
-		if (this.layer.kind !== 'adjustment')
-			expand(this.layer, image.width, image.height);	// what the tools draw on covers the canvas
+		// (the top one that is not a group)
+		this.layer		= this.stack.leaves().pop() ?? layers[layers.length - 1];
+		const pixels	= pixelLayer(this.layer);
+		if (pixels)
+			expand(pixels, image.width, image.height);	// what the tools draw on covers the canvas
 		this.compositor	= new LayerCompositor(canvas3d, programComposite, programEffect, programBlur);
 		this.compositor.compose(image.width, image.height, layers);
 		this.texture	= this.compositor.texture;
 	}
 
 	static async create(image: ImageData, layerdata: LayerData[]) {
-		// the layers as the page has them, from a file's
-		const layers = layerdata.map((data): Layer => {
+		// the layers as the page has them, from a file's, with each group's layers in it
+		const layers = grouped(layerdata.map((data): Layer | 'end' => {
 			const kind = layerKind(data.blocks);
+			if (kind === 'end')
+				return kind;
 			const common: LayerBase = {
 				name:		data.name,
 				opacity:	data.opacity,
@@ -448,10 +552,12 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 				vectorMaskDensity:	data.vectorMaskDensity,
 				vectorMaskFeather:	data.vectorMaskFeather,
 			};
-			return kind === 'adjustment'
-				? {...common, kind}
+			// (a group's blend mode is its section's, which may be pass through where the record's says normal)
+			const section = data.blocks?.lsct ?? data.blocks?.lsdk;
+			return kind === 'group' ? {...common, kind, blend: (section?.blend?.key ?? data.blend) as BLEND_MODE, open: section?.type === 1, layers: []}
+				: kind === 'adjustment' ? {...common, kind}
 				: {...common, kind, left: data.left, top: data.top, image: {data: new Uint8ClampedArray(data.data), width: data.width, height: data.height}};
-		});
+		}));
 		return new LayeredMode(image, layers, await shader('2d'), await shader('composite'), await shader('effect'), await shader('blur'));
 	}
 
@@ -482,69 +588,88 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 
 	private uniqueLayerName(name: string, from = 1) {
 		let n = from;
-		while (this.stack.layers.some(l => l.name === `${name} ${n}`))
+		const all = this.stack.all();
+		while (all.some(l => l.name === `${name} ${n}`))
 			n++;
 		return `${name} ${n}`;
 	}
 
+	// The layers arranged otherwise (by `change`, which moves them between the lists of the stack and its groups), as one edit; the
+	// layer that is then current is `current`, or the one that was
+	private rearrange(label: string, change: () => void, current?: Layer) {
+		const stack = this.stack, was = this.live.layer;
+		const before = stack.arrangement();
+		change();
+		const after = stack.arrangement(), now = current ?? was;
+		const put = (a: Arrangement, layer: Layer | undefined) => () => {
+			stack.arrange(a);
+			if (layer && layer !== this.live.layer)
+				this.live.makeCurrent(layer);
+			else
+				this.live.recompose();
+		};
+		put(after, now)();
+		history.record(label, put(before, was), put(after, now));
+	}
+
+	// where a new layer goes: above the current one, or into the current group, at its top
+	private insert(made: Layer[]) {
+		const layer = this.live.layer;
+		if (layer?.kind === 'group') {
+			layer.layers.push(...made);
+		} else {
+			const {list} = layer ? this.stack.parent(layer) : {list: this.stack.layers};
+			list.splice(layer ? list.indexOf(layer) + 1 : list.length, 0, ...made);
+		}
+	}
+
 	private addNewLayer() {
 		const {width, height} = this.stack;
-		this.addLayer({kind: 'image', name: this.uniqueLayerName('Layer', this.stack.layers.length + 1),
+		this.addLayer({kind: 'image', name: this.uniqueLayerName('Layer', this.stack.leaves().length + 1),
 			left: 0, top: 0, opacity: 1, visible: true, blend: 'norm',
 			image: {data: new Uint8ClampedArray(width * height * 4), width, height}}
 		);
 	}
-	private addLayer(layer: Layer) {
-		const stack = this.stack;
-		const was = this.live.layer!, at = stack.layers.indexOf(was) + 1;
-		const redo = () => {
-			stack.layers.splice(at, 0, layer);
-			this.live.layer = layer;
-			this.live.recompose();
-		};
-		redo();
-		history.record('New Layer', () => {
-			stack.layers.splice(at, 1);
-			this.live.layer = was;
-			this.live.recompose();
-		}, redo);
+	private addLayer(layer: Layer, label = 'New Layer') {
+		this.rearrange(label, () => this.insert([layer]), layer);
 	}
+	// (one that leaves no layers at all is not)
 	private removeLayer(layer: Layer) {
-		const stack = this.stack;
-		if (stack.layers.length < 2)
+		const stack = this.stack, {list, group} = stack.parent(layer), inside = allLayers([layer]);
+		if (stack.all().every(l => inside.includes(l)))
 			return;
-		const at = stack.layers.indexOf(layer), wasCurrent = layer === this.live.layer;
-		const redo = () => {
-			stack.layers.splice(at, 1);
-			if (wasCurrent) {
-				const next = stack.layers[Math.min(at, stack.layers.length - 1)];
-				this.live.layer = next;
-				if (next.kind !== 'adjustment')
-					expand(next, stack.width, stack.height);
-			}
-			this.live.recompose();
-		};
-		redo();
-		history.record('Delete Layer', () => {
-			stack.layers.splice(at, 0, layer);
-			if (wasCurrent)
-				this.live.layer = layer;
-			this.live.recompose();
-		}, redo);
+		// (the current one, or the group it is in, gone: the one above it in its list is current, else the one below, else the group it was in)
+		const at = list.indexOf(layer);
+		this.rearrange('Delete Layer', () => list.splice(at, 1), inside.includes(this.live.layer!) ? list[at + 1] ?? list[at - 1] ?? group : undefined);
 	}
-	// up (1) or down (-1) one place
+	// Up (1) or down (-1) one place: into a group that is next to it (at its bottom going up, its top going down), and out of the group
+	// it is in at either end of it
 	private moveLayer(layer: Layer, direction: 1 | -1) {
-		const from = this.stack.index(layer), to = from + direction;
-		if (to < 0 || to >= this.stack.layers.length)
+		const stack = this.stack, {list, group} = stack.parent(layer), at = list.indexOf(layer), next = list[at + direction];
+		if (!next && !group)
 			return;
-		const swap = (a: number, b: number) => () => {
-			const t = this.stack.layers[a];
-			this.stack.layers[a] = this.stack.layers[b];
-			this.stack.layers[b] = t;
-			this.live.recompose();
-		};
-		swap(from, to)();
-		history.record(direction > 0 ? 'Raise Layer' : 'Lower Layer', swap(to, from), swap(from, to));
+		this.rearrange(direction > 0 ? 'Raise Layer' : 'Lower Layer', () => {
+			list.splice(at, 1);
+			if (next?.kind === 'group') {
+				next.layers.splice(direction > 0 ? 0 : next.layers.length, 0, layer);
+			} else if (next) {
+				list.splice(at + direction, 0, layer);
+			} else {
+				const outer = stack.parent(group!).list;
+				outer.splice(outer.indexOf(group!) + (direction > 0 ? 1 : 0), 0, layer);
+			}
+		});
+	}
+	// the layer put in a new group of its own, where it was
+	private groupLayer(layer: Layer) {
+		const {list} = this.stack.parent(layer);
+		const group: GroupLayer = {kind: 'group', name: this.uniqueLayerName('Group'), opacity: 1, visible: true, blend: 'pass', layers: [layer], open: true};
+		this.rearrange('Group Layers', () => list.splice(list.indexOf(layer), 1, group));
+	}
+	// a group's layers put in its place (its own opacity, blend mode and masks go with it)
+	private ungroup(group: GroupLayer) {
+		const {list} = this.stack.parent(group);
+		this.rearrange('Ungroup Layers', () => list.splice(list.indexOf(group), 1, ...group.layers), this.live.layer === group ? group.layers[group.layers.length - 1] ?? this.stack.leaves().pop() : undefined);
 	}
 
 	private layerItems(layer: Layer) {
@@ -585,9 +710,11 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			set('blend', blend, 'Layer Blend Mode');
 		};
 
-		const blend = blendItem(() => layer.blend, setBlend, previewBlend);
+		const group = layer.kind === 'group' ? layer : undefined;
+		const blend = blendItem(() => layer.blend, setBlend, previewBlend, group && 'pass');
 
 		// a layer a PSD keeps as a shape (a fill seen through a vector mask), and shown, so that what is done to it can be seen
+		// (a group's layer style is kept, but not shown, so it is not offered)
 		return [
 			{...toggleItem('Visible', svgFace(menuIcon.eye), () => layer.visible, visible => set('visible', visible, visible ? 'Show Layer' : 'Hide Layer')), id: 'visible'},
 			{...sliderItem({
@@ -596,10 +723,13 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 				step: (v, steps) => v + 5 * steps,
 			}), id: 'opacity'},
 			blend,
-			adjustmentItem(this.blocksOf(layer, 'Adjustment')) ?? fillLayerItem(this.blocksOf(layer, 'Fill')) ?? styleItem(this.blocksOf(layer, 'Layer Style')),
+			...group ? [] : [adjustmentItem(this.blocksOf(layer, 'Adjustment')) ?? fillLayerItem(this.blocksOf(layer, 'Fill')) ?? styleItem(this.blocksOf(layer, 'Layer Style'))],
 			...this.maskItems(layer),
 			...(layer.kind === 'text' ? TextEditor.layerMenu(this, layer) : []),
-			opItem(menuIcon.trash, 'Delete layer', () => this.removeLayer(layer)),
+			group
+				? opItem(groupIcons.ungroup, 'Ungroup: its layers in its place', () => this.ungroup(group), 'ungroup')
+				: opItem(groupIcons.add, 'Put in a new group', () => this.groupLayer(layer), 'group-layer'),
+			opItem(menuIcon.trash, group ? 'Delete the group and its layers' : 'Delete layer', () => this.removeLayer(layer)),
 		];
 	}
 
@@ -792,7 +922,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	// the layer's mask or vector mask made what is edited, as choosing a layer makes its pixels that (it is chosen first, if it is not)
 	private editMask(layer: Layer, what: 'mask' | 'vector') {
 		if (this.live.layer !== layer)
-			this.choose(this.stack.index(layer));
+			this.makeCurrent(layer);
 		this.edit(what);
 	}
 
@@ -848,7 +978,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			if (!s)
 				return;
 			const shown = {...s.layer, ...s.state()}, {width, height} = this.stack;
-			this.compositor.compose(width, height, this.stack.layers.map(l => l === s.layer ? shown : l));
+			this.compositor.compose(width, height, this.stack.layers, undefined, l => l === s.layer ? shown : l);
 			this.texture = this.compositor.texture;
 			this.redraw();
 		});
@@ -943,17 +1073,17 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const d = c && x >= 0 && y >= 0 && x < c.width && y < c.height ? c.read(new float2.extent(float2(x, y), float2(x + 1, y + 1))) : undefined;
 		return d && asRGBA(d);
 	}
-	// the layer it was pointed at on, whichever is drawn on (nothing once it is gone), or all the picture shows as a stroke begins
-	override cloneSource(at: float2, all: boolean) {
+	// the layer (or mask) it was pointed at on, whichever is drawn on (the point on the layer's own pixels), or all the picture shows
+	override cloneSource(at: float2, all: boolean): CloneSource | undefined {
 		if (all) {
 			const {width, height} = this.stack, data = this.compositor.read(new float2.extent(float2(0, 0), float2(width, height)));
-			return data && {from: Pixels<4>(data as Uint8ClampedArray<ArrayBuffer>, width, height), at};
+			return data && {at, from: Pixels<4>(data as Uint8ClampedArray<ArrayBuffer>, width, height)};
 		}
 		const mask = this.maskPainted();
 		if (mask)
-			return this.live.layer?.mask === mask ? {from: maskPicture(mask, this.stack.width, this.stack.height), at} : undefined;
+			return this.live.layer?.mask === mask ? {at, from: maskPicture(mask, this.stack.width, this.stack.height)} : undefined;
 		const layer = pixelLayer(this.layer);
-		return layer && this.live.stack.layers.includes(layer) ? {from: layer.image, at} : undefined;
+		return layer && this.live.stack.all().includes(layer) ? {at: float2(at.x - layer.left, at.y - layer.top), from: layer.image} : undefined;
 	}
 
 	override menu() {
@@ -962,6 +1092,10 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			return [];
 
 		const add: CascadeItem = {face: () => svgFace(menuIcon.plus), caption: () => 'New layer', select: () => this.addNewLayer() };
+		// (above the current layer, or in the current group; and current, so that new layers go into it)
+		const group: CascadeItem = {id: 'new-group', face: () => svgFace(groupIcons.add), caption: () => 'New group', select: () => this.addLayer(
+			{kind: 'group', name: this.uniqueLayerName('Group'), opacity: 1, visible: true, blend: 'pass', layers: [], open: true}, 'New Group')
+		};
 		
 		const text: CascadeItem = {face: () => svgFace(textIcon), caption: () => 'New text layer', select: () => {
 			// a new text layer with its text to be typed
@@ -973,7 +1107,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 				'Text',
 				float2(Math.round(width / 10), Math.round(height / 2)),
 				Math.max(8, Math.round(height / 12)),
-				stack.layers.find(l => l.kind === 'text')?.blocks
+				stack.all().find(l => l.kind === 'text')?.blocks
 			));
 		} };
 
@@ -988,7 +1122,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const urls = new Map<Layer, string>();	// (the menu is made again each time it comes up, so these are as the pictures are then)
 
 		const layer = this.layer;
-		const fx	= !layer
+		const fx	= !layer || layer.kind === 'group'
 				?	undefined
 				:	adjustmentItem(this.blocksOf(layer, 'Adjustment')) ?? styleItem(this.blocksOf(layer, 'Layer Style'));
 
@@ -1053,14 +1187,15 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			layerChooser('Layer',
 				() => stack.layers ?? [],
 				() => this.layer!,
-				layer => this.choose(stack.index(layer)),
+				layer => this.makeCurrent(layer),
 				layer => layer.name,
 				layer => {
 					let face = urls.get(layer);
 					if (face === undefined) {
 						// (a fill layer with no shape is its fill all over; with one, it is the shape, which the thumbnail draws)
-						const swatch = layer.kind !== 'adjustment' && fillSwatch(layer.blocks);
+						const swatch = pixelLayer(layer) && fillSwatch(layer.blocks);
 						face = layer.kind === 'adjustment' ? adjustmentFace(layer.blocks) ?? ''
+							: layer.kind === 'group' ? svgFace(groupIcons.group)
 							: swatch ? swatchFace(swatch)
 							: `<img class="cascade-thumb" draggable="false" src="${layerThumbnail(stack.width, stack.height, 26, layer).toDataURL()}">`;
 						urls.set(layer, face = this.withMaskBadge(face, layer));
@@ -1068,9 +1203,16 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 					return face;
 				},
 				layer => this.layerItems(layer),
-				layer => this.fan.highlight(layer && stack.index(layer)),
-				layer => reversed(this.dragger(layer), () => stack.layers.length),
-				[add, text, adjust]
+				layer => this.fan.highlight(layer && layer.kind !== 'group' ? stack.leaves().indexOf(layer) : undefined),
+				// (in the strip it is in: the stack's, or its group's)
+				layer => reversed(this.dragger(place => {
+					const {list} = stack.parent(layer), from = list.indexOf(layer), to = Math.max(0, Math.min(list.length - 1, place));
+					if (to !== from)
+						list.splice(to, 0, ...list.splice(from, 1));
+				}), () => stack.parent(layer).list.length),
+				[add, group, text, adjust],
+				true,
+				layer => layer.kind === 'group' ? layer.layers : undefined,
 			),
 		];
 	}
@@ -1080,14 +1222,14 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		// (a mask's picture is over the whole canvas)
 		const mask = paintedMask(changed, rect);
 		if (mask) {
-			for (const l of this.stack.layers)
+			for (const l of this.stack.all())
 				if (l.mask?.image === mask)
 					forgetEffects(l);
 			this.compositor.uploadMask(mask, rect);
 			this.recompose(rect);
 			return;
 		}
-		const layer = this.stack?.layers.find((l): l is PixelLayer => l.kind !== 'adjustment' && l.image === changed);
+		const layer = this.stack?.holding(changed);
 		if (layer)
 			forgetEffects(layer);		// (a style follows what the layer shows)
 		if (layer)
@@ -1096,7 +1238,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		this.recompose(shift && rect ? new float2.extent(rect.min.add(shift), rect.max.add(shift)) : undefined);
 	}
 	override shownBy(image: Pixels<4>) {
-		const layer = this.stack?.layers.find((l): l is PixelLayer => l.kind !== 'adjustment' && l.image === image);
+		const layer = this.stack?.holding(image);
 		const texture = layer && !layer.effect ? this.compositor.layerTexture(layer) : undefined;
 		if (texture) {
 			const base = canvas3d.offscreenOn(texture, image.width, image.height);
@@ -1202,7 +1344,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			return undefined;
 
 		const layers	= this.stack;
-		const before	= layers.snapshot(layers.index(this.layer));	// (whatever is done, the same layer is current)
+		const before	= layers.snapshot(this.layer);	// (whatever is done, the same layer is current)
 		const rect		= imageRect(before);
 
 		const floating = !!layer && !!selection;					// (what a selection covers is lifted, and carried alone)
@@ -1211,7 +1353,10 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 
 		if (floating) {
 			const index = before.current;
-			after		= {...before, layers: before.layers.map((l, k) => k === index && l.kind !== 'adjustment' ? {...l, image: warpSelected(l.image, selection, carry, LayeredMode.warpPixels)} : l)};
+			after		= {...before, layers: mapLayers(before.layers, (l, k) => {
+				const p = k === index ? pixelLayer(l) : undefined;
+				return p ? {...p, image: warpSelected(p.image, selection, carry, LayeredMode.warpPixels)} : l;
+			})};
 			selafter	= LayeredMode.warpSelection(selection, carry, imageRect(before));
 
 		} else {
@@ -1226,15 +1371,13 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 			}
 			const carried	= carry;
 
-			function moveLayer(layer: Layer, move: <P extends PlacedPixels>(p: P) => P) {
-				const mask = layer.mask && {...layer.mask, ...move(layer.mask)};
-				if (layer.kind === 'adjustment')
-					return {...layer, mask};
-				return {...layer, ...move(layer), mask};
+			function moveLayer(layer: Layer, move: <P extends PlacedPixels>(p: P) => P): Layer {
+				const mask = layer.mask && {...layer.mask, ...move(layer.mask)}, pixels = pixelLayer(layer);
+				return pixels ? {...pixels, ...move(pixels), mask} : {...layer, mask};
 			}
 
 			function moveLayers(before: Snapshot, move: <P extends PlacedPixels>(p: P) => P, layer?: Layer) {
-				return {...before, layers: before.layers.map((l, i) => layer && i !== before.current ? l : moveLayer(l, move))};
+				return {...before, layers: mapLayers(before.layers, (l, i) => layer && i !== before.current ? l : moveLayer(l, move))};
 			}
 
 			after = moveLayers(before, p => {
@@ -1257,7 +1400,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 				return [p.x, p.y];
 			};
 			const moved = after;
-			after = {...moved, layers: moved.layers.map((l, i) =>
+			after = {...moved, layers: mapLayers(moved.layers, (l, i) =>
 				l.blocks && (!layer || i === before.current && !((maskBlock(l.blocks)?.flags ?? 0) & 2)) ? {...l, blocks: transformBlocks(l.blocks, map, before, moved)} : l)};
 		}
 
@@ -1269,7 +1412,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		if (!floating) {
 			const {width, height} = after;
 			const m = carry instanceof Warp ? undefined : carry.scale(1 / carry.z.z), scale = m ? Math.sqrt(Math.abs(m.x.x * m.y.y - m.x.y * m.y.x)) : 1;
-			after = {...after, layers: after.layers.map((l, i) => {
+			after = {...after, layers: mapLayers(after.layers, (l, i) => {
 				if (layer && i !== before.current)
 					return l;
 				const set = l.kind === 'text' ? carryText(l, carry, width, height) : l;
@@ -1280,9 +1423,10 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		const use		= (s: Snapshot, sel?: Selection) => () => {
 			const self = this.live, layers = self.stack;
 			layers.restore(s);
-			self.layer = layers.layers[s.current];
-			if (self.layer.kind !== 'adjustment')
-				expand(self.layer, layers.width, layers.height);	// what the tools draw on covers the canvas
+			self.layer = layers.all()[s.current];
+			const pixels = pixelLayer(self.layer);
+			if (pixels)
+				expand(pixels, layers.width, layers.height);	// what the tools draw on covers the canvas
 			self.fan.reset();
 			if (self.image.width !== layers.width || self.image.height !== layers.height)
 				self.image	= new ImageData(layers.width, layers.height);
@@ -1311,40 +1455,16 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		this.addLayers(items.map(it => newLayer(it.name, {data: it.pixels.data, width: it.pixels.width, height: it.pixels.height})), items.length > 1 ? 'Add Layers' : 'Add Layer');
 	}
 
-	// The pictures of the layers other than the current one, which a style can be taken from
-	layerPictures() {
-		return this.stack.layers.filter((l): l is PixelLayer => l.kind !== 'adjustment' && l !== this.layer).map(l => ({name: l.name, image: l.image}));
-	}
-
-	// Layers put above the current one, the last of them current: all of it one edit
+	// Layers put above the current one (or in the current group), the last of them current: all of it one edit
 	addLayers(made: PixelLayer[], label: string) {
-		const prev = this.layer;
-		const last = made[made.length - 1];
-		let at = 0;
-		const redo = () => {
-			const self = this.live, stack = self.stack;
-			at = stack.layers.indexOf(self.layer!) + 1;
-			stack.layers.splice(at, 0, ...made);
-			self.layer = last;
-			expand(last, stack.width, stack.height);	// what the tools draw on covers the canvas
-			self.recompose();
-		};
-		const undo = () => {
-			const self = this.live;
-			self.stack.layers.splice(at, made.length);
-			self.layer = prev;
-			self.recompose();
-		};
-		redo();
-		history.record(label, undo, redo);
+		this.rearrange(label, () => this.insert(made), made[made.length - 1]);
 	}
 
 	// the picture again from the layers (all of it, or a part), and what shows of it
 	recompose(area?: float2.extent, carried?: Layer) {
 		if (this.compositor && this.stack) {
 			// (the layer being transformed is drawn on its own, as it is carried)
-			const layers = carried ? this.stack.layers.map(l => l === carried ? {...l, visible: false} : l) : this.stack.layers;
-			this.compositor.compose(this.stack.width, this.stack.height, layers, area);
+			this.compositor.compose(this.stack.width, this.stack.height, this.stack.layers, area, carried && (l => l === carried ? {...l, visible: false} : l));
 			this.texture = this.compositor.texture;
 			if (this.live === this)
 				this.syncShape();
@@ -1358,7 +1478,7 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 	// a layer style's measurements go with the picture. (A shape's pixels are the old ones made bigger, until its path is edited.)
 	private async upscaleLayers(factor: 2 | 4 | 8) {
 		const bigger = new Map<Pixels, Pixels>();
-		for (const l of this.stack.layers) {
+		for (const l of this.stack.all()) {
 			if (l.kind === 'image' && l.image.width && l.image.height) {
 				const result = await upscale(l.image, factor);
 				if (!result)
@@ -1397,60 +1517,68 @@ export class LayeredMode extends PictureMode implements SheetFanHost {
 		}
 	}
 
-	// a layer moved to another place in the order, by index: it is one edit when it is dropped
-	dragger(layer: Layer): CascadeDrag {
-		let drag: {layer: Layer, order: Layer[]} | undefined;
+	// a layer moved to other places in the order as it is dragged (`to` puts it at one): it is one edit when it is dropped
+	private dragger(to: (place: number) => void): CascadeDrag {
 		const stack = this.stack;
+		let before: Arrangement | undefined;
 		const changed = () => this.live.recompose();
-
+		const put = (a: Arrangement) => () => {
+			stack.arrange(a);
+			changed();
+		};
 		return {
 			begin() {
-						drag = {layer, order: stack.layers.slice()};
+				before = stack.arrangement();
 			},
-			to(index: number) {
-				if (!drag)
+			to(place: number) {
+				if (!before)
 					return;
-				const layer = drag.layer;
-				const to = Math.max(0, Math.min(stack.layers.length - 1, index));
-				if (stack.layers.indexOf(layer) === to)
-					return;
-				stack.layers.splice(stack.layers.indexOf(layer), 1);
-				stack.layers.splice(to, 0, layer);
+				to(place);
 				changed();
 			},
 			drop() {
-				const drag2 = drag;
-				drag = undefined;
-				if (!drag2 || stack.layers.every((l, i) => l === drag2.order[i]))
-					return;
-				const after = stack.layers.slice();
-				const put	= (order: Layer[]) => () => {
-					stack.layers = order.slice();
-					changed();
-				};
-				history.record('Move Layer', put(drag2.order), put(after));
+				const was = before;
+				before = undefined;
+				const after = stack.arrangement();
+				if (was && [...after].some(([group, list]) => list.length !== was.get(group)?.length || list.some((l, i) => l !== was.get(group)?.[i])))
+					history.record('Move Layer', put(was), put(after));
 			}
 		};
 	}
 
 	override raw() {
 		const raw = super.raw();
-		if (raw && this.stack)
-			raw.layers = this.stack.layers.map(layer => {
-				const m		= layer.mask;
-				const mask	= m && {left: m.left, top: m.top, width: m.image.width, height: m.image.height, default: m.default, disabled: m.disabled, inverted: m.inverted, density: m.density, feather: m.feather, data: m.image.data};
-				const ext	= layer.kind === 'adjustment' ? undefined : alphaExtent(layer.image);
-				const size	= ext?.size() ?? float2(0, 0);
-				const off 	= ext && layer.kind !== 'adjustment' ? float2(layer.left, layer.top).add(ext.min) : float2(0, 0);
+		const record = (layer: Layer, blend = layer.blend, blocks = layer.blocks): LayerData => {
+			const m		= layer.mask;
+			const mask	= m && {left: m.left, top: m.top, width: m.image.width, height: m.image.height, default: m.default, disabled: m.disabled, inverted: m.inverted, density: m.density, feather: m.feather, data: m.image.data};
+			const p		= pixelLayer(layer);
+			const ext	= p && alphaExtent(p.image);
+			const size	= ext?.size() ?? float2(0, 0);
+			const off 	= ext && p ? float2(p.left, p.top).add(ext.min) : float2(0, 0);
 
-				return {
-					name:	layer.name, opacity: layer.opacity, visible: layer.visible, blend: layer.blend, clipped: layer.clipped, blocks: layer.blocks,
-					left: 	off.x, top: off.y, width: size.x, height: size.y,
-					data:	ext && layer.kind !== 'adjustment' ? crop(layer.image, ext).data.slice().buffer : new Uint8ClampedArray(0).buffer,
-					mask:	mask && {...mask, data: (mask.data as Uint8ClampedArray).slice().buffer},
-					vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather,
-				};
-			});
+			return {
+				name:	layer.name, opacity: layer.opacity, visible: layer.visible, blend, clipped: layer.clipped, blocks,
+				left: 	off.x, top: off.y, width: size.x, height: size.y,
+				data:	ext && p ? crop(p.image, ext).data.slice().buffer : new Uint8ClampedArray(0).buffer,
+				mask:	mask && {...mask, data: (mask.data as Uint8ClampedArray).slice().buffer},
+				vectorMaskDensity: layer.vectorMaskDensity, vectorMaskFeather: layer.vectorMaskFeather,
+			};
+		};
+		// A group is its end, its layers, then itself, as a file has them: its section says what its blend mode is (the record's is normal
+		// if it passes through, as Photoshop writes it)
+		const end: Layer = {kind: 'group', name: '</Layer group>', opacity: 1, visible: true, blend: 'norm', layers: [], open: false};
+		const records = (layers: Layer[]): LayerData[] => layers.flatMap(layer => {
+			if (layer.kind !== 'group')
+				return [record(layer)];
+			const {lsdk, lsct, ...blocks} = layer.blocks ?? {}, section = lsct ?? lsdk;
+			return [
+				record(end, 'norm', {lsct: {key: 'lsct', type: 3}}),
+				...records(layer.layers),
+				record(layer, layer.blend === 'pass' ? 'norm' : layer.blend, {...blocks, lsct: {key: 'lsct', type: layer.open ? 1 : 2, blend: {key: layer.blend}, subType: section?.subType}}),
+			];
+		});
+		if (raw && this.stack)
+			raw.layers = records(this.stack.layers);
 		return raw;
 	}
 }
@@ -1500,7 +1628,7 @@ function layerThumbnail(width: number, height: number, size: number, layer: Pixe
 
 const fills = new WeakMap<Layer, {blocks: unknown, size: string, layer: Layer | undefined}>();
 
-function makeFill(layer: Layer, width: number, height: number): Layer | undefined {
+function makeFill(layer: Exclude<Layer, GroupLayer>, width: number, height: number): Layer | undefined {
 	const adjust = adjustment(layer.blocks);
 	if (adjust)
 		return {kind: 'adjustment', name: '', opacity: 1, visible: true, blend: 'norm', adjust, blocks: layer.blocks};	// (its blocks for its vector mask)
@@ -1508,7 +1636,7 @@ function makeFill(layer: Layer, width: number, height: number): Layer | undefine
 }
 
 // the layer as the compositor is to have it: what a fill layer shows, with the layer's own mode and the like, or the layer itself
-function shown(layer: Layer, width: number, height: number): Layer {
+function shown(layer: Exclude<Layer, GroupLayer>, width: number, height: number): Layer {
 	const size = `${width}x${height}`;
 	let entry = fills.get(layer);
 	if (!entry || entry.blocks !== layer.blocks || entry.size !== size) {
@@ -1546,8 +1674,7 @@ class LayerCompositor {
 	private luts = new Map<Layer, {texture: WebGLTexture, table: unknown}>();	// the tables of the adjustment layers
 	private noMask: WebGLTexture | undefined;		// for a layer which has none, as something has to be bound
 	private result: Offscreen | undefined;			// the picture
-	private scratch: Offscreen[] = [];				// what is drawn into on the way to it
-	private groups: Offscreen[] = [];				// and where a layer with layers clipped to it is made first, which is only if there are some
+	private buffers: Offscreen[] = [];				// what is drawn into on the way to it: as many as the deepest group needs
 	private float: boolean;
 	width = 0;
 	height = 0;
@@ -1574,6 +1701,8 @@ class LayerCompositor {
 	layerTexture(layer: Layer) {
 		if (layer.kind === 'adjustment')
 			return this.dummyMask();
+		if (layer.kind === 'group')
+			return undefined;
 		const entry = this.textures.get(layer);
 		if (entry && entry.image === layer.image)
 			return entry.texture;
@@ -1695,26 +1824,36 @@ class LayerCompositor {
 
 	private deleteTargets() {
 		this.result?.delete();
-		for (const s of [...this.scratch, ...this.groups])
+		for (const s of this.buffers)
 			s.delete();
 		this.result = undefined;
-		this.scratch = [];
-		this.groups = [];
+		this.buffers = [];
 	}
 
-	// The layers, bottom first, composed into the picture: all of it, or the part inside rect
-	compose(width: number, height: number, layers: Layer[], rect?: float2.extent) {
+	// The layers, bottom first, composed into the picture: all of it, or the part inside rect. Each layer that is not a group is first made
+	// what `as` makes it (as a shape being edited is shown in its place).
+	compose(width: number, height: number, layers: Layer[], rect?: float2.extent, as = (layer: Layer) => layer) {
 		const {canvas3d} = this;
 
-		/** The layers with each one's styles after it (and a fill layer as what it shows), as the compositor takes them. */
-		layers = layers.flatMap(layer => layer.kind === 'adjustment' ? [shown(layer, width, height)] : [
-			...styleLayers(layer, width, height, true).map(p => p.layer),
-			shown(layer, width, height),
-			...styleLayers(layer, width, height, false).map(p => p.layer),
-		]);
+		// The layers with each one's styles about it (and a fill layer as what it shows), as the compositor takes them, and each group
+		// with its own made so
+		type Node = {layer: Layer, inside?: Node[]};
+		const live = new Set<Layer>();
+		const nodes = (list: Layer[]): Node[] => list.flatMap((layer): Node[] => {
+			if (layer.kind === 'group') {
+				live.add(layer);
+				return [{layer, inside: nodes(layer.layers)}];
+			}
+			const l = as(layer);
+			const made = l.kind === 'adjustment' ? [shown(l, width, height)]
+				: l.kind === 'group' ? [l]
+				: [...styleLayers(l, width, height, true).map(p => p.layer), shown(l, width, height), ...styleLayers(l, width, height, false).map(p => p.layer)];
+			made.forEach(m => live.add(m));
+			return made.map(layer => ({layer}));
+		});
+		const tree = nodes(layers);
 
 		// textures for the layers there are, and none for those there are not
-		const live = new Set(layers);
 		for (const textures of [this.textures, this.masks, this.vectorMasks, this.luts]) {
 			for (const [layer, entry] of textures) {
 				if (!live.has(layer)) {
@@ -1730,7 +1869,6 @@ class LayerCompositor {
 			this.width = width;
 			this.height = height;
 			this.result = this.target(width, height);
-			this.scratch = [this.target(width, height), this.target(width, height)];
 			rect = undefined;
 		}
 
@@ -1739,34 +1877,50 @@ class LayerCompositor {
 		if (x1 <= x0 || y1 <= y0)
 			return;
 
-		// What is to be drawn, bottom first: each layer, with the layers clipped to it (the ones directly above it which say they
-		// are), which are drawn onto it first, as a group. Only layers which are shown and reach the part to be made are.
+		// What is to be drawn, bottom first: in each list, each layer with the layers clipped to it (the ones directly above it which say
+		// they are), which are drawn onto it first, as a set. Only layers which are shown and reach the part to be made are, and groups
+		// with some of those in them.
 		// (a style is made when it is first looked for: before anything is drawn, which making it would disturb)
-		const reaches = (l: Layer) => l.visible && l.opacity > 0 && (l.kind === 'adjustment'
+		type Step = {layer: Layer, inside?: Clipping[]};
+		type Clipping = {base: Step, clipped: Step[]};	// (a layer with those clipped to it)
+		const reaches = (l: Layer) => l.visible && l.opacity > 0 && (l.kind === 'adjustment' || l.kind === 'group'
 			|| l.image.width > 0 && l.image.height > 0 && l.left < x1 && l.top < y1 && l.left + l.image.width > x0 && l.top + l.image.height > y0
 			&& (!l.effect || !!this.layerTexture(l)));
-		const items: {base: Layer, clipped: Layer[]}[] = [];
-		const groups: {base: Layer, clipped: Layer[]}[] = [];
-		for (const layer of layers) {
-			if (layer.clipped && groups.length)
-				groups[groups.length - 1].clipped.push(layer);
-			else
-				groups.push({base: layer, clipped: []});
-		}
-		for (const group of groups)
-			if (reaches(group.base))
-				items.push({base: group.base, clipped: group.clipped.filter(reaches)});
+		const step = (node: Node): Step[] => {
+			if (!reaches(node.layer))
+				return [];
+			if (!node.inside)
+				return [{layer: node.layer}];
+			const inside = plan(node.inside);
+			return inside.length ? [{layer: node.layer, inside}] : [];
+		};
+		const plan = (list: Node[]): Clipping[] => {
+			const sets: {base: Node, clipped: Node[]}[] = [];
+			for (const node of list) {
+				if (node.layer.clipped && sets.length)
+					sets[sets.length - 1].clipped.push(node);
+				else
+					sets.push({base: node, clipped: []});
+			}
+			return sets.flatMap(({base, clipped}) => step(base).map(base => ({base, clipped: clipped.flatMap(step)})));
+		};
+		const sets = plan(tree);
 
-		// Their textures, and the buffers a group needs, first: making either binds it, to whichever texture unit is active,
-		// which would be the one of a texture bound to be drawn from
-		// (a feathered mask is blurred as its texture is made, which draws into targets of its own)
-		const textures = new Map<Layer, {texture: WebGLTexture, mask: QuadMask | undefined, vmask: QuadMask | undefined, lut: WebGLTexture | undefined}>();
-		for (const item of items) {
-			for (const layer of [item.base, ...item.clipped])
-				textures.set(layer, {texture: this.layerTexture(layer)!, mask: this.maskTexture(layer), vmask: this.vectorMaskTexture(layer), lut: this.lutTexture(layer)});
-		}
-		if (items.some(item => item.clipped.length) && !this.groups.length)
-			this.groups = [this.target(width, height), this.target(width, height)];
+		// Their textures first: making one binds it, to whichever texture unit is active, which would be the one of a texture bound to be
+		// drawn from (a feathered mask is blurred as its texture is made, which draws into targets of its own)
+		const textures = new Map<Layer, {texture: WebGLTexture | undefined, mask: QuadMask | undefined, vmask: QuadMask | undefined, lut: WebGLTexture | undefined}>();
+		const gather = (sets: Clipping[]) => sets.forEach(({base, clipped}) => [base, ...clipped].forEach(({layer, inside}) => {
+			textures.set(layer, {texture: this.layerTexture(layer), mask: this.maskTexture(layer), vmask: this.vectorMaskTexture(layer), lut: this.lutTexture(layer)});
+			if (inside)
+				gather(inside);
+		}));
+		gather(sets);
+
+		// the buffers drawn into on the way, each taken while it is wanted and given back after (made as they are first wanted, which binds
+		// nothing that is being drawn from: everything is bound as it is drawn)
+		const free = this.buffers.slice();
+		const take = () => free.pop() ?? this.buffers[this.buffers.push(this.target(width, height)) - 1];
+		const give = (b: Offscreen) => free.push(b);
 
 		const gl	= canvas3d.gl
 		const blend = gl.isEnabled(gl.BLEND);
@@ -1778,28 +1932,31 @@ class LayerCompositor {
 		const clear = (target: Offscreen) => {
 			target.begin();
 			canvas3d.clear(true, false);
+			return target;
 		};
 
-		// a layer, or what a group has made, over what has been made so far
-		const draw = (from: Offscreen, to: Offscreen, layer: Layer, mode: BLEND_MODE, opacity: number, clip: boolean, own?: WebGLTexture) => {
-			const t = textures.get(layer);
-			const mask		= own ? undefined : t!.mask, vmask = own ? undefined : t!.vmask;
-			const whole		= own || layer.kind === 'adjustment';		// (an adjustment is of the whole canvas)
+		// A layer, or what a group or a set has made (`own`), over what has been made so far. What a group made is drawn through its masks,
+		// and if it passes through (`through`) it was made over the same backdrop, and is shown over it as much as its opacity and masks say.
+		const draw = (from: Offscreen, to: Offscreen, layer: Layer, mode: BLEND_MODE, opacity: number, clip: boolean, own?: WebGLTexture, masked = !own, through = false) => {
+			const t = textures.get(layer)!;
+			const mask		= masked ? t.mask : undefined, vmask = masked ? t.vmask : undefined;
+			const placed	= !own && layer.kind !== 'adjustment' && layer.kind !== 'group' ? layer : undefined;		// (else it is of the whole canvas)
 			const adjust	= !own && layer.kind === 'adjustment' ? layer.adjust : undefined;
 			to.begin();
 			canvas3d.bindTexture2D(from.texture, 0);
-			canvas3d.bindTexture2D(own ?? t!.texture, 1);
+			canvas3d.bindTexture2D(own ?? t.texture ?? this.noMask!, 1);
 			canvas3d.bindTexture2D(mask?.texture ?? this.noMask!, 2);
-			canvas3d.bindTexture2D(!own && t!.lut ? t!.lut : this.noMask!, 3);
+			canvas3d.bindTexture2D(!own && t.lut ? t.lut : this.noMask!, 3);
 			canvas3d.bindTexture2D(vmask?.texture ?? this.noMask!, 4);
 			this.program.draw({
 				u_backdrop:	0,
 				u_layer:	1,
-				u_origin:	whole ? [0, 0] : [layer.left, layer.top],
-				u_size:		whole ? [width, height] : [layer.image.width, layer.image.height],
+				u_origin:	placed ? [placed.left, placed.top] : [0, 0],
+				u_size:		placed ? [placed.image.width, placed.image.height] : [width, height],
 				u_opacity:	opacity,
-				u_mode:		BLEND_MODES[mode] ?? 0,
+				u_mode:		mode === 'pass' ? 0 : BLEND_MODES[mode] ?? 0,
 				u_clip:		clip ? 1 : 0,
+				u_through:	through ? 1 : 0,
 				u_adjust:	!adjust ? 0 : adjust.kind === 'table' ? 1 : adjust.kind === 'threshold' ? 2 : adjust.kind === 'hue' ? 3 : adjust.kind === 'mono' ? 4 : 5,
 				u_lut:		3,
 				u_level:	adjust?.kind === 'threshold' ? adjust.level : 0,
@@ -1827,33 +1984,61 @@ class LayerCompositor {
 			});
 		};
 
-		if (!items.length) {
-			clear(this.result);
-		} else {
-			// each is drawn over what has been made so far, which goes from one scratch buffer to the other, and the last
-			// goes into the picture
-			let from = this.scratch[0];
-			clear(from);
-			items.forEach(({base, clipped}, i) => {
-				const to = i === items.length - 1 ? this.result! : from === this.scratch[0] ? this.scratch[1] : this.scratch[0];
-				if (!clipped.length) {
-					draw(from, to, base, base.blend, base.opacity, false);
-				} else {
-					// The group is made on its own: the layer as it is (its mask applied, whatever its mode and opacity,
-					// which are for the group), and each layer clipped to it over that. Its alpha is the layer's, which
-					// is what they are clipped to. Then the group goes over what is below, with the layer's mode and opacity.
-					const [a, b] = this.groups;
-					clear(a);
-					draw(a, b, base, 'norm', 1, false);
-					let made = b, other = a;
-					for (const layer of clipped) {
-						draw(made, other, layer, layer.blend, layer.opacity, true);
-						[made, other] = [other, made];
-					}
-					draw(from, to, base, base.blend, base.opacity, false, made.texture);
-				}
+		// The sets drawn one over another onto what `start` has: each goes from one buffer to the next, and the last into `last` if it is
+		// given. The buffer that has it all is returned (`start`, if there are none); the others are given back, but not `start`.
+		const over = (start: Offscreen, sets: Clipping[], last?: Offscreen) => {
+			let from = start;
+			sets.forEach((set, i) => {
+				const to = last && i === sets.length - 1 ? last : take();
+				drawSet(from, to, set);
+				if (from !== start)
+					give(from);
 				from = to;
 			});
+			return from;
+		};
+
+		// A layer, or a group, over what is made so far. A group's layers are made on their own and drawn over that as one; or, if it passes
+		// through (and is not clipped, nor clipped to), straight over what is made so far, which is then shown through the group's masks.
+		const drawStep = (from: Offscreen, to: Offscreen, {layer, inside}: Step, mode: BLEND_MODE, opacity: number, clip: boolean) => {
+			if (!inside) {
+				draw(from, to, layer, mode, opacity, clip);
+			} else if (mode === 'pass' && !clip) {
+				const made = over(from, inside);
+				draw(from, to, layer, mode, opacity, false, made.texture, true, true);
+				give(made);
+			} else {
+				const start = clear(take()), made = over(start, inside);
+				draw(from, to, layer, mode, opacity, clip, made.texture, true);
+				give(start);
+				if (made !== start)
+					give(made);
+			}
+		};
+
+		// A set: a layer alone; or one with layers clipped to it, which are made on their own: the layer as it is (its masks applied, whatever
+		// its mode and opacity, which are for the set), and each layer clipped to it over that. Its alpha is the layer's, which is what they
+		// are clipped to. Then the set goes over what is below, with the layer's mode and opacity.
+		const drawSet = (from: Offscreen, to: Offscreen, {base, clipped}: Clipping) => {
+			if (!clipped.length)
+				return drawStep(from, to, base, base.layer.blend, base.layer.opacity, false);
+			let made = take(), other = clear(take());
+			drawStep(other, made, base, 'norm', 1, false);
+			for (const step of clipped) {
+				drawStep(made, other, step, step.layer.blend, step.layer.opacity, true);
+				[made, other] = [other, made];
+			}
+			draw(from, to, base.layer, base.layer.blend, base.layer.opacity, false, made.texture);
+			give(made);
+			give(other);
+		};
+
+		if (!sets.length) {
+			clear(this.result);
+		} else {
+			const start = clear(take());
+			over(start, sets, this.result);
+			give(start);
 			for (const unit of [4, 3, 2, 1, 0])
 				canvas3d.bindTexture2D(null, unit);
 		}

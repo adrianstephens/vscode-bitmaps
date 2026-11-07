@@ -10,7 +10,7 @@ import * as items from './menuitems';
 let bad = 0;
 const check = (ok: boolean, msg: string) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${msg}`); if (!ok) bad++; };
 
-const models = path.join(__dirname, '../../../packages/binary-ml/assistant/models');
+const models = path.join(__dirname, '../../../packages/binary_ml/assistant/models');
 const W = 700, H = 500;
 
 (async () => {

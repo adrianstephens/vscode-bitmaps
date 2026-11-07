@@ -1495,7 +1495,7 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 										const list = choices.map(([value, face, text]) => ({value, face: svgFace(face), caption: text}));
 										if (!list.some(c => c.value === now))
 											list.push({value: now, face: svgFace('<circle cx="3.5" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12.5" cy="8" r="1"/>'), caption: `custom (${now})`});
-										return choiceItem(caption, list, () => getProp(e, name) ?? '', v => { setAndSave(e, name, v); showProps(); });
+										return choiceItem({caption, get: () => getProp(e, name) ?? '', set: v => { setAndSave(e, name, v); showProps(); }}, list);
 									};
 									return {id, face: () => item().face(), caption: () => item().caption(), wheel: steps => item().wheel!(steps), children: () => item().children!()};
 								};
@@ -1556,12 +1556,12 @@ export function createSession(ui: SessionUi, backend: SessionBackend): Session {
 			}
 			const swatch = (fill: string) => svgFace(`<rect x="2" y="2" width="12" height="12" fill="${fill}"/>`);
 			items.push({
-				...choiceItem('Background', [
+				...choiceItem({caption: 'Background', get: () => background, set: v => { background = v; this.draw(); }}, [
 					{value: 'theme', face: svgFace('<rect x="2" y="2" width="12" height="12" stroke-dasharray="2 2"/>'), caption: 'Editor'},
 					{value: 'white', face: swatch('#fff'), caption: 'White'},
 					{value: 'black', face: swatch('#000'), caption: 'Black'},
 					{value: 'checker', face: svgFace('<rect x="2" y="2" width="12" height="12"/><rect x="2" y="2" width="6" height="6" fill="currentColor"/><rect x="8" y="8" width="6" height="6" fill="currentColor"/>'), caption: 'Checker'},
-				], () => background, v => { background = v; this.draw(); }),
+				]),
 				id: 'background',
 			});
 			return items;

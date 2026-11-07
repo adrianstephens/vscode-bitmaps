@@ -12,7 +12,24 @@ uniform float		u_kernel[49];	// u_size by u_size of them, a row at a time
 uniform float		u_bias;		// 0..1
 uniform float		u_grey;		// 1: from the luminance, to grey
 uniform float		u_smooth;	// 1: a smoothing kernel
+// Only for the filter shown on the picture as it is changed (see paint.ts's previewShade), which draws into the picture's own texture:
+// the filter is limited to the selection's box, and the mask's coverage says how much of it a pixel takes. (Off, in the filter's own passes.)
+uniform sampler2D	u_selection;	// the selection's coverage over its box, in r (when u_masked)
+uniform vec4		u_selected;		// the selection's box: corner and size
+uniform float		u_bounded;		// 1: limited to the selection, 0: all of it
+uniform float		u_masked;		// 1: the box has u_selection's coverage, 0: all of it is selected
 out vec4			fragColor;
+
+vec4 selected(ivec2 p, vec4 was, vec4 now) {
+	if (u_bounded < 0.5)
+		return now;
+	ivec2 s = p - ivec2(u_selected.xy);
+	if (any(lessThan(s, ivec2(0))) || any(greaterThanEqual(s, ivec2(u_selected.zw))))
+		return was;
+	float cover	= u_masked > 0.5 ? texelFetch(u_selection, s, 0).r : 1.0;
+	float a		= mix(was.a, now.a, cover);
+	return vec4(a > 0.0 ? mix(was.rgb * was.a, now.rgb * now.a, cover) / a : now.rgb, a);
+}
 
 void main() {
 	ivec2 size	= textureSize(u_image, 0);
@@ -29,8 +46,11 @@ void main() {
 				sum.rgb += (u_grey > 0.5 ? vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114))) : c.rgb) * w;
 		}
 	}
+	vec4 was	= texelFetch(u_image, at, 0);
+	vec4 now;
 	if (u_smooth > 0.5)
-		fragColor = sum.a > 0.0 ? vec4(sum.rgb / sum.a, sum.a) : vec4(0.0);
+		now = sum.a > 0.0 ? vec4(sum.rgb / sum.a, sum.a) : vec4(0.0);
 	else
-		fragColor = vec4(clamp(sum.rgb + u_bias, 0.0, 1.0), texelFetch(u_image, at, 0).a);
+		now = vec4(clamp(sum.rgb + u_bias, 0.0, 1.0), was.a);
+	fragColor = selected(ivec2(gl_FragCoord.xy), was, now);
 }

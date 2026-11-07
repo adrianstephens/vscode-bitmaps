@@ -606,7 +606,7 @@ const strokeIcon = (colour: string) => `<rect x="3" y="3" width="10" height="10"
 // they are dashed. `edited` is told of a change.
 function strokeItems(id: string, stroke: Stroke, edited: () => void, paint: CascadeItem, remove: () => void): CascadeItem {
 	const choice = <K extends keyof Stroke>(caption: string, key: K, values: {value: Stroke[K], icon: string, caption: string}[]) =>
-		choiceItem(caption, values.map(v => ({value: v.value, face: svgFace(v.icon), caption: v.caption})), () => stroke[key], v => { stroke[key] = v; edited(); });
+		choiceItem({caption, get: () => stroke[key], set: v => { stroke[key] = v; edited(); }}, values.map(v => ({value: v.value, face: svgFace(v.icon), caption: v.caption})));
 	const dashed = (dashes: number[]) => stroke.dashes && dashes.length === stroke.dashes?.length && dashes.every((d, i) => d === stroke.dashes![i]);
 	return {
 		id,
@@ -639,12 +639,15 @@ function strokeItems(id: string, stroke: Stroke, edited: () => void, paint: Casc
 				{value: 'round', icon: '<path d="M3 13V3H13" stroke-width="3" stroke-linejoin="round"/>', caption: 'Round'},
 				{value: 'bevel', icon: '<path d="M3 13V3H13" stroke-width="3" stroke-linejoin="bevel"/>', caption: 'Bevelled'},
 			]),
-			choiceItem('Dashes', [
+			choiceItem({
+				caption:	'Dashes',
+				get:		() => dashed([]) ? 'solid' : dashed([4, 2]) ? 'dashed' : dashed([1, 1]) ? 'dotted' : 'dashed',
+				set:		v => { stroke.dashes = v === 'solid' ? [] : v === 'dashed' ? [4, 2] : [1, 1]; stroke.cap = v === 'dotted' ? 'round' : stroke.cap; edited(); },
+			}, [
 				{value: 'solid', face: svgFace('<path d="M2 8H14" stroke-width="2"/>'), caption: 'Solid'},
 				{value: 'dashed', face: svgFace('<path d="M2 8H5M7 8H10M12 8H14" stroke-width="2"/>'), caption: 'Dashed'},
 				{value: 'dotted', face: svgFace('<path d="M2 8H3M5 8H6M8 8H9M11 8H12" stroke-width="2"/>'), caption: 'Dotted'},
-			], () => dashed([]) ? 'solid' : dashed([4, 2]) ? 'dashed' : dashed([1, 1]) ? 'dotted' : 'dashed',
-			v => { stroke.dashes = v === 'solid' ? [] : v === 'dashed' ? [4, 2] : [1, 1]; stroke.cap = v === 'dotted' ? 'round' : stroke.cap; edited(); }),
+			]),
 		],
 	};
 }
@@ -675,10 +678,10 @@ export function paintItem(id: string, label: string, paint: Fill, edited: () => 
 			click:	() => { onDrawing.toggle(); return true; },
 		}),
 		children:	() => [
-			choiceItem('Type', [
+			choiceItem({caption: 'Type', get: () => g.type, set: v => { g.type = v; edited(); }}, [
 				{value: 'linear' as const, face: svgFace(icons.linear), caption: 'Linear'},
 				{value: 'radial' as const, face: svgFace(icons.radial), caption: 'Radial'},
-			], () => g.type, v => { g.type = v; edited(); }),
+			]),
 			...(g.type === 'linear' ? [valueItem({
 				label: 'angle', caption: 'Angle (degrees)', min: -180, max: 180, presets: [-180, -90, 0, 90, 180],
 				get: () => g.angle, set: v => { g.angle = v; edited(); }, step: (v, steps) => v + 5 * steps,

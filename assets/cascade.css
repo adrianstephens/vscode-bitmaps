@@ -6,18 +6,22 @@
   pointer-events: none;
 }
 
+/* following the icon it came out of as that is magnified (left and top are first set before it is shown, which nothing animates from) */
 .cascade-strip {
   position: absolute;
   display: flex;
-}
-
-.cascade-strip.shown {
-  pointer-events: auto;
-}
-
-/* following the icon it came out of as that is magnified (left and top are first set before it is shown, which nothing animates from) */
-.cascade-strip {
   transition: left 70ms ease-out, top 70ms ease-out;
+
+  &.shown {
+    pointer-events: auto;
+  }
+
+  /* a slider's strip slides out of the icon it came out of rather than growing from it (its --tx/--ty and clip are set in addStrip) */
+  &.tape > * {
+    opacity: 1;
+    transform: translate(var(--tx, 0), var(--ty, 0));
+    transition: none;		/* (not while --tx/--ty are being set) */
+  }
 }
 
 .cascade-button {
@@ -39,37 +43,84 @@
   transform: translate(var(--dx, 0), var(--dy, 0)) scale(0.4);
   transition: transform 110ms ease-out, opacity 90ms ease-out, scale 70ms ease-out, translate 70ms ease-out;
   transition-delay: calc(var(--i, 0) * 12ms), calc(var(--i, 0) * 12ms), 0ms, 0ms;
+
+  .cascade-strip.closing & {
+    transition-duration: 80ms;
+    transition-delay: 0ms;
+  }
+
+  .cascade-strip.shown & {
+    opacity: 1;
+    transform: none;
+  }
+
+  &.open {
+    background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+  }
+
+  &.active {
+    color: var(--vscode-inputOption-activeForeground, inherit);
+    background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-activeBackground));
+    border-radius: 2;
+    border-color: rgba(255,0,0,1);/*var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));*/
+  }
+
+  /* an icon being dragged to another place in its strip */
+  &.dragging {
+    position: relative;
+    z-index: 1;
+    cursor: grabbing;
+    transition: none;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+  }
+
+  /* the icon faces follow the size set by the bitmaps.cascadeIconSize setting (--cascade-scale is that over 32) */
+  & svg {
+    width: calc(20px * var(--cascade-scale, 1));
+    height: calc(20px * var(--cascade-scale, 1));
+  }
+
+  /* an icon the wheel changes: a mark in the corner */
+  &.wheel {
+    background-image: linear-gradient(135deg, transparent 80%, var(--vscode-focusBorder) 80%);
+  }
+
+  /* a slider: one long button, with the bar filled to the value along its bottom (or right) edge */
+  &.track {
+    position: relative;
+    justify-content: flex-end;
+    padding: 0 8px 4px;
+    cursor: ew-resize;
+
+    & ~ .cascade-gauge {
+      bottom: 5px;
+      height: 4px;
+    }
+
+    & ~ .cascade-gauge.vertical {
+      bottom: auto;
+      right: 5px;
+      width: 4px;
+      height: auto;
+    }
+
+    .cascade-strip.vertical & {
+      cursor: ns-resize;
+    }
+  }
+
 }
 
-.cascade-strip.shown .cascade-button {
-  opacity: 1;
-  transform: none;
-}
+/* (after the buttons' own, so that these win at equal specificity as they did before nesting) */
+.cascade-strip {
+  &.tape.shown > * {
+    transform: none;
+    transition: transform 160ms ease-out;
+  }
 
-.cascade-strip.closing .cascade-button {
-  transition-duration: 80ms;
-  transition-delay: 0ms;
-}
-
-.cascade-button.open {
-  background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
-}
-
-.cascade-button.active {
-  color: var(--vscode-inputOption-activeForeground, inherit);
-  background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-activeBackground));
-  border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));
-}
-
-/* the icon faces follow the size set by the bitmaps.cascadeIconSize setting (--cascade-scale is that over 32) */
-.cascade-button svg {
-  width: calc(20px * var(--cascade-scale, 1));
-  height: calc(20px * var(--cascade-scale, 1));
-}
-
-/* an icon the wheel changes: a mark in the corner */
-.cascade-button.wheel {
-  background-image: linear-gradient(135deg, transparent 80%, var(--vscode-focusBorder) 80%);
+  &.tape.closing > * {
+    transition: transform 100ms ease-in;
+  }
 }
 
 .cascade-value {
@@ -79,12 +130,20 @@
   font-size: calc(11px * var(--cascade-scale, 1));
   font-weight: 600;
   line-height: 1;
+  & small {
+    font-size: calc(8px * var(--cascade-scale, 1));
+    font-weight: normal;
+    opacity: 0.8;
+  }
 }
 
-.cascade-value small {
-  font-size: calc(8px * var(--cascade-scale, 1));
-  font-weight: normal;
-  opacity: 0.8;
+.cascade-img {
+  /* all of the button inside its border, with the button's corners less that border */
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 5px;
+  pointer-events: none;
 }
 
 .cascade-swatch {
@@ -98,25 +157,25 @@
   position: relative;
   width: calc(20px * var(--cascade-scale, 1));
   height: calc(20px * var(--cascade-scale, 1));
+  & span {
+    position: absolute;
+    width: calc(13px * var(--cascade-scale, 1));
+    height: calc(13px * var(--cascade-scale, 1));
+    border: 1px solid var(--vscode-editorWidget-border, #888);
+    border-radius: 2px;
+
+    &:first-child {
+      right: 0;
+      bottom: 0;
+    }
+    &:last-child {
+      left: 0;
+      top: 0;
+    }
+  }
 }
 
-.cascade-swatch2 span {
-  position: absolute;
-  width: calc(13px * var(--cascade-scale, 1));
-  height: calc(13px * var(--cascade-scale, 1));
-  border: 1px solid var(--vscode-editorWidget-border, #888);
-  border-radius: 2px;
-}
 
-.cascade-swatch2 span:first-child {
-  right: 0;
-  bottom: 0;
-}
-
-.cascade-swatch2 span:last-child {
-  left: 0;
-  top: 0;
-}
 
 /* a bar through a strip of presets, filled to where the value is: along the bottom of a strip across, the right of one down */
 .cascade-gauge {
@@ -128,69 +187,25 @@
   pointer-events: none;
   opacity: 0;
   transition: opacity 80ms;
-}
 
-.cascade-gauge.vertical {
-  bottom: auto;
-  right: 4px;
-  width: 3px;
-  height: auto;
-}
+  &.vertical {
+    bottom: auto;
+    right: 4px;
+    width: 3px;
+    height: auto;
+  }
 
-.cascade-strip.shown .cascade-gauge {
-  opacity: 1;
-  transition-delay: calc(var(--n, 0) * 12ms + 90ms);
-}
+  & div {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--vscode-focusBorder, #0078d4);
+  }
 
-.cascade-gauge div {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: var(--vscode-focusBorder, #0078d4);
-}
-
-/* a slider: one long button, with the bar filled to the value along its bottom (or right) edge */
-.cascade-button.track {
-  justify-content: flex-end;
-  padding: 0 8px 4px;
-  cursor: ew-resize;
-}
-
-.cascade-strip.vertical .cascade-button.track {
-  cursor: ns-resize;
-}
-
-.cascade-button.track ~ .cascade-gauge {
-  bottom: 5px;
-  height: 4px;
-}
-
-.cascade-button.track ~ .cascade-gauge.vertical {
-  bottom: auto;
-  right: 5px;
-  width: 4px;
-  height: auto;
-}
-
-/* a slider's strip slides out of the icon it came out of rather than growing from it (its --tx/--ty and clip are set in addStrip) */
-.cascade-strip.tape > * {
-  opacity: 1;
-  transform: translate(var(--tx, 0), var(--ty, 0));
-  transition: none;		/* (not while --tx/--ty are being set) */
-}
-
-.cascade-strip.tape.shown > * {
-  transform: none;
-  transition: transform 160ms ease-out;
-}
-
-.cascade-strip.tape.closing > * {
-  transition: transform 100ms ease-in;
-}
-
-/* ticks along a slider's bar, at values worth knowing (in its face) */
-.cascade-button.track {
-  position: relative;
+  .cascade-strip.shown & {
+    opacity: 1;
+    transition-delay: calc(var(--n, 0) * 12ms + 90ms);
+  }
 }
 
 .cascade-mark {
@@ -202,52 +217,52 @@
   background: var(--vscode-foreground, #888);
   opacity: 0.6;
   pointer-events: none;
-}
 
-.cascade-mark small {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  transform: translateX(-50%);
-  font-size: 8px;
-  line-height: 1;
-  margin-bottom: 1px;
-  opacity: 0.9;
-}
 
-.cascade-strip.vertical .cascade-mark small {
-  bottom: auto;
-  left: auto;
-  right: 100%;
-  margin: 0 2px 0 0;
-  transform: translateY(-50%);
-}
+  /* (across the bar at the right edge, with their numbers inside the button before them, as a bar across has them above) */
+  .cascade-strip.vertical & {
+    left: auto;
+    right: 2px;
+    bottom: auto;
+    top: var(--at);
+    width: 10px;
+    height: 1px;
+  }
 
-/* the first and last numbers kept inside the bar's ends: from their tick on, and up to it */
-.cascade-mark:first-child small {
-  transform: none;
-}
+  & small {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    transform: translateX(-50%);
+    font-size: 8px;
+    line-height: 1;
+    margin-bottom: 1px;
+    opacity: 0.9;
 
-.cascade-mark:last-child small {
-  transform: translateX(-100%);
-}
+    .cascade-strip.vertical & {
+      bottom: auto;
+      left: auto;
+      right: 100%;
+      margin: 0 2px 0 0;
+      transform: translateY(-50%);
+    }
+  }
 
-.cascade-strip.vertical .cascade-mark:first-child small {
-  transform: none;
-}
+  /* the first and last numbers kept inside the bar's ends: from their tick on, and up to it */
+  &:first-child small {
+    transform: none;
+    .cascade-strip.vertical & {
+      transform: none;
+    }
+  }
 
-.cascade-strip.vertical .cascade-mark:last-child small {
-  transform: translateY(-100%);
-}
+  &:last-child small {
+    transform: translateX(-100%);
+    .cascade-strip.vertical & {
+      transform: translateY(-100%);
+    }
+  }
 
-/* (across the bar at the right edge, with their numbers inside the button before them, as a bar across has them above) */
-.cascade-strip.vertical .cascade-mark {
-  left: auto;
-  right: 2px;
-  bottom: auto;
-  top: var(--at);
-  width: 10px;
-  height: 1px;
 }
 
 /* what the icon under the pointer is, beside it */
@@ -262,10 +277,10 @@
   border-radius: 3px;
   opacity: 0;
   transition: opacity 80ms;
-}
 
-.cascade-caption.shown {
-  opacity: 1;
+  &.shown {
+    opacity: 1;
+  }
 }
 
 /* a layer or slice, small, in a strip of them */
@@ -278,11 +293,3 @@
   user-select: none;
 }
 
-/* an icon being dragged to another place in its strip */
-.cascade-button.dragging {
-  position: relative;
-  z-index: 1;
-  cursor: grabbing;
-  transition: none;
-  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
-}

@@ -5,7 +5,7 @@
 import { float2, float3, float4, float3x3, float4x4 } from '@isopodlabs/maths/vector';
 import type { Canvas3D, ShaderProgram } from './opengl.js';
 import type { Selection } from './bitmapSelection.js';
-import { Offscreen, readRect, Pixels, getPixel, createVertexArray } from './opengl.ts';
+import { Offscreen, readRect, Pixels, getPixel, createVertexArray, resizePixels } from './opengl.ts';
 import { clamp01 } from './colour.ts';
 import { type Warp, type Carry, carriedBounds } from './transformbox.ts';
 
@@ -60,6 +60,28 @@ export function alphaExtent(image: Pixels<4>) {
 export class Shape extends float2.extent {
 	constructor(area: float2.extent, readonly mask?: Uint8ClampedArray<ArrayBuffer>) {
 		super(area.min, area.max);
+	}
+	get width()		{ return this.max.x - this.min.x; }
+	get height()	{ return this.max.y - this.min.y; }
+
+	maskImage()		{ return this.mask && Pixels(this.mask, this.width, this.height, 1); }
+
+	// how much of a pixel is selected, 0..255 (the pixels are those of the box without its far edges, which `contains` has)
+	at(x: number, y: number) {
+		if (x >= this.min.x && y >= this.min.y && x < this.max.x && y < this.max.y)
+			return this.mask ? this.mask[(y - this.min.y) * this.width + (x - this.min.x)] : 255;
+		return 0;
+	}
+	offset(x: number, y: number) {
+		if (x >= this.min.x && y >= this.min.y && x < this.max.x && y < this.max.y)
+			return (y - this.min.y) * this.width + (x - this.min.x);
+		throw new Error("bad offset");
+	}
+	expand(x0: number, y0: number, x1: number, y1: number) {
+		const area = new float2.extent(float2(this.min.x + x0, this.min.y + y0), float2(this.max.x + x1, this.max.y + y1));
+		if (!this.mask)
+			return new Shape(area);
+		return new Shape(area, resizePixels(this.maskImage()!, x0, y0, x1 - x0, y1 - y0).data);
 	}
 }
 
@@ -629,21 +651,22 @@ function blurUniforms(sigma: number, edge: 'zero' | 'clamp', plain: boolean, fil
 	return {u_radius: rad, u_sigma: sigma, u_norm: norm, u_zero: edge === 'zero' ? 1 : 0, u_plain: plain ? 1 : 0, u_fill: [fill, fill, fill, fill]};
 }
 
-/** The pixels of `area` of an image blurred with a gaussian of this sigma (and with a `sharpen` amount, the unsharp mask of that radius),
- *  as `run` does it: the GPU's two passes of blur.frag, the first along the rows into a float target and the second down the columns
- *  (which goes on to the unsharp mask of the image if sharpening). Colours are weighted by their alpha; a one-channel image (a mask)
- *  is blurred value by value. Nothing where `run` cannot do it. */
-export function blurWith(run: (passes: ShadePass[], reach: number) => Pixels | undefined, image: Pixels, sigma: number, edge: 'zero' | 'clamp' = 'clamp', sharpen = 0): Pixels | undefined {
-	const common = blurUniforms(sigma, edge, image.channels === 1), rad = common.u_radius;
-	return run([
+/** The passes of blur.frag for a gaussian of this sigma (and with a `sharpen` amount, the unsharp mask of that radius): the first along
+ *  the rows into a float target and the second down the columns (which goes on to the unsharp mask of the image if sharpening); and how
+ *  far they look around a pixel. Colours are weighted by their alpha; `plain` is for a one-channel image (a mask), blurred value by value. */
+export function blurPasses(plain: boolean, sigma: number, edge: 'zero' | 'clamp' = 'clamp', sharpen = 0) {
+	const common = blurUniforms(sigma, edge, plain), rad = common.u_radius;
+	const passes: ShadePass[] = [
 		{uniforms: {...common, u_step: [1, 0], u_first: 1, u_amount: 0}, grow: [0, rad], float: true},
 		{uniforms: {...common, u_step: [0, 1], u_first: 0, u_amount: sharpen}},
-	], rad);
+	];
+	return {passes, reach: rad};
 }
 
-/** blurWith on the GPU */
+/** The pixels of `area` of an image blurred (see blurPasses), on the GPU */
 export function blur(canvas3d: Canvas3D, program: ShaderProgram, image: Pixels, area: float2.extent, sigma: number, edge: 'zero' | 'clamp' = 'clamp', sharpen = 0): Pixels | undefined {
-	return blurWith((passes, reach) => shade(canvas3d, program, image, area, passes, reach), image, sigma, edge, sharpen);
+	const {passes, reach} = blurPasses(image.channels === 1, sigma, edge, sharpen);
+	return shade(canvas3d, program, image, area, passes, reach);
 }
 
 /** How far a mask's feather reaches beyond its pixels: the blurred mask covers a rectangle this much bigger each way. */
@@ -700,30 +723,6 @@ export interface Levels {
 	gamma:	number;		// above 1 lightens the middle, below darkens it
 }
 
-/** The table which maps an input value to its level-adjusted output */
-export function levelsTable({black, white, gamma}: Levels) {
-	const table = new Uint8ClampedArray(256), range = Math.max(1, white - black);
-	for (let i = 0; i < 256; i++)
-		table[i] = Math.pow(clamp01((i - black) / range), 1 / gamma) * 255 + 0.5;
-	return table;
-}
-
-/** The pixels of `area` of an image with its colours' levels adjusted (the alpha is left alone) */
-export function levelsPixels(image: Pixels, area: float2.extent, levels: Levels): Pixels {
-	const {x: aw, y: ah} = area.size(), table = levelsTable(levels);
-	const out = new Uint8ClampedArray(aw * ah * 4);
-	for (let y = 0; y < ah; y++) {
-		for (let x = 0; x < aw; x++) {
-			const o = (y * aw + x) * 4, s = ((y + area.min.y) * image.width + x + area.min.x) * 4;
-			out[o]		= table[image.data[s]];
-			out[o + 1]	= table[image.data[s + 1]];
-			out[o + 2]	= table[image.data[s + 2]];
-			out[o + 3]	= image.data[s + 3];
-		}
-	}
-	return {data: out, width: aw, height: ah};
-}
-
 /** The uniforms which levels.frag takes for these levels */
 export const levelsUniforms = (l: Levels) => ({u_black: l.black / 255, u_white: l.white / 255, u_gamma: l.gamma});
 
@@ -763,6 +762,69 @@ export interface ShadePass {
 	float?:		boolean;			// into a float target, to keep more than a byte a channel (bytes where there is no such thing); (always, for an image of floats)
 }
 
+/** Where the last of a filter's passes is drawn: `rect` (of the image), into the target that `open` gives, and what `read` makes of it
+ *  once drawn (before the target ends). `uniforms` are the last pass's alone (what the earlier ones' do not need). A target which is not
+ *  `owned` is the caller's to delete. */
+export interface ShadeSink<T> {
+	rect:		float2.extent;
+	open(format: 'rgba8' | 'rgba16f' | 'rgba32f'): Offscreen;	// (the target the pass would be drawn into otherwise)
+	read(width: number, height: number): T;
+	owned?:		boolean;
+	uniforms?:	Record<string, any>;
+}
+
+/** The passes of a filter's fragment shader run against the texture of an image (`whole` its rect), the earlier ones over `area` and
+ *  what they grow by, the last into the sink. Units: 0 is what the pass reads, 1 the image itself (`u_original`), and `extra`'s from 2.
+ *  Nothing where it cannot be done. */
+export function drawPasses<T>(canvas3d: Canvas3D, program: ShaderProgram, source: WebGLTexture, whole: float2.extent, area: float2.extent, passes: ShadePass[], floats: boolean,
+		sink: ShadeSink<T>, extra: WebGLTexture[] = []): T | undefined {
+	const gl = canvas3d.gl;
+	// (a pass that wants a float target has bytes where there are none: less exact, but done)
+	const halfFloat = !!gl.getExtension('EXT_color_buffer_float');
+	const targets: Offscreen[] = [];
+	const blend = gl.isEnabled(gl.BLEND);
+	try {
+		gl.disable(gl.BLEND);
+		let read = source, readAt = float2(0, 0);
+		canvas3d.bindTexture2D(source, 1);
+		extra.forEach((t, i) => canvas3d.bindTexture2D(t, i + 2));
+		for (const [i, pass] of passes.entries()) {
+			const last	= i === passes.length - 1;
+			const [gx, gy] = pass.grow ?? [0, 0];
+			const draws	= last ? sink.rect : new float2.extent(area.min.sub(float2(gx, gy)), area.max.add(float2(gx, gy))).intersect(whole);
+			const {x: w, y: h} = draws.size();
+			const format = floats ? 'rgba32f' : pass.float && halfFloat ? 'rgba16f' : 'rgba8';
+			const target = last ? sink.open(format) : canvas3d.createOffscreen(w, h, format);
+			if (!last || sink.owned)
+				targets.push(target);
+			target.begin();
+			gl.viewport(0, 0, w, h);
+			canvas3d.bindTexture2D(read, 0);
+			program.draw({u_image: 0, u_original: 1, u_origin: [draws.min.x - readAt.x, draws.min.y - readAt.y], u_originalAt: [draws.min.x, draws.min.y], u_bounded: 0, ...pass.uniforms, ...(last ? sink.uniforms : undefined)});
+			if (last) {
+				const out = sink.read(w, h);
+				target.end();
+				return out;
+			}
+			target.end();
+			read = target.texture;
+			readAt = draws.min;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	} finally {
+		extra.forEach((_, i) => canvas3d.bindTexture2D(null, i + 2));
+		canvas3d.bindTexture2D(null, 1);
+		canvas3d.bindTexture2D(null, 0);
+		for (const t of targets)
+			t.delete();
+		if (blend)
+			gl.enable(gl.BLEND);
+		canvas3d.initViewport();
+	}
+}
+
 /** An area of an image run through a filter's fragment shader, as passes (the last drawing the area itself), in one go: nothing where it
  *  cannot be. An image of floats is kept in floats all the way, and comes back so. An image of one channel (a mask) is sampled as its red,
  *  and a shader writes its result to the red. */
@@ -773,30 +835,14 @@ function shadeOnce(canvas3d: Canvas3D, program: ShaderProgram, image: Pixels, ar
 		|| Math.max(image.width, image.height) > gpuLimit(canvas3d) || aw <= 0 || ah <= 0
 		|| floats && !gl.getExtension('EXT_color_buffer_float'))
 		return undefined;
-	// (a pass that wants a float target has bytes where there are none: less exact, but done)
-	const halfFloat = !!gl.getExtension('EXT_color_buffer_float');
-
-	const targets: Offscreen[] = [];
 	let source: WebGLTexture | undefined;
-	const blend = gl.isEnabled(gl.BLEND);
 	try {
 		source = canvas3d.createTextureFromImage(image, {min: 'nearest', mag: 'nearest', format: floats ? (channels === 1 ? 'r32f' : 'rgba32f') : (channels === 1 ? 'r8' : 'rgba8')});
-		gl.disable(gl.BLEND);
-		const whole = imageRect(image);
-		let read = source, readAt = float2(0, 0);
-		canvas3d.bindTexture2D(source, 1);
-		for (const [i, pass] of passes.entries()) {
-			const last	= i === passes.length - 1;
-			const [gx, gy] = pass.grow ?? [0, 0];
-			const draws	= last ? area : new float2.extent(area.min.sub(float2(gx, gy)), area.max.add(float2(gx, gy))).intersect(whole);
-			const {x: w, y: h} = draws.size();
-			const target = canvas3d.createOffscreen(w, h, floats ? 'rgba32f' : pass.float && halfFloat ? 'rgba16f' : 'rgba8');
-			targets.push(target);
-			target.begin();
-			gl.viewport(0, 0, w, h);
-			canvas3d.bindTexture2D(read, 0);
-			program.draw({u_image: 0, u_original: 1, u_origin: [draws.min.x - readAt.x, draws.min.y - readAt.y], u_originalAt: [draws.min.x, draws.min.y], ...pass.uniforms});
-			if (last) {
+		return drawPasses<Pixels>(canvas3d, program, source, imageRect(image), area, passes, floats, {
+			rect:	area,
+			owned:	true,
+			open:	format => canvas3d.createOffscreen(aw, ah, format),
+			read:	(w, h) => {
 				// (always read as rgba, which is what a target can be read as; a single channel is the red)
 				let data: Pixels<4>['data'];
 				if (floats) {
@@ -806,32 +852,20 @@ function shadeOnce(canvas3d: Canvas3D, program: ShaderProgram, image: Pixels, ar
 					data = new Uint8ClampedArray(w * h * 4);
 					gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
 				}
-				target.end();
 				if (channels === 1) {
 					const red = floats ? new Float32Array(w * h) : new Uint8ClampedArray(w * h);
 					for (let i = 0; i < red.length; i++)
 						red[i] = data[i * 4];
 					data = red;
 				}
-				return {data: data, width: w, height: h, channels: image.channels};
-			}
-			target.end();
-			read = target.texture;
-			readAt = draws.min;
-		}
-		return undefined;
+				return {data, width: w, height: h, channels: image.channels};
+			},
+		});
 	} catch {
 		return undefined;
 	} finally {
-		canvas3d.bindTexture2D(null, 1);
-		canvas3d.bindTexture2D(null, 0);
-		for (const t of targets)
-			t.delete();
 		if (source)
 			canvas3d.deleteTexture(source);
-		if (blend)
-			gl.enable(gl.BLEND);
-		canvas3d.initViewport();
 	}
 }
 
@@ -848,9 +882,11 @@ export function shade(canvas3d: Canvas3D, program: ShaderProgram, image: Pixels,
 
 /** The biggest piece of an image to give the GPU at once: what it can take, and no more than will not strain its memory */
 const MAX_PIECE = 4096;
-const gpuLimit = (canvas3d: Canvas3D) => {
+export const gpuLimit = (canvas3d: Canvas3D) => Math.min(MAX_PIECE, textureLimit(canvas3d));
+/** The biggest image the GPU can hold as one texture and draw into whole */
+export const textureLimit = (canvas3d: Canvas3D) => {
 	const gl = canvas3d.gl;
-	return Math.min(MAX_PIECE, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number, ...(gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array));
+	return Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number, ...(gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array));
 };
 
 /** A filter of an area of an image, which `run` does for an image and area of at most `limit` pixels either way, done in pieces

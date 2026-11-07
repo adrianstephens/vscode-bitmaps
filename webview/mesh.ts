@@ -460,28 +460,28 @@ const menu = new Cascade($('main'), (): CascadeItem[] => [
 		face:		() => svgFace(commonIcons.view),
 		caption:	() => 'View',
 		children:	() => [
-			choiceItem('Display', [
-				{value: 'solid' as const,	face: svgFace(icons.solid),	caption: 'Solid'},
-				{value: 'edges' as const,	face: svgFace(icons.edges),	caption: 'Solid with edges'},
-				{value: 'wire' as const,	face: svgFace(icons.wire),	caption: 'Wireframe'},
-			], () => view.display, v => { view.display = v; render(); }),
-			choiceItem('Shading', [
+			choiceItem({caption: 'Display', get: () => view.display, set: v => { view.display = v; render(); } }, [
+				{value: 'solid' as const,	face: svgFace(icons.solid),		caption: 'Solid'},
+				{value: 'edges' as const,	face: svgFace(icons.edges),		caption: 'Solid with edges'},
+				{value: 'wire' as const,	face: svgFace(icons.wire),		caption: 'Wireframe'},
+			]),
+			choiceItem({caption: 'Shading', get: () => view.shading, set: v => { view.shading = v; render(); }}, [
 				{value: 'smooth' as const,	face: svgFace(icons.smooth),	caption: 'Smooth'},
 				{value: 'flat' as const,	face: svgFace(icons.flat),		caption: 'Flat'},
 				{value: 'unlit' as const,	face: svgFace(icons.unlit),		caption: 'Unlit'},
-			], () => view.shading, v => { view.shading = v; render(); }),
+			]),
 			toggleItem('File colours and textures', svgFace(icons.colours), () => view.colours, v => { view.colours = v; render(); }),
 			toggleItem('File lines', svgFace(icons.lines), () => view.lines, v => { view.lines = v; render(); }),
-			choiceItem('Back faces', [
-				{value: 'tint' as const,	face: svgFace(icons.tint),	caption: 'Tinted'},
-				{value: 'plain' as const,	face: svgFace(icons.plain),	caption: 'As front faces'},
-				{value: 'hide' as const,	face: svgFace(icons.hide),	caption: 'Hidden'},
-			], () => view.backs, v => { view.backs = v; render(); }),
+			choiceItem({caption: 'Back faces', get: () => view.backs, set: v => { view.backs = v; render(); }}, [
+				{value: 'tint' as const,	face: svgFace(icons.tint),		caption: 'Tinted'},
+				{value: 'plain' as const,	face: svgFace(icons.plain),		caption: 'As front faces'},
+				{value: 'hide' as const,	face: svgFace(icons.hide),		caption: 'Hidden'},
+			]),
 			toggleItem('Floor', svgFace(icons.floor), () => floorOn, v => { floorOn = v; render(); }),
-			choiceItem('Up axis', [
+			choiceItem({caption: 'Up axis', get: () => up, set: setUp}, [
 				{value: 'z' as const,	face: svgFace(icons.up) + '<small>Z</small>',	caption: 'Z up'},
 				{value: 'y' as const,	face: svgFace(icons.up) + '<small>Y</small>',	caption: 'Y up'},
-			], () => up, setUp),
+			]),
 			{
 				face:		() => svgFace(icons.fit),
 				caption:	() => 'Fit to window',

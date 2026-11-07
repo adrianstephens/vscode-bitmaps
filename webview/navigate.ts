@@ -35,8 +35,8 @@ export const Place = {page: 0, view: 1, tools: 2, editor: 3, transform: 4, panni
 
 const mac = navigator.platform.toLowerCase().includes('mac');
 
-// a key typed into a field, which is the field's
-function typing(target: EventTarget | null) {
+// a key typed into a field (or its copy and paste), which is the field's
+export function typing(target: EventTarget | null) {
 	const t = target as HTMLElement | null;
 	return !!t?.tagName && (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
 		|| (t.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button', 'color'].includes((t as HTMLInputElement).type)));

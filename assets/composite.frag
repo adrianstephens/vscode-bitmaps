@@ -27,6 +27,7 @@ uniform float		u_vmaskInvert;
 uniform float		u_vmaskDensity;
 uniform float		u_hasVmask;
 uniform float		u_clip;			// the layer is clipped to what it goes over: its alpha is not added to that, which stays as it is
+uniform float		u_through;		// the layer is what a group passing through made over this same backdrop, shown as much as its opacity and masks say
 uniform int			u_adjust;		// an adjustment layer, which has no pixels but is what it does to the backdrop's colours: 1 a table, 2 a threshold, 3 hue/saturation, 4 black and white, 5 colour balance
 uniform sampler2D	u_lut;			// 256 by 4: the composite's table, then red's, green's and blue's
 uniform float		u_level;		// a threshold: 0..255
@@ -196,11 +197,18 @@ void main() {
 
 	vec4 layer	= u_adjust > 0 ? vec4(adjusted(below.rgb), 1.0) : texelFetch(u_layer, q, 0);
 	int mode	= int(u_mode + 0.5);
-	float a		= layer.a * u_opacity;
+	float shown	= u_opacity;
 	if (u_hasMask > 0.5)
-		a *= masked(u_mask, p, u_maskOrigin, u_maskSize, u_maskDefault, u_maskInvert, u_maskDensity);
+		shown *= masked(u_mask, p, u_maskOrigin, u_maskSize, u_maskDefault, u_maskInvert, u_maskDensity);
 	if (u_hasVmask > 0.5)
-		a *= masked(u_vmask, p, u_vmaskOrigin, u_vmaskSize, u_vmaskDefault, u_vmaskInvert, u_vmaskDensity);
+		shown *= masked(u_vmask, p, u_vmaskOrigin, u_vmaskSize, u_vmaskDefault, u_vmaskInvert, u_vmaskDensity);
+	if (u_through > 0.5) {
+		// (mixed premultiplied, as the backdrop and what was made over it may differ in alpha)
+		float alpha	= mix(below.a, layer.a, shown);
+		fragColor	= alpha > 0.0 ? vec4(mix(below.rgb * below.a, layer.rgb * layer.a, shown) / alpha, alpha) : vec4(0.0);
+		return;
+	}
+	float a		= layer.a * shown;
 	if (mode == 1)	// dissolve: each pixel is wholly there or not, by chance, as often as it is opaque
 		a = fract(sin(dot(vec2(p), vec2(12.9898, 78.233))) * 43758.5453) < a ? 1.0 : 0.0;
 	if (a <= 0.0) {

@@ -10,22 +10,34 @@ type Page = {evaluate: (fn: string) => Promise<any>};
 const inPage = `async (ids, what, arg) => {
 	const {mode} = await import('/out/webview/modes.js');
 	let items = [...mode.menu(), {id: 'view', children: () => mode.viewItems()}], item;
+	const chain = [];
 	for (const id of ids) {
 		item = items.find(i => i.id === id) ?? items.find(i => !i.id && i.caption?.().startsWith(id));
 		if (!item)
 			throw new Error('no ' + id + ' in the menu, among ' + items.map(i => i.id ?? '-').join(' '));
+		chain.push(item);
 		items = item.children?.() ?? [];
 	}
+	// what the item above the one at i does when chosen, as the menu has it
+	const up = i => () => i > 0 && chain[i - 1].select ? chain[i - 1].select(up(i - 1)) : true;
 	switch (what) {
 		case 'ids':		return items.map(i => i.id ?? '');
 		case 'faces':	return items.map(i => i.face());
 		case 'active':	return !!item.active?.();
 		case 'hover':	return item.hover?.(arg);
-		case 'wheel':	return item.wheel(arg);
+		case 'wheel':	{
+			// (or the nearest item above that takes it, as the menu passes it back)
+			let i = chain.length - 1;
+			while (i > 0 && !chain[i].wheel)
+				--i;
+			if (!chain[i].wheel)
+				throw new Error(ids.join('/') + ' takes no wheel');
+			return chain[i].wheel(arg);
+		}
 		case 'select':
 			if (!item.select)
 				throw new Error(ids.join('/') + ' cannot be chosen');
-			return item.select();
+			return item.select(up(chain.length - 1));
 	}
 }`;
 

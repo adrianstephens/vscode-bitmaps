@@ -1346,11 +1346,16 @@ export abstract class PathEditor {
 		// Choosing one begins the transform, if it is not under way. (A transform of its own cannot distort or warp.) A warp begins again,
 		// to cut the outline finer, and one that has been bent is applied before another mode is begun.
 		const affine = this.xf ? this.xf.box.affine : this.menuScope === 'element' && !!this.beginElementTransform();
-		return {...choiceItem('Mode', modeChoices(affine), () => this.xfMode, v => {
-			this.xfMode = v;
-			if (!this.xf || (v === 'warp' && this.xf.box.mode !== 'warp') || !this.xf.box.setMode(v))
-				this.startTransform();
-		}), id: 'transform-mode'};
+		return choiceItem({
+			caption: 'Mode',
+			get: () => this.xfMode,
+			set: v	=> {
+				this.xfMode = v;
+				if (!this.xf || (v === 'warp' && this.xf.box.mode !== 'warp') || !this.xf.box.setMode(v))
+					this.startTransform();
+			},
+			main: {id: 'transform-mode'}
+		}, modeChoices(affine));
 	}
 	private xfMode: TransformMode = 'free';
 
@@ -1566,7 +1571,12 @@ export abstract class PathEditor {
 				...this.shapeKinds().map(k => shapes[k]),
 				...this.extraTools(),
 			];
-			items.push({...choiceItem('Tool', tools, () => this.tool, v => this.setTool(v), true), id: 'tool'});
+			items.push(choiceItem({
+				caption: 'Tool',
+				get: () => this.tool,
+				set: v => { this.setTool(v); return false; },
+				main: {id: 'tool'}
+			}, tools));
 		}
 
 		if (this.canEdit() && this.points()?.length)

@@ -52,7 +52,7 @@ export interface RawImage {
 	layers?: LayerData[];
 }
 
-export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d'|'layer'|'composite'|'planes'|'warp'|'blur'|'levels'|'convolve'|'flatten'|'ink'|'effect'|'textwarp'|'gradient';
+export type shaderType = 'bg'|'2d'|'array2d'|'3d'|'3d2d'|'cube'|'cube2d'|'layer'|'composite'|'planes'|'warp'|'blur'|'levels'|'convolve'|'flatten'|'ink'|'effect'|'textwarp'|'gradient'|'mix';
 export type MessageOut =
 	| {command: 'ready'}
 	| {command: 'error', message: string}
@@ -60,7 +60,6 @@ export type MessageOut =
 	| {command: 'saveSvg', text: string}	// markup to be saved as a file and opened in the SVG editor
 	| {command: 'installedFonts', requestId: number}	//result: InstalledFont[] (family, style and PostScript name of each font the machine has)
 	| {command: 'model', name: 'sam-encoder' | 'sam-decoder' | 'lama' | 'esrgan' | `style-${'mosaic' | 'candy' | 'rain-princess' | 'udnie' | 'pointilism'}` | 'adain-vgg' | 'adain-decoder', requestId: number}	//result: ArrayBuffer (the network's ONNX file, which the extension fetches the first time)
-	| {command: 'pickImage', requestId: number}	//result: {name: string, data: ArrayBuffer} | undefined (a picture file the user chooses, as it is)
 	| {command: 'glyphOutlines', runs: GlyphRun[], requestId: number}	//result: {curve: curveVertex[], missing: number} (the text as contours of cubics, in the runs' units)
 	| {command: 'edited', label: string};	// the image has been changed, undoably
 
@@ -159,7 +158,8 @@ class ImageMode extends PictureMode {
 					const [matrix, warp] = planar(carry);
 					this.preview = () => {
 						programBG.draw({u_viewport: [this.canvas.width, this.canvas.height]});
-						drawQuad(canvas3d, programLayer, before, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
+						if (this.texture)
+							drawQuad(canvas3d, programLayer, this.texture, whole, {}, 1, planeMvp(this.pictureMatrix(), matrix), undefined, warp);
 					};
 					this.redraw();
 				},

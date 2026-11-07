@@ -510,8 +510,7 @@ function warpItems(spec: TextSpec, edited: (label: string, key: string) => void)
 		face:		() => svgFace(warpIcons[style()]?.[1] ?? warpIcons.warpArc[1]),
 		caption:	() => `Warp Text: ${warpIcons[style()]?.[0] ?? style()}`,
 		children:	() => [
-			choiceItem('Style', ['warpNone', ...WARP_STYLES].map(value => ({value: value as string, face: svgFace(warpIcons[value][1]), caption: warpIcons[value][0]})),
-				style, v => {
+			choiceItem({caption: 'Style', get: style, set: v => {
 					if (v === 'warpNone') {
 						spec.warp = undefined;
 					} else {
@@ -520,7 +519,7 @@ function warpItems(spec: TextSpec, edited: (label: string, key: string) => void)
 							spec.warp!.bend = 50;
 					}
 					edited('Text Warp', 'text-warp-style');
-				}),
+				}}, ['warpNone', ...WARP_STYLES].map(value => ({value: value as string, face: svgFace(warpIcons[value][1]), caption: warpIcons[value][0]}))),
 			amount('bend', 'Bend (%)', 'bend', [-100, -50, 0, 50, 100]),
 			amount('horiz', 'Horizontal distortion (%)', 'horizontal', [-50, 0, 50]),
 			amount('vert', 'Vertical distortion (%)', 'vertical', [-50, 0, 50]),
@@ -567,11 +566,15 @@ export function textItems(spec: TextSpec, edited: (label: string, key: string) =
 		},
 	};
 
-	const align = choiceItem('Alignment', [
+	const align = choiceItem({
+		caption:	'Alignment',
+		get:		() => spec.paras[0]?.justification % 3,
+		set:		v => { for (const p of spec.paras) p.justification = v; edited('Text Alignment', 'text-align'); },
+	}, [
 		{value: 0, face: svgFace(icons.left), caption: 'Left'},
 		{value: 2, face: svgFace(icons.centre), caption: 'Centre'},
 		{value: 1, face: svgFace(icons.right), caption: 'Right'},
-	], () => spec.paras[0]?.justification % 3, v => { for (const p of spec.paras) p.justification = v; edited('Text Alignment', 'text-align'); });
+	]);
 
 	return [
 		font,

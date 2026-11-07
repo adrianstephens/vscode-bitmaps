@@ -14,9 +14,13 @@ export interface RGBA {
 export function RGB(r: number, g: number, b: number)					{ return {r, g, b}; }
 export function RGBA(r: number, g: number, b: number, a: number): RGBA	{ return {r, g, b, a}; }
 
-export function asRGBA(p?: Iterable<number>): RGBA|undefined { if (p) { const [r,g,b,a] = p; return {r, g, b, a}; } }
+export function asRGBA(p?: Iterable<number>): RGBA|undefined			{ if (p) { const [r,g,b,a] = p; return {r, g, b, a}; } }
+export function loadRGBA(p: ArrayLike<number>, i: number): RGBA			{ return {r: p[i], g: p[i + 1], b: p[i + 2], a: p[i + 3]}; }
+export function saveRGBA(p: {[n: number]: number}, i: number, {r, g, b, a}: RGBA)	{ p[i] = r; p[i + 1] = g; p[i + 2] = b; p[i + 3] = a; }
 
-export const toHex = ({r, g, b}: RGB) => '#' + [r, g, b].map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('');
+
+export const toFloat	= ({r, g, b, a}: RGBA)=> [r / 255, g / 255, b / 255, a / 255];
+export const toHex		= ({r, g, b}: RGB) => '#' + [r, g, b].map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('');
 
 /** From #rrggbb. */
 export const fromHex = (text: string): RGB => ({r: parseInt(text.slice(1, 3), 16), g: parseInt(text.slice(3, 5), 16), b: parseInt(text.slice(5, 7), 16)});

@@ -2,7 +2,8 @@
 // pointer, and the pointer resting on an icon brings out that icon's own strip beside it, across from a downward strip and
 // down from an across one, so the strips step down and to the right. Moving to another icon of a strip takes back what came
 // out of the one before. An icon may answer the wheel (to change a value it shows) as well as a click; one that does nothing
-// when clicked passes the click back to the icon it came out of, so clicking a tool's option chooses the tool. A value with a
+// when clicked passes the click back to the icon it came out of, so clicking a tool's option chooses the tool, and one that does
+// nothing with the wheel passes that back in the same way, so the wheel over a preset turns its value. A value with a
 // strip of presets can also be dragged: the left button held on it or on a preset, the pointer's place along the strip is the
 // value. An icon with `drag` can be picked up and moved to another place in its strip (opt-in, per icon): it stays under the
 // pointer along the strip while the others slide aside to make room.
@@ -30,9 +31,11 @@ export interface CascadeItem {
 	caption():			string;				// shown beside the icon while the pointer is on it
 	children?():		CascadeItem[];		// the strip that comes out of this icon
 	active?():			boolean;			// marked, as the current tool or the chosen option is
-	select?():			boolean | void;		// a click on it, or the right button let go on it: true keeps the menu open
+	// a click on it, or the right button let go on it: true keeps the menu open; up does what the icon it came out of does when chosen
+	// (true, and nothing done, if that does nothing)
+	select?(up: () => boolean | void): boolean | void;
 	click?():			boolean | void;		// a click on this icon itself (not on one of its strip's that has no `select`): true if it took the click, which closes the menu
-	wheel?(steps: number): number;			// the wheel turned over it, with up positive; returns how much of steps was used
+	wheel?(steps: number): number;			// the wheel turned over it (or over one of its strip's without wheel), with up positive; returns how much of steps was used
 	gauge?():			number;				// where a value falls along the strip that comes out of this icon, drawn as a bar through
 											// it: in icons, 0 the middle of the first, 1.5 halfway from the second to the third
 	scrub?(position: number): void;			// the pointer dragged to a place along that strip, in the same terms as gauge
@@ -82,6 +85,13 @@ export const swatchFace = (colour: string, second?: string) => second
 	? `<span class="cascade-swatch2"><span style="background:${second}"></span><span style="background:${colour}"></span></span>`
 	: `<span class="cascade-swatch" style="background:${colour}"></span>`;
 
+// a picture filling the icon: a path from the extension's root ('assets/udnie.png', found from this module's own URL, which is
+// the same in the extension's webview and in a web page), or a full URL or a data: URI
+export const imgFace = (src: string) => {
+	const url = /^([a-z][a-z0-9+.-]*:|\/)/i.test(src) ? src : new URL(`../../${src}`, import.meta.url).href;
+	return `<img class="cascade-img" src="${url.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" draggable="false" alt="">`;
+};
+
 export function opItem(icon: string, caption: string, run: () => boolean|void, id?: string): CascadeItem {
 	return {
 		id,
@@ -91,68 +101,103 @@ export function opItem(icon: string, caption: string, run: () => boolean|void, i
 	};
 }
 
-// a number that the wheel changes, and that a strip of presets can set
-export interface ValueOptionsBase {
-	id?:			string;				// the icon's data-id, for finding it from outside
-	label:			string;				// short, to fit on the icon
+
+// what the items that set a value take
+export interface OptionsBase<T> {
 	caption:		string;
+	get():			T;
+	// a new value; when a preset or choice is chosen, what it returns is what that select returns (true keeps the menu open, false
+	// closes it), and with nothing the click goes on to the item the preset or choice came out of
+	set(v: T):		void | boolean;
+	// what a value would do, shown (undefined: shown no more): the item's own value while the pointer rests on it, or the wheel or a
+	// drag changes it, and a preset's or choice's while it is pointed at
+	preview?(v: T | undefined): void;
+	main?:			Partial<CascadeItem>;			// in place of what the item would have
+	children?: (v: T) => Partial<CascadeItem>;		// in place of what the preset or choice of v would have
+}
+
+// set, and shown if there is a preview
+const setter = <T>(o: OptionsBase<T>) => (v: T) => {
+	o.set(v);
+	o.preview?.(v);
+};
+// shown while pointed at
+const hoverer = <T>(o: OptionsBase<T>, v: () => T) => o.preview && ((on: boolean) => o.preview!(on ? v() : undefined));
+// a preset or choice chosen: set, then (unless set says) what the item it came out of does, as the menu has it
+const chooser = <T>(o: OptionsBase<T>, v: T) => (up: () => boolean | void) => o.set(v) ?? up();
+
+// An item that holds the value it sets, in an object of its own (state), so that the item spread into another ({...item, caption}) still
+// has it; changed is told of each new value (and what it returns is what set does)
+function persist<T, I extends CascadeItem>(value: T, make: (get: () => T, set: (v: T) => void | boolean) => I, changed?: (v: T) => void | boolean) {
+	const state = {value};
+	const get = () => state.value;
+	const set = (v: T) => { state.value = v; return changed?.(v); };
+
+	return {state, get, set, ...make(get, set)};
+}
+
+type PersistOptions<O extends OptionsBase<any>> = Omit<O, 'get'|'set'> & Partial<Pick<O, 'set'>> & {value?: O extends OptionsBase<infer T> ? T : number};
+
+// a number that the wheel changes, and that a strip of presets can set
+export interface ValueOptionsBase extends OptionsBase<number> {
+	label:			string;				// short, to fit on the icon
 	min:			number;
 	max:			number;
-	set(v: number): void;
+	resolution?:	number;				// what a value dragged along the presets is rounded to, in steps from min; by default 1 (0: not rounded)
 	step?(value: number, steps: number): number;	// the value after turning the wheel; by default up or down by one
-	resolution?:	number;				// what a value dragged along the presets is rounded to; by default 1
 	format?(value: number): string;
 }
 
 // a number that the wheel changes, and that a strip of presets can set
 export interface ValueOptions extends ValueOptionsBase {
-	get():			number;
 	presets?:		number[];				// increasing
 }
 
+// what a dragged value is rounded to: whole steps of the resolution from min (so that min 3 by 2 is odd), with the error of the sums
+// taken off so that a value can equal a preset
+const quantiser = (o: ValueOptionsBase): (v: number) => number => {
+	const r = o.resolution ?? 1;
+	return r === 0 ? v => v : v => +(o.min + Math.round((v - o.min) / r) * r).toPrecision(12);
+};
+
 export function valueItem(o: ValueOptions): CascadeItem {
-	const format = o.format ?? (v => String(Math.round(v)));
-	const resolution = o.resolution;
-	const quant: (v: number) => number = resolution === undefined ? v => Math.round(v) : resolution === 0 ? v => v : v => Math.round(v / resolution) * resolution;
-	const clamp = (v: number) => Math.min(o.max, Math.max(o.min, v));
+	const format	= o.format ?? (v => String(Math.round(v)));
+	const quant		= quantiser(o);
+	const clamp		= (v: number) => Math.min(o.max, Math.max(o.min, v));
+	const set		= setter(o);
 
 	return {
-		id:			o.id,
 		face:		() => valueFace(o.label, format(o.get())),
 		caption:	() => `${o.caption} ${format(o.get())} (scroll${o.presets ? ' or drag' : ''})`,
-		wheel:		steps => {
+		wheel:		o.step ? steps => {
+			set(clamp(o.step!(o.get(), steps)));
+			return steps;
+		} : steps => {
 			const v = o.get();
-			if (o.step) {
-				o.set(clamp(o.step(v, steps)));
-				return steps;
-			} else {
-				const v1 = quant(v + steps);
-				o.set(clamp(v1));
-				return clamp(v1) !== v1 ? steps : v1 - v;		// the wheel is all used up at either end
-			}
+			const v1 = quant(v + steps);
+			set(clamp(v1));
+			return clamp(v1) !== v1 ? steps : v1 - v;		// the wheel is all used up at either end
 		},
+		hover:		hoverer(o, o.get),
 		gauge:		o.presets && (() => presetPosition(o.presets!, clamp(o.get()), o.min, o.max)),
-		scrub:		o.presets && (p => o.set(clamp(quant(presetValue(o.presets!, p, o.min, o.max))))),
+		scrub:		o.presets && (p => set(clamp(quant(presetValue(o.presets!, p, o.min, o.max))))),
+		...o.main,
 		children:	o.presets && (() => o.presets!.map(v => ({
 			id:			`preset-${v}`,
 			face:		() => valueFace('', format(v)),
 			caption:	() => `${o.caption} ${format(v)}`,
+			hover:		hoverer(o, () => v),
+			select:		chooser(o, v),
 			active:		() => o.get() === v,
-			select:		() => { o.set(v); return true; },
+			...o.children?.(v)
 		}))),
 	};
 }
-
-export function valueItemPersist(o: ValueOptions) {
-	let value = o.min;
-	const set = o.set;
-	return valueItem({...o, 
-		get: () => value, set: v => set(value = v),
-	})
+export function valueItemPersist(o: PersistOptions<ValueOptions>) {
+	return persist(Math.min(o.max, Math.max(o.min, o.value ?? o.min)), (get, set) => valueItem({...o, get, set}), o.set);
 }
 
 export interface SliderOptions extends ValueOptionsBase {
-	get():			number;
 	length?:		number;					// of the slider, in pixels; by default 160
 	markers?:		number[] | number;		// values to mark with a tick along the bar
 }
@@ -161,33 +206,40 @@ export interface SliderOptions extends ValueOptionsBase {
 // from min to max (the same wheel, and a drag as well as a press)
 export function sliderItem(o: SliderOptions): CascadeItem {
 	const format 	= o.format ?? (v => String(Math.round(v)));
-	const item = valueItem(o);
-	const resolution = o.resolution;
-	const quant: (v: number) => number = resolution === undefined ? v => Math.round(v) : resolution === 0 ? v => v : v => Math.round(v / resolution) * resolution;
+	const quant		= quantiser(o);
 	const clamp		= (v: number) => Math.min(o.max, Math.max(o.min, v));
+	const set		= setter(o);
+
 	const markers	= Array.isArray(o.markers) ? o.markers : o.markers ? Array.from({length: o.markers }, (_, i) => i * (o.max - o.min) / (o.markers as number - 1) + o.min) : [];
 	const marks		= markers.map(v => `<span class="cascade-mark" style="--at:${(v - o.min) / (o.max - o.min) * 100}%"><small>${format(v)}</small></span>`).join('');
 	
 	return {
-		...item,
+		face:		() => valueFace(o.label, format(o.get())),
 		caption:	() => `${o.caption} ${format(o.get())} (scroll or drag)`,
-		// one button, so its position is -0.5 at its start and 0.5 at its end
-		gauge:		() => (clamp(o.get()) - o.min) / (o.max - o.min) - 0.5,
-		scrub:		p => o.set(clamp(quant(o.min + (p + 0.5) * (o.max - o.min)))),
+		wheel:		o.step ? steps => {
+			set(clamp(o.step!(o.get(), steps)));
+			return steps;
+		} : steps => {
+			const v = o.get();
+			const v1 = quant(v + steps);
+			set(clamp(v1));
+			return clamp(v1) !== v1 ? steps : v1 - v;		// the wheel is all used up at either end
+		},
+		hover:		hoverer(o, o.get),
+		gauge:		() => (clamp(o.get()) - o.min) / (o.max - o.min) - 0.5,		// one button, so its position is -0.5 at its start and 0.5 at its end
+		scrub:		p => set(clamp(quant(o.min + (p + 0.5) * (o.max - o.min)))),
+		...o.main,
 		children:	() => [{
 			id:			'slider',
 			track:		o.length ?? 160,
 			face:		() => marks,
 			caption:	() => `${o.caption} ${format(o.get())}`,
+			hover:		hoverer(o, o.get),
 		}],
 	};
 }
-export function sliderItemPersist(o: ValueOptions) {
-	let value = o.min;
-	const set = o.set;
-	return sliderItem({...o, 
-		get: () => value, set: v => set(value = v),
-	})
+export function sliderItemPersist(o: PersistOptions<SliderOptions>) {
+	return persist(Math.min(o.max, Math.max(o.min, o.value ?? o.min)), (get, set) => sliderItem({...o, get, set}), o.set);
 }
 
 // where a value falls among increasing presets, in presets: between them in proportion, and beyond them out to half a
@@ -217,27 +269,38 @@ function presetValue(presets: number[], p: number, min: number, max: number) {
 export const multiplicativeStep = (factor = 1.15) => (v: number, steps: number) =>
 	Math.round(v * factor ** steps + Math.sign(steps));
 
-// one of a few choices, which the wheel goes through and whose strip shows them all
-// a choice among values, which keeps the menu open for the next setting unless `closes`
-export function choiceItem<T>(caption: string, choices: {value: T, face: string, caption: string}[], get: () => T, set: (v: T) => void, closes = false): CascadeItem {
-	const current = () => Math.max(0, choices.findIndex(c => c.value === get()));
+// one of a few values, which the wheel goes through and whose strip shows them all; a choice chosen keeps the menu open for the next
+// setting unless set returns false
+export type ChoiceOptions<T> = OptionsBase<T>;
+
+export function choiceItem<T>(o: ChoiceOptions<T>, choices: {value: T, face: string, caption: string}[]): CascadeItem {
+	const current = () => Math.max(0, choices.findIndex(c => c.value === o.get()));
+	const set = setter(o);
 	return {
 		face:		() => choices[current()].face,
-		caption:	() => `${caption}: ${choices[current()].caption}`,
+		caption:	() => `${o.caption}: ${choices[current()].caption}`,
 		wheel:		steps => {
 			const delta = Math.round(steps);
 			if (delta)
 				set(choices[(current() + delta + choices.length) % choices.length].value);
 			return delta;
 		},
+		hover:		hoverer(o, o.get),
+		...o.main,
 		children:	() => choices.map(c => ({
 			id:			typeof c.value === 'string' ? c.value : undefined,
 			face:		() => c.face,
 			caption:	() => c.caption,
-			active:		() => get() === c.value,
-			select:		() => { set(c.value); return !closes; },
+			active:		() => o.get() === c.value,
+			hover:		hoverer(o, () => c.value),
+			select:		chooser(o, c.value),
+			...o.children?.(c.value),
 		})),
 	};
+}
+
+export function choiceItemPersist<T>(o: PersistOptions<ChoiceOptions<T>>, choices: {value: T, face: string, caption: string}[], changed?: (v: T) => void) {
+	return persist(o.value ?? choices[0].value, (get, set) => choiceItem({...o, get, set}, choices), changed);
 }
 
 export function toggleItem(caption: string, face: string, get: () => boolean, set: (v: boolean) => void): CascadeItem {
@@ -253,6 +316,9 @@ export function toggleItem(caption: string, face: string, get: () => boolean, se
 			return delta;
 		}
 	};
+}
+export function toggleItemPersist(caption: string, face: string, value = false, changed?: (v: boolean) => void) {
+	return persist(value, (get, set) => toggleItem(caption, face, get, set), changed);
 }
 
 export const COLOURS = ['#000000', '#ffffff', '#808080', '#e53935', '#fb8c00', '#fdd835', '#43a047', '#1e88e5', '#8e24aa'].map(fromHex);
@@ -411,8 +477,15 @@ export class Cascade {
 		this.root.addEventListener('wheel', e => {
 			e.preventDefault();
 			const hit = this.hit(e);
-			const item = hit && this.strips[hit.level].items[hit.index];
-			if (!item?.wheel)
+			if (!hit)
+				return;
+			// the icon under the pointer, or the nearest it came out of that takes the wheel
+			let at = hit.level, item = this.strips[at].items[hit.index];
+			while (!item.wheel && at > 0) {
+				--at;
+				item = this.strips[at].items[this.strips[at].open];
+			}
+			if (!item.wheel)
 				return;
 
 			const delta = e.deltaY / -WHEEL_STEP;
@@ -422,10 +495,10 @@ export class Cascade {
 			this.wheelTime = e.timeStamp;
 			this.stepAccum += delta;
 			const used = item.wheel(this.stepAccum);
-			if (used)
+			if (used) {
+				this.stepAccum -= used;
 				this.refresh();
-
-			this.stepAccum -= used;
+			}
 
 		}, {passive: false});
 		window.addEventListener('keydown', e => {
@@ -764,13 +837,16 @@ export class Cascade {
 			this.close();
 			return;
 		}
-		for (let l = level; !item.select && l-- > 0;)
-			item = this.strips[l].items[this.strips[l].open];
+		let at = level;
+		while (!item.select && at > 0) {
+			--at;
+			item = this.strips[at].items[this.strips[at].open];
+		}
 		if (!item.select) {
 			this.hover(level, index);
 			return;
 		}
-		if (!item.select()) {
+		if (!item.select(this.up(at))) {
 			this.close();
 			return;
 		}
@@ -781,6 +857,14 @@ export class Cascade {
 			this.hover(level, index);
 		}
 		this.refresh();
+	}
+
+	// what the icon open at the level above `level` does when chosen (with its own up), or true (the menu kept open) if it does nothing
+	private up(level: number): () => boolean | void {
+		return () => {
+			const parent = level > 0 ? this.strips[level - 1].items[this.strips[level - 1].open] : undefined;
+			return parent?.select ? parent.select(this.up(level - 1)) : true;
+		};
 	}
 
 	// beside the icon, on the side away from where its strip comes out, and moved on past any icons in the way

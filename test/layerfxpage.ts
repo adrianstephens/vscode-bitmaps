@@ -152,7 +152,7 @@ const W = 700, H = 500;
 	r = await raw();
 	check(!!r.layers?.[2]?.blocks?.SoCo?.descriptor && px(r, 50, 40).slice(0, 3).join() === '255,255,255', `a new solid colour layer covers the square in white (${px(r, 50, 40)})`);
 	const fill = await items.ids(page, ['layer', 'layer-2']);
-	check(fill.includes('adjustment') && fill.includes('fx'), `and has its colour and a style (${fill.join(' ')})`);
+	check(fill.includes('fill') && !fill.includes('adjustment'), `and its layer menu has the fill, and no second one (${fill.join(' ')})`);
 
 	// the shape editor is over it, not the paint tools: with no contours it fills all, and drawing one gives it a vector mask
 	const editing = () => page.$eval('.pathedit-host', (e: HTMLElement) => e.style.display !== 'none').catch(() => false);
@@ -228,7 +228,7 @@ const W = 700, H = 500;
 	check(!!r.layers?.[2]?.blocks?.GdFl?.descriptor && grad[0] !== grad[1], `a new gradient layer shades across the picture (${grad})`);
 	const gfill = [await items.ids(page, ['layer', 'layer-2'])];
 	await pause(200);
-	check(gfill[gfill.length - 1].includes('adjustment') && gfill[gfill.length - 1].includes('fx'), `and has its gradient and a style (${gfill[gfill.length - 1].join(' ')})`);
+	check(gfill[gfill.length - 1].includes('fill') && !gfill[gfill.length - 1].includes('adjustment'), `and its layer menu has the fill, and no second one (${gfill[gfill.length - 1].join(' ')})`);
 	await send({command: 'undo'});
 	await pause(300);
 

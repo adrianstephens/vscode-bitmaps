@@ -27,7 +27,7 @@ const W = 700, H = 500;
 		},
 	});
 	await readyP;
-	const {page, send} = view;
+	const {page, send, shot} = view;
 	let rid = 100;
 	const raw = async () => {
 		const id = ++rid;
@@ -85,8 +85,11 @@ const W = 700, H = 500;
 	for (let i = 0; i < 4; i++) { await page.mouse.wheel({deltaY: 100}); await pause(100); }
 	const lev = await page.$$eval('.cascade:not(.hidden) .cascade-strip.shown', (ss: Element[], i: number) => ss[i].children[2].textContent, levelsStrip);
 	check(lev !== '255', `the white point moved (${lev})`);
+	// (the GPU draws it over the picture, whose pixels are as they were until it is made an edit)
 	r = await raw();
-	check(px(r, 50, 40)[0] > 100, `it is shown while pointed at (${px(r, 50, 40)[0]})`);
+	check(px(r, 50, 40)[0] === 100, `the pixels are as they were while it is pointed at (${px(r, 50, 40)[0]})`);
+	const seen = (await shot()).at(Math.round((W - 100 * 7) / 2 + 50 * 7 + 3), Math.round((H - 80 * 7) / 2 + 40 * 7 + 3));
+	check(seen[0] > 100, `it is shown while pointed at (${seen})`);
 	const lv = await page.$eval('.cascade:not(.hidden) .cascade-strip.shown [data-id="levels"]', (e: Element) => { const b = e.getBoundingClientRect(); return {x: b.x + b.width / 2, y: b.y + b.height / 2}; });
 	await page.mouse.click(lv.x, lv.y);
 	await pause(500);

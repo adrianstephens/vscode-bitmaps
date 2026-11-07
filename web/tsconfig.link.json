@@ -3,6 +3,6 @@
 	"references": [
 		{ "path": "../webview/tsconfig.link.json" },
 		{ "path": "../../../packages/maths/tsconfig.esm.json" },
-		{ "path": "../../../packages/binary-fonts/tsconfig.esm.json" }
+		{ "path": "../../../packages/binary_fonts/tsconfig.esm.json" }
 	]
 }

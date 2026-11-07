@@ -351,15 +351,19 @@ const BLEND_GROUPS: {name: string, modes: {key: BLEND_MODE, name: string, short:
 		{key: 'lum', name: 'Luminosity', short: 'Lum'}]},
 ];
 
-/** A blend mode chosen from the groups of them; `preview` is told of the one the pointer rests on, and of none when it leaves. */
-export function blendItem(get: () => BLEND_MODE, set: (mode: BLEND_MODE) => void, preview?: (mode: BLEND_MODE | undefined) => void): CascadeItem {
-	const modes = BLEND_GROUPS.flatMap(g => g.modes);
+/** A blend mode chosen from the groups of them (and, for a group of layers, `pass` through); `preview` is told of the one the pointer
+ *  rests on, and of none when it leaves. */
+export function blendItem<P extends 'pass' = never>(get: () => BLEND_MODE | NoInfer<P>, set: (mode: BLEND_MODE | NoInfer<P>) => void, preview?: (mode: BLEND_MODE | NoInfer<P> | undefined) => void, pass?: P): CascadeItem {
+	const groups: {name: string, modes: {key: BLEND_MODE | P, name: string, short: string}[]}[] = pass
+		? [{...BLEND_GROUPS[0], modes: [{key: pass, name: 'Pass Through', short: 'Pass'}, ...BLEND_GROUPS[0].modes]}, ...BLEND_GROUPS.slice(1)]
+		: BLEND_GROUPS;
+	const modes = groups.flatMap(g => g.modes);
 	const current = () => modes.find(m => m.key === get());
 	return {
 		id:			'blend',
 		face:		() => valueFace('blend', current()?.short ?? 'Norm'),
 		caption:	() => `Blend mode: ${current()?.name ?? 'Normal'}`,
-		children:	() => BLEND_GROUPS.map(g => ({
+		children:	() => groups.map(g => ({
 			id:			`blend-${g.name.toLowerCase()}`,
 			face:		() => valueFace('', g.name.slice(0, 4)),
 			caption:	() => g.name,
@@ -445,14 +449,22 @@ function glowSettings(id: string, e: Edit<Glow>, inner: boolean): CascadeItem[] 
 	return [
 		colourOf(`${id}-colour`, e),
 		...common(e),
-		choiceItem('Technique', [
+		choiceItem({
+			caption: 'Technique',
+			get: () => e.get().technique,
+			set: v => e.set(x => { x.technique = v; }, true)
+		}, [
 			{value: 'softer' as const, face: valueFace('', 'Soft'), caption: 'Softer'},
 			{value: 'precise' as const, face: valueFace('', 'Prec'), caption: 'Precise'},
-		], () => e.get().technique, v => e.set(x => { x.technique = v; }, true)),
-		...(inner ? [choiceItem('Source', [
+		]),
+		...(inner ? [choiceItem({
+			caption: 'Source',
+			get: () => e.get().source ?? 'edge',
+			set: v => e.set(x => { x.source = v; }, true)
+		 }, [
 			{value: 'edge' as const, face: valueFace('', 'Edge'), caption: 'Edge'},
 			{value: 'center' as const, face: valueFace('', 'Cntr'), caption: 'Centre'},
-		], () => e.get().source ?? 'edge', v => e.set(x => { x.source = v; }, true))] : []),
+		])] : []),
 		spreadItem(e, inner ? 'Choke' : 'Spread'),
 		sizeItem(e, 'Size', x => x.size, (x, v) => { x.size = v; }),
 		numberItem(e, {label: 'range', caption: 'Range (%)', min: 1, max: 100, presets: [1, 25, 50, 75, 100], step: step(5)}, x => Math.round(x.range * 100), (x, v) => { x.range = v / 100; }),
@@ -475,16 +487,22 @@ function bevelSettings(id: string, e: Edit<BevelEmboss>): CascadeItem[] {
 		};
 	};
 	return [
-		choiceItem('Style', [
+		choiceItem({
+			caption: 'Style',
+			get: () => e.get().style, set: v => e.set(x => { x.style = v; }, true)
+		 }, [
 			{value: 'inner' as const, face: valueFace('', 'Innr'), caption: 'Inner bevel'},
 			{value: 'outer' as const, face: valueFace('', 'Outr'), caption: 'Outer bevel'},
 			{value: 'emboss' as const, face: valueFace('', 'Embs'), caption: 'Emboss'},
 			{value: 'pillow' as const, face: valueFace('', 'Pilw'), caption: 'Pillow emboss'},
-		], () => e.get().style, v => e.set(x => { x.style = v; }, true)),
-		choiceItem('Direction', [
+		]),
+		choiceItem({
+			caption: 'Direction',
+			get: () => e.get().direction, set: v => e.set(x => { x.direction = v; }, true)
+		}, [
 			{value: 'up' as const, face: valueFace('', 'Up'), caption: 'Up'},
 			{value: 'down' as const, face: valueFace('', 'Down'), caption: 'Down'},
-		], () => e.get().direction, v => e.set(x => { x.direction = v; }, true)),
+		]),
 		numberItem(e, {label: 'depth', caption: 'Depth (%)', min: 1, max: 1000, presets: [1, 50, 100, 200, 500, 1000], step: multiplicativeStep()}, x => Math.round(x.depth * 100), (x, v) => { x.depth = v / 100; }),
 		sizeItem(e, 'Size', x => x.size, (x, v) => { x.size = v; }),
 		angleItem(e),
@@ -497,10 +515,13 @@ function bevelSettings(id: string, e: Edit<BevelEmboss>): CascadeItem[] {
 function gradientSettings(id: string, e: Edit<GradientFill>): CascadeItem[] {
 	const stops = e.get().stops;
 	return [
-		choiceItem('Type', [
+		choiceItem({
+			caption: 'Type',
+			get: () => e.get().type, set: v => e.set(x => { x.type = v; }, true)
+		}, [
 			{value: 'linear' as const, face: valueFace('', 'Lin'), caption: 'Linear'},
 			{value: 'radial' as const, face: valueFace('', 'Rad'), caption: 'Radial'},
-		], () => e.get().type, v => e.set(x => { x.type = v; }, true)),
+		]),
 		...(e.get().type === 'linear' ? [numberItem(e, {label: 'angle', caption: 'Angle (degrees)', min: -180, max: 180, presets: [-180, -90, 0, 90, 180], step: step(5)}, x => x.angle, (x, v) => { x.angle = v; })] : []),
 		numberItem(e, {label: 'scale', caption: 'Scale (%)', min: 10, max: 150, presets: [10, 50, 100, 150], step: step(5)}, x => Math.round(x.scale * 100), (x, v) => { x.scale = v / 100; }),
 		toggleItem('Reverse', svgFace(icons.reverse), () => e.get().reverse, v => e.set(x => { x.reverse = v; }, true)),
@@ -528,11 +549,14 @@ function strokeSettings(id: string, e: Edit<StrokeEffect>): CascadeItem[] {
 			(c, final) => e.set(x => { if (x.paint.type === 'solid') x.paint.colour = c; }, final))] : []),
 		...common(e),
 		sizeItem(e, 'Size', x => x.width, (x, v) => { x.width = Math.max(1, v); }),
-		choiceItem('Position', [
+		choiceItem({
+			caption: 'Position',
+			get: () => e.get().align, set: v => e.set(x => { x.align = v; }, true)
+		}, [
 			{value: 'outside' as const, face: valueFace('', 'Out'), caption: 'Outside'},
 			{value: 'inside' as const, face: valueFace('', 'In'), caption: 'Inside'},
 			{value: 'center' as const, face: valueFace('', 'Cntr'), caption: 'Centre'},
-		], () => e.get().align, v => e.set(x => { x.align = v; }, true)),
+		]),
 	];
 }
 
@@ -816,7 +840,7 @@ export class EffectRenderer {
 // a shadow's shift: the light is at `angle` degrees, so the shadow falls the other way
 const shift = (s: Shadow) => ({dx: -Math.cos(s.angle * Math.PI / 180) * s.distance, dy: Math.sin(s.angle * Math.PI / 180) * s.distance});
 
-/** One of a layer's styles as a layer for the compositor. */
+// One of a layer's styles as a layer for the compositor
 interface StyleLayer {
 	layer:		PixelLayer;
 	name:		string;
@@ -873,8 +897,8 @@ function effectLayer(spec: EffectSpec, width: number, height: number): PixelLaye
 // What the layer's masks leave of the shape the styles follow: Photoshop puts them on the layer as it shows, its masks applied, and
 // does not cut them off with the masks.
 function maskedShape(layer: PixelLayer, shape: Shape, width: number, height: number): Shape | undefined {
-	const kept = layer.mask && !layer.mask.disabled ? keptBy(shape, layer.mask) : shape;
-	const vmask = vectorMask(layer, width, height);
+	const kept	= layer.mask && !layer.mask.disabled ? keptBy(shape, layer.mask) : shape;
+	const vmask	= vectorMask(layer, width, height);
 	return kept && vmask ? keptBy(kept, vmask) : kept;
 }
 
@@ -986,15 +1010,10 @@ function buildStyles(layer: PixelLayer, width: number, height: number): StyleLay
 	if (stroke) {
 		// room for the band outside the shape's rectangle
 		const pad	= stroke.align === 'inside' ? 0 : Math.ceil(stroke.width) + 2;
-		const {x: sx, y: sy} = shape.min, {x: sw, y: sh} = shape.size();
-		const left	= Math.max(0, sx - pad), top = Math.max(0, sy - pad);
-		const w		= Math.min(width, sx + sw + pad) - left, h = Math.min(height, sy + sh + pad) - top;
-		const alpha = new Uint8ClampedArray(w * h);
+		const shape2 = shape.expand(-pad, -pad, pad, pad);
+		const {x: left, y: top} = shape2.min, {x: w, y: h} = shape2.size();
 
-		for (let y = 0; y < sh; y++)
-			alpha.set(shape.mask!.subarray(y * sw, (y + 1) * sw), (y + sy - top) * w + sx - left);
-
-		const band = strokeAlpha(alpha, w, h, stroke.width, stroke.align);
+		const band = strokeAlpha(shape2.mask!, w, h, stroke.width, stroke.align);
 		add(painted(left, top, w, h, band, ctx => {
 			ctx.fillStyle = gradientStyle(ctx, stroke.paint, shape, {width, height});
 			ctx.fillRect(left, top, w, h);

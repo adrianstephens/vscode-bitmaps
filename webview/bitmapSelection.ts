@@ -27,19 +27,10 @@ export class Selection extends Shape {
 		super(area, mask);
 	}
 
-	get width()		{ return this.max.x - this.min.x; }
-	get height()	{ return this.max.y - this.min.y; }
-
 	bounds() {
 		return this;
 	}
 
-	// how much of a pixel is selected, 0..255 (the pixels are those of the box without its far edges, which `contains` has)
-	at(x: number, y: number) {
-		if (x >= this.min.x && y >= this.min.y && x < this.max.x && y < this.max.y)
-			return this.mask ? this.mask[(y - this.min.y) * this.width + (x - this.min.x)] : 255;
-		return 0;
-	}
 	clippedAt(x: number, y: number) {
 		return this.mask ? this.mask[(y - this.min.y) * this.width + (x - this.min.x)] : 255;
 	}

@@ -11,7 +11,7 @@ import * as items from './menuitems';
 let bad = 0;
 const check = (ok: boolean, msg: string) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${msg}`); if (!ok) bad++; };
 
-const model = path.join(__dirname, '../../../packages/binary-ml/assistant/models/realesr_x4v3.onnx');
+const model = path.join(__dirname, '../../../packages/binary_ml/assistant/models/realesr_x4v3.onnx');
 
 (async () => {
 	const problems: string[] = [], edits: string[] = [], waiting = new Map<number, (r: any) => void>();

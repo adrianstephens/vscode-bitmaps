@@ -1,0 +1,288 @@
+/* the menu of icons brought up at the pointer (webview/cascade.ts) */
+.cascade {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.cascade-strip {
+  position: absolute;
+  display: flex;
+}
+
+.cascade-strip.shown {
+  pointer-events: auto;
+}
+
+/* following the icon it came out of as that is magnified (left and top are first set before it is shown, which nothing animates from) */
+.cascade-strip {
+  transition: left 70ms ease-out, top 70ms ease-out;
+}
+
+.cascade-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: var(--cascade-size, 32px);
+  height: var(--cascade-size, 32px);
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-widget-border, transparent));
+  border-radius: 6px;
+  box-shadow: 0 1px 5px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+  cursor: pointer;
+  user-select: none;
+  /* in from the icon it came out of, one after another */
+  opacity: 0;
+  transform: translate(var(--dx, 0), var(--dy, 0)) scale(0.4);
+  transition: transform 110ms ease-out, opacity 90ms ease-out, scale 70ms ease-out, translate 70ms ease-out;
+  transition-delay: calc(var(--i, 0) * 12ms), calc(var(--i, 0) * 12ms), 0ms, 0ms;
+}
+
+.cascade-strip.shown .cascade-button {
+  opacity: 1;
+  transform: none;
+}
+
+.cascade-strip.closing .cascade-button {
+  transition-duration: 80ms;
+  transition-delay: 0ms;
+}
+
+.cascade-button.open {
+  background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+}
+
+.cascade-button.active {
+  color: var(--vscode-inputOption-activeForeground, inherit);
+  background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-activeBackground));
+  border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));
+}
+
+/* the icon faces follow the size set by the bitmaps.cascadeIconSize setting (--cascade-scale is that over 32) */
+.cascade-button svg {
+  width: calc(20px * var(--cascade-scale, 1));
+  height: calc(20px * var(--cascade-scale, 1));
+}
+
+/* an icon the wheel changes: a mark in the corner */
+.cascade-button.wheel {
+  background-image: linear-gradient(135deg, transparent 80%, var(--vscode-focusBorder) 80%);
+}
+
+.cascade-value {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: calc(11px * var(--cascade-scale, 1));
+  font-weight: 600;
+  line-height: 1;
+}
+
+.cascade-value small {
+  font-size: calc(8px * var(--cascade-scale, 1));
+  font-weight: normal;
+  opacity: 0.8;
+}
+
+.cascade-swatch {
+  width: calc(18px * var(--cascade-scale, 1));
+  height: calc(18px * var(--cascade-scale, 1));
+  border: 1px solid var(--vscode-editorWidget-border, #888);
+  border-radius: 3px;
+}
+
+.cascade-swatch2 {
+  position: relative;
+  width: calc(20px * var(--cascade-scale, 1));
+  height: calc(20px * var(--cascade-scale, 1));
+}
+
+.cascade-swatch2 span {
+  position: absolute;
+  width: calc(13px * var(--cascade-scale, 1));
+  height: calc(13px * var(--cascade-scale, 1));
+  border: 1px solid var(--vscode-editorWidget-border, #888);
+  border-radius: 2px;
+}
+
+.cascade-swatch2 span:first-child {
+  right: 0;
+  bottom: 0;
+}
+
+.cascade-swatch2 span:last-child {
+  left: 0;
+  top: 0;
+}
+
+/* a bar through a strip of presets, filled to where the value is: along the bottom of a strip across, the right of one down */
+.cascade-gauge {
+  position: absolute;
+  bottom: 4px;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vscode-foreground, #888) 10%, transparent);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.cascade-gauge.vertical {
+  bottom: auto;
+  right: 4px;
+  width: 3px;
+  height: auto;
+}
+
+.cascade-strip.shown .cascade-gauge {
+  opacity: 1;
+  transition-delay: calc(var(--n, 0) * 12ms + 90ms);
+}
+
+.cascade-gauge div {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--vscode-focusBorder, #0078d4);
+}
+
+/* a slider: one long button, with the bar filled to the value along its bottom (or right) edge */
+.cascade-button.track {
+  justify-content: flex-end;
+  padding: 0 8px 4px;
+  cursor: ew-resize;
+}
+
+.cascade-strip.vertical .cascade-button.track {
+  cursor: ns-resize;
+}
+
+.cascade-button.track ~ .cascade-gauge {
+  bottom: 5px;
+  height: 4px;
+}
+
+.cascade-button.track ~ .cascade-gauge.vertical {
+  bottom: auto;
+  right: 5px;
+  width: 4px;
+  height: auto;
+}
+
+/* a slider's strip slides out of the icon it came out of rather than growing from it (its --tx/--ty and clip are set in addStrip) */
+.cascade-strip.tape > * {
+  opacity: 1;
+  transform: translate(var(--tx, 0), var(--ty, 0));
+  transition: none;		/* (not while --tx/--ty are being set) */
+}
+
+.cascade-strip.tape.shown > * {
+  transform: none;
+  transition: transform 160ms ease-out;
+}
+
+.cascade-strip.tape.closing > * {
+  transition: transform 100ms ease-in;
+}
+
+/* ticks along a slider's bar, at values worth knowing (in its face) */
+.cascade-button.track {
+  position: relative;
+}
+
+.cascade-mark {
+  position: absolute;
+  left: var(--at);
+  bottom: 2px;
+  height: 10px;
+  width: 1px;
+  background: var(--vscode-foreground, #888);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.cascade-mark small {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  transform: translateX(-50%);
+  font-size: 8px;
+  line-height: 1;
+  margin-bottom: 1px;
+  opacity: 0.9;
+}
+
+.cascade-strip.vertical .cascade-mark small {
+  bottom: auto;
+  left: auto;
+  right: 100%;
+  margin: 0 2px 0 0;
+  transform: translateY(-50%);
+}
+
+/* the first and last numbers kept inside the bar's ends: from their tick on, and up to it */
+.cascade-mark:first-child small {
+  transform: none;
+}
+
+.cascade-mark:last-child small {
+  transform: translateX(-100%);
+}
+
+.cascade-strip.vertical .cascade-mark:first-child small {
+  transform: none;
+}
+
+.cascade-strip.vertical .cascade-mark:last-child small {
+  transform: translateY(-100%);
+}
+
+/* (across the bar at the right edge, with their numbers inside the button before them, as a bar across has them above) */
+.cascade-strip.vertical .cascade-mark {
+  left: auto;
+  right: 2px;
+  bottom: auto;
+  top: var(--at);
+  width: 10px;
+  height: 1px;
+}
+
+/* what the icon under the pointer is, beside it */
+.cascade-caption {
+  position: absolute;
+  padding: 2px 6px;
+  font-size: 0.85em;
+  white-space: nowrap;
+  color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+  background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-widget-border, transparent));
+  border-radius: 3px;
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.cascade-caption.shown {
+  opacity: 1;
+}
+
+/* a layer or slice, small, in a strip of them */
+.cascade-thumb {
+  max-width: calc(26px * var(--cascade-scale, 1));
+  max-height: calc(26px * var(--cascade-scale, 1));
+  image-rendering: pixelated;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* an icon being dragged to another place in its strip */
+.cascade-button.dragging {
+  position: relative;
+  z-index: 1;
+  cursor: grabbing;
+  transition: none;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+}

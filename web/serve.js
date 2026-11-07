@@ -12,6 +12,11 @@ http.createServer((req, res) => {
 	const url = decodeURIComponent(req.url.split('?')[0]);
 	if (url === '/')
 		return res.writeHead(302, {location: '/web/index.html'}).end();
+	// the networks GitHub won't let a page fetch itself (release downloads send no CORS headers)
+	if (url.startsWith('/models/') && /^[\w.]+\.pth$/.test(url.slice(8)))
+		return fetch(`https://github.com/naoto0804/pytorch-AdaIN/releases/download/v0.0.0/${url.slice(8)}`)
+			.then(async r => res.writeHead(r.status, {'content-type': 'application/octet-stream'}).end(Buffer.from(await r.arrayBuffer())))
+			.catch(e => res.writeHead(502).end(String(e)));
 	const file = path.join(root, url);
 	if (!file.startsWith(root))
 		return res.writeHead(403).end();
